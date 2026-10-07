@@ -1,0 +1,8 @@
+[package]
+name = "wrobot-cli"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+wrobot-core = { path = "../wrobot-core" }
+image = { version = "0.25", default-features = false, features = ["png"] }
