@@ -292,6 +292,61 @@ mod tests {
         assert!(n_with > n_only, "显式开启后应叠加表格元素");
     }
 
+    /// BUG #59 修复：切到非内容页（图片/设备/…）后，未勾选叠加的内容模块不应再自动残留。
+    ///
+    /// 旧实现靠 `last_content_tab` 在非内容页自动带入上一个内容模块，
+    /// 导致切到图片/设备页后旧笔迹仍留在画布上，干扰定位、也让人误以为没切换成功。
+    #[test]
+    fn switching_to_noncontent_tab_clears_unoverlaid_content() {
+        let Some(mut app) = make_app() else { return };
+        // 在文字页应有内容
+        app.tab = 0;
+        assert!(app.texts[0].text.len() > 0, "默认应有一个含文字的文本框");
+        app.rebuild_preview();
+        assert!(!app.preview.is_empty(), "文字页应有笔迹");
+        assert!(app.module_active(0), "当前文字页应激活文字模块");
+
+        // 切到「图片」页（非内容页）且未勾选任何叠加
+        for i in 0..app.module_on.len() {
+            app.module_on[i] = false;
+        }
+        app.images_on = false;
+        app.tab = 5;
+        app.rebuild_preview();
+
+        // 旧实现靠 last_content_tab 自动带入文字模块 → 这里必须不再带入
+        assert!(
+            !app.module_active(0),
+            "非内容页未勾选叠加时，文字模块不应激活"
+        );
+        assert!(
+            app.collect_polylines(false).is_empty(),
+            "非内容页且未勾选叠加时，页面不应残留任何内容"
+        );
+
+        // 显式勾选叠加后又应出现
+        app.module_on[0] = true;
+        app.rebuild_preview();
+        assert!(
+            app.module_active(0),
+            "显式勾选叠加后文字模块应激活"
+        );
+        assert!(
+            !app.preview.is_empty(),
+            "勾选叠加后文字笔迹应重新出现"
+        );
+    }
+
+    /// 视图辅助默认值：标尺默认开、自定义网格默认关。
+    #[test]
+    fn view_ruler_grid_defaults() {
+        let Some(app) = make_app() else { return };
+        assert!(app.ruler_on, "标尺默认开启");
+        assert!(!app.grid_overlay, "自定义网格默认关闭");
+        assert_eq!(app.grid_overlay_cols, 10);
+        assert_eq!(app.grid_overlay_rows, 14);
+    }
+
     /// BUG 修复：重新随机应真正改变笔迹（旧实现固定种子永不变化）。
     #[test]
     fn random_reseed_changes_output() {

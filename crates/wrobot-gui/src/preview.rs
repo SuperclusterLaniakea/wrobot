@@ -5,7 +5,7 @@
 //!   在「图片」页直接拖动画布移动选中图片；
 //! - `draw_progress_page`：运行中进度页，整页显示，已完成笔迹黑色、未完成浅灰。
 
-use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 use wrobot_core::render::Polyline;
 
 use crate::state::AppState;
@@ -29,16 +29,36 @@ impl PreviewMap {
     }
 }
 
-/// 计算整页缩放居中的映射（始终按**整页**缩放居中，页面稳定不跳动）。
+/// 计算整页缩放映射。
+///
+/// - `top_left = false`（默认）：页面在可用区**居中**（标尺关闭、进度页使用）。
+/// - `top_left = true`：页面**左上对齐**，仅留出 `margin` 边距贴着可用区左上角。
+///   用于开启标尺时——标尺条就画在这条 `margin` 边距内，左侧只空出
+///   「标尺条 + 小间隙」一小块，**不会在宽窗口下因居中而产生整片左侧空白**。
 fn layout(avail: egui::Rect, page_w_mm: f64, page_h_mm: f64) -> (PreviewMap, Rect) {
-    let margin = 18.0_f32;
+    layout_opts(avail, page_w_mm, page_h_mm, false, 18.0)
+}
+
+fn layout_opts(
+    avail: egui::Rect,
+    page_w_mm: f64,
+    page_h_mm: f64,
+    top_left: bool,
+    margin: f32,
+) -> (PreviewMap, Rect) {
     let scale = ((avail.width() - 2.0 * margin) / page_w_mm as f32)
         .min((avail.height() - 2.0 * margin) / page_h_mm as f32)
         .max(0.01);
     let draw_w = page_w_mm as f32 * scale;
     let draw_h = page_h_mm as f32 * scale;
-    let off_x = avail.min.x + (avail.width() - draw_w) / 2.0;
-    let off_y = avail.min.y + (avail.height() - draw_h) / 2.0;
+    let (off_x, off_y) = if top_left {
+        (avail.min.x + margin, avail.min.y + margin)
+    } else {
+        (
+            avail.min.x + (avail.width() - draw_w) / 2.0,
+            avail.min.y + (avail.height() - draw_h) / 2.0,
+        )
+    };
     let map = PreviewMap {
         scale,
         off_x,
@@ -183,6 +203,143 @@ fn draw_page_bg(p: &Painter, map: &PreviewMap, page_rect: &Rect, page_w_mm: f64,
     }
 }
 
+/// 页面外侧标尺带的**厚度**（顶部 + 左侧各一条固定厚度的带子）。
+///
+/// 关键：标尺必须是「贴着页面边缘」的固定厚度带子，**不能**从可用区边缘一直填到页面边缘——
+/// 页面居中时两者之间会有几百像素的留白，那样会变成一大片灰底「空白」。
+const RULER_PX: f32 = 30.0;
+
+/// 画一段虚线（在页面毫米坐标下），用于自定义网格。
+fn dashed_line(
+    p: &Painter,
+    map: &PreviewMap,
+    a: (f64, f64),
+    b: (f64, f64),
+    stroke: Stroke,
+    dash: f64,
+) {
+    let total = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    if total <= 0.0 {
+        return;
+    }
+    let (ux, uy) = ((b.0 - a.0) / total, (b.1 - a.1) / total);
+    let mut t = 0.0;
+    while t < total {
+        let t2 = (t + dash).min(total);
+        p.line_segment(
+            [
+                map.to_screen(a.0 + ux * t, a.1 + uy * t),
+                map.to_screen(a.0 + ux * t2, a.1 + uy * t2),
+            ],
+            stroke,
+        );
+        t = t2 + dash;
+    }
+}
+
+/// 在页面**外侧**绘制标尺：顶部 + 左侧，显示毫米刻度（每 10mm 一个刻度，每 50mm 一个数值）。
+///
+/// 标尺是「**紧贴页面边缘**」的固定厚度（`RULER_PX`）带子，长度与页面对齐，
+/// **不依赖可用区到页面的间距**——页面在预览框里居中时，两者之间的空白属于正常留白，
+/// 不能被填成一大片灰底（这正是旧实现「左侧大片空白」的根因）。
+fn draw_rulers(
+    p: &Painter,
+    map: &PreviewMap,
+    page_rect: Rect,
+    page_w_mm: f64,
+    page_h_mm: f64,
+) {
+    let strip = Color32::from_rgb(244, 246, 249);
+    let corner = Color32::from_rgb(234, 238, 243);
+    let edge = Color32::from_gray(170);
+    let tick = Color32::from_gray(150);
+    let lbl = Color32::from_rgb(120, 130, 145);
+
+    let (x0, y0) = (page_rect.min.x, page_rect.min.y);
+    let (x1, y1) = (page_rect.max.x, page_rect.max.y);
+
+    // 顶部标尺带：贴页面上边，**厚度固定** = RULER_PX，长度 = 页面宽
+    p.rect_filled(
+        Rect::from_min_max(Pos2::new(x0, y0 - RULER_PX), Pos2::new(x1, y0)),
+        0.0,
+        strip,
+    );
+    // 左侧标尺带：贴页面左边，**厚度固定** = RULER_PX，长度 = 页面高
+    p.rect_filled(
+        Rect::from_min_max(Pos2::new(x0 - RULER_PX, y0), Pos2::new(x0, y1)),
+        0.0,
+        strip,
+    );
+    // 左上角块
+    p.rect_filled(
+        Rect::from_min_max(Pos2::new(x0 - RULER_PX, y0 - RULER_PX), Pos2::new(x0, y0)),
+        0.0,
+        corner,
+    );
+
+    // 与纸张交界的边线（上、左）
+    p.line_segment(
+        [Pos2::new(x0, y0), Pos2::new(x1, y0)],
+        Stroke::new(1.0, edge),
+    );
+    p.line_segment(
+        [Pos2::new(x0, y0), Pos2::new(x0, y1)],
+        Stroke::new(1.0, edge),
+    );
+    // 标尺带外沿（上、左）
+    p.line_segment(
+        [Pos2::new(x0, y0 - RULER_PX), Pos2::new(x1, y0 - RULER_PX)],
+        Stroke::new(1.0, edge),
+    );
+    p.line_segment(
+        [Pos2::new(x0 - RULER_PX, y0), Pos2::new(x0 - RULER_PX, y1)],
+        Stroke::new(1.0, edge),
+    );
+
+    // 顶部刻度（沿 X）
+    let mut x = 0.0;
+    while x <= page_w_mm + 1e-6 {
+        let sx = map.to_screen(x, 0.0).x;
+        let major = (x % 50.0).abs() < 1e-6;
+        let h = if major { 9.0 } else { 5.0 };
+        p.line_segment(
+            [Pos2::new(sx, y0), Pos2::new(sx, y0 - h)],
+            Stroke::new(1.0, tick),
+        );
+        if major && x > 0.5 {
+            p.text(
+                Pos2::new(sx, y0 - h - 1.0),
+                Align2::CENTER_BOTTOM,
+                format!("{}", x as i32),
+                FontId::proportional(9.0),
+                lbl,
+            );
+        }
+        x += 10.0;
+    }
+    // 左侧刻度（沿 Y，页面 Y 向下为正）
+    let mut y = 0.0;
+    while y <= page_h_mm + 1e-6 {
+        let sy = map.to_screen(0.0, y).y;
+        let major = (y % 50.0).abs() < 1e-6;
+        let h = if major { 9.0 } else { 5.0 };
+        p.line_segment(
+            [Pos2::new(x0, sy), Pos2::new(x0 - h, sy)],
+            Stroke::new(1.0, tick),
+        );
+        if major && y > 0.5 {
+            p.text(
+                Pos2::new(x0 - h - 2.0, sy),
+                Align2::RIGHT_CENTER,
+                format!("{}", y as i32),
+                FontId::proportional(9.0),
+                lbl,
+            );
+        }
+        y += 10.0;
+    }
+}
+
 /// 在编辑画布上绘制整页：纸张 / 网格 / 背景参考图（浅色，不打印）/ 文字笔迹 / 选中图片框。
 ///
 /// - `freehand`：开启手绘捕获（拖动鼠标画笔迹）；
@@ -197,7 +354,17 @@ pub fn draw_canvas(
     acc: &mut Vec<(f64, f64)>,
 ) -> (PreviewMap, bool) {
     let avail = ui.available_rect_before_wrap();
-    let (map, page_rect) = layout(avail, app.page_w_mm, app.page_h_mm);
+    // 标尺开启时，页面在可用区内**居中**（与关闭标尺一致，页面在预览框里居中、左右留白对称），
+    // 仅把边距放大到「标尺条宽 + 小间隙」以保证左侧/顶部标签有空间、且旧 BUG（偏移导致左侧整片空白）不再出现；
+    // 窗口太小时退化为无标尺的居中型。
+    let ruler_on = app.ruler_on
+        && avail.width() > 80.0
+        && avail.height() > 80.0;
+    let (map, page_rect) = if ruler_on {
+        layout_opts(avail, app.page_w_mm, app.page_h_mm, false, RULER_PX + 6.0)
+    } else {
+        layout(avail, app.page_w_mm, app.page_h_mm)
+    };
 
     let sense = if freehand || image_tab {
         egui::Sense::click_and_drag()
@@ -296,6 +463,24 @@ pub fn draw_canvas(
     let page_painter = ui.painter().with_clip_rect(page_rect);
 
     draw_page_bg(&page_painter, &map, &page_rect, app.page_w_mm, app.page_h_mm);
+
+    // 自定义网格覆盖层：可调节行/列数量的浅色虚线网格，**仅用于定位、不打印**。
+    // 在 10mm 淡网格之外再叠一层按用户设定分割的参考线，方便把内容对齐到等分格。
+    if app.grid_overlay {
+        let gcol = Color32::from_rgb(150, 178, 210);
+        let gstroke = Stroke::new(1.0, gcol);
+        let dash = 4.0_f64;
+        let n = app.grid_overlay_cols.max(1);
+        for i in 1..n {
+            let x = app.page_w_mm * i as f64 / n as f64;
+            dashed_line(&page_painter, &map, (x, 0.0), (x, app.page_h_mm), gstroke, dash);
+        }
+        let m = app.grid_overlay_rows.max(1);
+        for j in 1..m {
+            let y = app.page_h_mm * j as f64 / m as f64;
+            dashed_line(&page_painter, &map, (0.0, y), (app.page_w_mm, y), gstroke, dash);
+        }
+    }
 
     // 背景参考图（浅色显示，不参与打印）
     let bg_stroke = Stroke::new(1.0, Color32::from_rgb(170, 180, 195));
@@ -410,6 +595,18 @@ pub fn draw_canvas(
         );
     }
 
+    // 页面外侧标尺（顶部 + 左侧毫米刻度）：必须用「未裁剪」的 painter，
+    // 否则刻度条落在 page_rect 之外会被裁掉。仅当本帧确实按标尺布局时才画。
+    if ruler_on {
+        draw_rulers(
+            &ui.painter(),
+            &map,
+            page_rect,
+            app.page_w_mm,
+            app.page_h_mm,
+        );
+    }
+
     (map, committed)
 }
 
@@ -455,6 +652,55 @@ pub fn draw_progress_page(
             "尚无运行内容：请在「运行中」页点击「开始运行」",
             egui::FontId::proportional(14.0),
             Color32::from_gray(150),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 标尺开启时页面应在预览框内**居中**（左右留白对称），不再像旧实现那样
+    /// 把页面放在「右移了标尺条宽度的偏移区」里再居中，导致左侧整片空白。
+    #[test]
+    fn ruler_layout_centers_page_in_box() {
+        // A4 竖版（210×297）放在宽窗口里：高度约束主导，左右本就有留白，
+        // 但必须**对称居中**，不能左偏。
+        let avail = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 600.0));
+        let margin = RULER_PX + 6.0;
+        let (m, _r) = layout_opts(avail, 210.0, 297.0, false, margin);
+
+        let draw_w = 210.0 * m.scale;
+        let expected_off = (avail.width() - draw_w) / 2.0;
+        // 页面在预览框内居中
+        assert!(
+            (m.off_x - expected_off).abs() < 1e-3,
+            "页面应居中：左留白应等于 (width-draw_w)/2，实际 {}",
+            m.off_x
+        );
+        // 居中 → 左右留白对称（这是和旧 BUG 的本质区别）
+        let left_blank = m.off_x;
+        let right_blank = avail.width() - (m.off_x + draw_w);
+        assert!(
+            (left_blank - right_blank).abs() < 1e-3,
+            "左右留白应对称（左 {} / 右 {}）",
+            left_blank,
+            right_blank
+        );
+        // 且左留白至少为 margin，保证标尺标签有空间、不会因偏移再多吃一片
+        assert!(
+            left_blank >= margin - 1e-3,
+            "左留白应不小于标尺边距 {}，实际 {}",
+            margin,
+            left_blank
+        );
+        // 标尺带是「贴着页面边缘」的固定厚度带子，必须能放进预留边距内，
+        // 否则居中时它会从可用区边缘一直填到页面 → 左侧一大片灰底空白（旧 BUG）。
+        assert!(
+            RULER_PX <= margin,
+            "标尺带厚度 {} 必须不大于预留边距 {}，否则会溢出可用区",
+            RULER_PX,
+            margin
         );
     }
 }

@@ -431,12 +431,6 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
     // 页面尺寸可能被改过（PDF 导入 / 滑块 / 载入旧工程），规格名跟着重判一次。
     app.sync_paper();
 
-    // 记住最近停留的内容模块：离开内容页后（如切到「设备」），
-    // 页面仍只显示这一个模块，避免五个模块同时渲染互相重叠。
-    if app.tab < CONTENT_MODULES.len() {
-        app.last_content_tab = app.tab;
-    }
-
     // 每帧从后台设备线程同步连接状态与日志（非阻塞，只读共享状态）。
     app.dev_log = app.device.log_snapshot();
     app.dev_connected = app.device.is_connected();
@@ -526,14 +520,8 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
             if app.tab < CONTENT_MODULES.len() {
                 ui.label(RichText::new("默认只输出当前模块，勾选可叠加").size(10.0).color(muted()));
             } else {
-                let cur = CONTENT_MODULES
-                    .get(app.last_content_tab)
-                    .copied()
-                    .unwrap_or("文字");
                 ui.label(
-                    RichText::new(format!("非内容页：只显示「{}」，勾选可叠加", cur))
-                        .size(10.0)
-                        .color(muted()),
+                    RichText::new("非内容页：默认只显示已勾选叠加的模块").size(10.0).color(muted()),
                 );
             }
             for (i, name) in CONTENT_MODULES.iter().enumerate() {
@@ -651,6 +639,31 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
             run_control_bar(app, ui);
             ui.separator();
 
+            // 视图辅助（页面外侧）：标尺开关 + 可调节行/列数量的浅色虚线网格
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut app.ruler_on, "标尺");
+                ui.checkbox(&mut app.grid_overlay, "网格");
+                if app.grid_overlay {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("列").size(11.0).color(muted()));
+                    ui.add(
+                        egui::DragValue::new(&mut app.grid_overlay_cols)
+                            .range(1..=60)
+                            .clamp_existing_to_range(true)
+                            .speed(1),
+                    );
+                    ui.label(RichText::new("行").size(11.0).color(muted()));
+                    ui.add(
+                        egui::DragValue::new(&mut app.grid_overlay_rows)
+                            .range(1..=80)
+                            .clamp_existing_to_range(true)
+                            .speed(1),
+                    );
+                    ui.weak("可调行/列分割数（浅色虚线，不打印）");
+                }
+            });
+            ui.separator();
+
             let freehand = app.tab == 3 && app.freehand_on;
             let image_tab = app.tab == 5;
             // 手绘临时点集用局部变量，避免与整块 `app` 的可变借用冲突。
@@ -728,6 +741,21 @@ fn coord_panel(app: &mut AppState, ui: &mut Ui) {
             app.status_poll_ms = if poll { 1000 } else { 0 };
         }
     });
+
+    // 一键回原点：把笔移到坐标零点 (0,0)。放在实时坐标下方、左下角，
+    // 运行中想随时把笔退回家时不用切到顶部运行条。
+    if ui
+        .add_sized(
+            [110.0, 26.0],
+            egui::Button::new(RichText::new("↺ 回原点").size(12.0))
+                .fill(egui::Color32::from_rgb(46, 120, 200)),
+        )
+        .on_hover_text("发送 G0 X0 Y0，把笔移动到坐标零点 (0,0)")
+        .clicked()
+    {
+        app.go_zero();
+    }
+
     if !app.dev_connected {
         ui.label(RichText::new("未连接：连上机器后才有坐标").size(10.0).color(muted()));
     } else if !p.any() {

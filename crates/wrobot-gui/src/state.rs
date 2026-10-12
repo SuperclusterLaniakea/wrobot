@@ -309,6 +309,26 @@ fn default_true() -> bool {
     true
 }
 
+/// 页面外侧标尺（顶部 + 左侧毫米刻度）默认开启。
+fn default_ruler_on() -> bool {
+    true
+}
+
+/// 自定义网格覆盖层默认关闭（保留原有 10mm 淡网格作为基线）。
+fn default_grid_overlay() -> bool {
+    false
+}
+
+/// 自定义网格默认列数（竖向分割线数量）。
+fn default_grid_div_x() -> usize {
+    10
+}
+
+/// 自定义网格默认行数（横向分割线数量；A4 纵向，行略多于列）。
+fn default_grid_div_y() -> usize {
+    14
+}
+
 fn one() -> usize {
     1
 }
@@ -554,6 +574,19 @@ pub struct AppState {
     /// 文字模块是否画出**文本框虚拟框**（虚线，仅用于定位，不打印）。
     #[serde(default = "default_true")]
     pub text_frame_on: bool,
+
+    /// 页面外侧**标尺**（顶部 + 左侧毫米刻度），帮助把内容放到精确位置。
+    #[serde(default = "default_ruler_on")]
+    pub ruler_on: bool,
+    /// 自定义**网格覆盖层**：可调节行/列数量的浅色虚线网格（仅用于定位，不打印）。
+    #[serde(default = "default_grid_overlay")]
+    pub grid_overlay: bool,
+    /// 自定义网格的**列数**（竖向分割线数量）。
+    #[serde(default = "default_grid_div_x")]
+    pub grid_overlay_cols: usize,
+    /// 自定义网格的**行数**（横向分割线数量）。
+    #[serde(default = "default_grid_div_y")]
+    pub grid_overlay_rows: usize,
     /// 坐标自动查询间隔（毫秒，0=关闭）。
     ///
     /// GRBL 只在收到 `?` 时回报一次坐标、不主动推送，想让左栏坐标实时刷新
@@ -604,10 +637,6 @@ pub struct AppState {
     /// 「清空内容」需要二次确认，防止误删整页
     #[serde(skip)]
     pub confirm_clear: bool,
-    /// 最近一次停留的内容模块（0..4）。
-    /// 在设备 / 测试 / 导入导出等非内容页，页面只显示这一个模块 + 显式勾选的模块，
-    /// 避免「五个模块同时渲染、内容全叠在一起」。
-    pub last_content_tab: usize,
 
     // —— 设备 ——
     pub dev_kind: usize,
@@ -724,7 +753,6 @@ impl AppState {
             orientation: 0,
             module_on: [false; MODULE_COUNT],
             images_on: false,
-            last_content_tab: 0,
             confirm_clear: false,
             border_on: false,
             border_margin: 10.0,
@@ -824,6 +852,10 @@ impl AppState {
             min_step_mm: default_min_step(),
             axes_on: true,
             text_frame_on: true,
+            ruler_on: true,
+            grid_overlay: false,
+            grid_overlay_cols: 10,
+            grid_overlay_rows: 14,
             status_poll_ms: 0,
             cursor_mm: None,
             status_poll_key: (0, usize::MAX),
@@ -1441,11 +1473,13 @@ impl AppState {
 
     /// 判断某内容模块是否并入当前页面。
     ///
-    /// 规则（修复「设备页内容全部叠在一起」）：
+    /// 规则（修复「设备页内容全部叠在一起」+ BUG #59「切换模式旧内容残留」）：
     /// - 显式勾选（`module_on`）的模块始终并入；
-    /// - 停留在内容页（文字/表格/格子/绘图/笔记）时，并入该页对应模块；
+    /// - 停留在**内容页**（文字/表格/格子/绘图/笔记）时，并入该页对应模块；
     /// - 停留在**非内容页**（图片 / 设备 / 测试 / 导入导出 / 运行中）时，
-    ///   只并入「最近停留过的那一个内容模块」。
+    ///   **不再**自动带入「最近停留过的内容模块」——必须显式勾选「并入当前页面」
+    ///   才会显示。否则切到图片/设备页后，上一个模块的笔迹仍残留在画布上，
+    ///   既干扰定位、也让用户误以为没切换成功。
     ///
     /// 旧实现在非内容页返回「全部并入」，导致五个模块同时按各自默认坐标渲染、
     /// 全都堆在页面左上角互相重叠，而且左侧勾选框取消也无效——看到的还是全部。
@@ -1456,12 +1490,9 @@ impl AppState {
         if self.module_on[idx] {
             return true;
         }
-        let cur = if self.tab < MODULE_COUNT {
-            self.tab
-        } else {
-            self.last_content_tab.min(MODULE_COUNT - 1)
-        };
-        cur == idx
+        // 仅在「停留在本内容编辑页」时，自动并入当前页模块；
+        // 切到其它页（含图片/设备/测试/导入导出/运行中）不再自动带出旧内容。
+        self.tab < MODULE_COUNT && self.tab == idx
     }
 
     /// 汇总元素到工程对象：只并入「当前模块 + 显式开启的模块」，避免多模块坐标重叠。
