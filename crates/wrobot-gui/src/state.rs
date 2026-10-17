@@ -177,6 +177,21 @@ pub struct ImageObject {
     pub edge_threshold: f64,
     /// 反相（黑变白、白变黑）
     pub invert: bool,
+    /// **裁剪区域**（相对原图宽高的比例）：`(左, 上, 右, 下)`；`(0,0,1,1)` = 不裁剪。
+    #[serde(default = "default_crop")]
+    pub crop: (f64, f64, f64, f64),
+    /// **扫描方向**：0 横向 / 1 对角 45° / 2 纵向 / 3 对角 135°。
+    #[serde(default)]
+    pub scan_angle: u8,
+    /// **连笔跨行容差**（像素，连续笔画模式）：行间墨段端点距离 ≤ 行距+该值就接续。
+    #[serde(default = "default_merge_gap")]
+    pub merge_gap_px: u32,
+    /// **笔画顺序**：0 默认 / 1 最优路径 / 2 按扫描顺序 / 3 分块蛇形。
+    #[serde(default)]
+    pub order_mode: u8,
+    /// 分块边长（像素，`order_mode == 3` 时生效）。
+    #[serde(default = "default_block_px")]
+    pub block_px: u32,
     /// 是否作为背景参考（浅色显示、不参与打印）
     pub background: bool,
     /// **是否并入输出**（每张图单独控制）。
@@ -204,7 +219,25 @@ impl ImageObject {
         h = h.wrapping_mul(31).wrapping_add((self.edge_threshold * 1000.0) as u64);
         h = h.wrapping_mul(31).wrapping_add(self.invert as u64);
         h = h.wrapping_mul(31).wrapping_add(self.natural_h as u64);
+        // 裁剪 / 扫描方向 / 连笔容差 / 顺序模式 / 分块
+        for v in [
+            self.crop.0,
+            self.crop.1,
+            self.crop.2,
+            self.crop.3,
+            self.scan_angle as f64,
+            self.merge_gap_px as f64,
+            self.order_mode as f64,
+            self.block_px as f64,
+        ] {
+            h = h.wrapping_mul(31).wrapping_add((v * 1000.0) as u64);
+        }
         h
+    }
+
+    /// 是否真的裁掉了内容（`(0,0,1,1)` 视为不裁剪）。
+    pub fn is_cropped(&self) -> bool {
+        self.crop.0 > 1e-6 || self.crop.1 > 1e-6 || self.crop.2 < 1.0 - 1e-6 || self.crop.3 < 1.0 - 1e-6
     }
 
     /// 基础坐标（未变换，范围 `[0,natural_w]×[0,natural_h]`）→ 页面毫米坐标。
@@ -307,6 +340,21 @@ fn default_keepalive_ms() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+/// 图片裁剪默认不裁（左0 上0 右1 下1）。
+fn default_crop() -> (f64, f64, f64, f64) {
+    (0.0, 0.0, 1.0, 1.0)
+}
+
+/// 连笔跨行容差默认 8px：既能串出蛇形长笔画，又不会把隔太远的段硬连。
+fn default_merge_gap() -> u32 {
+    8
+}
+
+/// 分块蛇形的默认块边长 40px。
+fn default_block_px() -> u32 {
+    40
 }
 
 /// 页面外侧标尺（顶部 + 左侧毫米刻度）默认开启。
@@ -534,6 +582,32 @@ pub struct AppState {
     pub img_edge: f64,
     pub img_invert: bool,
     pub img_draw_type: usize,
+    /// 默认扫描方向：0 横向 / 1 对角 45° / 2 纵向 / 3 对角 135°
+    #[serde(default)]
+    pub img_scan_angle: u8,
+    /// 默认连笔跨行容差（像素）
+    #[serde(default = "default_merge_gap")]
+    pub img_merge_gap: u32,
+    /// 默认笔画顺序：0 默认 / 1 最优路径 / 2 按扫描顺序 / 3 分块蛇形
+    #[serde(default)]
+    pub img_order_mode: u8,
+    /// 默认分块边长（像素）
+    #[serde(default = "default_block_px")]
+    pub img_block_px: u32,
+
+    // —— 运行边界自检 ——
+    /// 生成 G-code 后先与机器幅面（`machine_w_mm`×`machine_h_mm`）比对，超界弹窗询问
+    #[serde(default = "default_true")]
+    pub bounds_check: bool,
+    /// 超界确认弹窗当前是否可见
+    #[serde(default)]
+    pub show_bounds_warn: bool,
+    /// 超界确认弹窗里待用户裁决的那份 G-code
+    #[serde(default)]
+    pub pending_run_gcode: String,
+    /// 超界提示内容（哪些方向超出、超出多少）
+    #[serde(default)]
+    pub bounds_warn_msg: String,
 
     // —— 固件 / G-code ——
     pub firmware_sel: usize, // 0 grbl 1 marlin 2 ebb
@@ -830,6 +904,14 @@ impl AppState {
             img_edge: 0.25,
             img_invert: false,
             img_draw_type: 0,
+            img_scan_angle: 0,
+            img_merge_gap: 8,
+            img_order_mode: 0,
+            img_block_px: 40,
+            bounds_check: true,
+            show_bounds_warn: false,
+            pending_run_gcode: String::new(),
+            bounds_warn_msg: String::new(),
             firmware_sel: 0,
             pen_mode_sel: 0,
             feed_rate: 10000.0,
@@ -1675,6 +1757,11 @@ impl AppState {
             edge_threshold: img.edge_threshold,
             invert: img.invert,
             draw_type: img.draw as usize,
+            crop: img.crop,
+            scan_angle: img.scan_angle,
+            merge_gap_px: img.merge_gap_px,
+            order_mode: img.order_mode,
+            block_px: img.block_px,
         }
     }
 
@@ -1711,6 +1798,11 @@ impl AppState {
             edge_threshold: self.img_edge,
             invert: self.img_invert,
             draw_type: self.img_draw_type,
+            crop: (0.0, 0.0, 1.0, 1.0),
+            scan_angle: self.img_scan_angle,
+            merge_gap_px: self.img_merge_gap,
+            order_mode: self.img_order_mode,
+            block_px: self.img_block_px,
         };
         let r = crate::io::image_to_polylines(&data, &opts)?;
         let n = r.polylines.len();
@@ -1731,6 +1823,11 @@ impl AppState {
             threshold: self.img_thr,
             edge_threshold: self.img_edge,
             invert: self.img_invert,
+            crop: (0.0, 0.0, 1.0, 1.0),
+            scan_angle: self.img_scan_angle,
+            merge_gap_px: self.img_merge_gap,
+            order_mode: self.img_order_mode,
+            block_px: self.img_block_px,
             background,
             out: true,
             base: r.polylines,
@@ -1819,6 +1916,12 @@ impl AppState {
             self.img_invert,
             self.img_draw_type,
         );
+        let (scan_angle, merge_gap, order_mode, block_px) = (
+            self.img_scan_angle,
+            self.img_merge_gap,
+            self.img_order_mode,
+            self.img_block_px,
+        );
         let tag = path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -1834,6 +1937,11 @@ impl AppState {
                 edge_threshold: edge,
                 invert,
                 draw_type,
+                crop: (0.0, 0.0, 1.0, 1.0),
+                scan_angle,
+                merge_gap_px: merge_gap,
+                order_mode,
+                block_px,
             };
             let r = crate::io::pdf_image_to_polylines(im, &opts)?;
             if r.polylines.is_empty() {
@@ -1853,6 +1961,11 @@ impl AppState {
                 threshold: thr,
                 edge_threshold: edge,
                 invert,
+                crop: (0.0, 0.0, 1.0, 1.0),
+                scan_angle,
+                merge_gap_px: merge_gap,
+                order_mode,
+                block_px,
                 background: false,
                 out: true,
                 base: r.polylines,
@@ -1893,6 +2006,11 @@ impl AppState {
                 threshold: thr,
                 edge_threshold: edge,
                 invert,
+                crop: (0.0, 0.0, 1.0, 1.0),
+                scan_angle,
+                merge_gap_px: merge_gap,
+                order_mode,
+                block_px,
                 background: false,
                 out: true,
                 base,
@@ -2116,6 +2234,48 @@ impl AppState {
         let all = self.collect_polylines(self.use_random);
         let gopts = self.gcode_options();
         wrobot_core::generate(&all, &gopts)
+    }
+
+    /// **边界自检**：解析 G-code 的 XY 范围并与机器幅面（`machine_w_mm`×`machine_h_mm`）比对。
+    ///
+    /// 超界时返回给用户看的提示文本（哪些方向超出、超出多少），未超界返回 `None`：
+    /// - **跨度超界**：内容宽/高超过机器行程宽/高 —— 以「当前位置为原点」时机器
+    ///   从起点出发最多也只能走一个幅面大小；
+    /// - **绝对坐标超界**：关闭「以当前位置为原点」后坐标按机械原点解析，
+    ///   内容任一角落到不了 `[0,0]~[机器宽,机器高]` 工作区域内都会软限位报警。
+    pub fn bounds_warning(&self, gcode: &str) -> Option<String> {
+        let (min_x, min_y, max_x, max_y) = wrobot_core::gcode_xy_bounds(gcode)?;
+        let mut probs: Vec<String> = Vec::new();
+        let span_x = max_x - min_x;
+        let span_y = max_y - min_y;
+        if span_x > self.machine_w_mm + 1e-6 {
+            probs.push(format!(
+                "内容宽 {:.1}mm > 机器行程宽 {:.1}mm",
+                span_x, self.machine_w_mm
+            ));
+        }
+        if span_y > self.machine_h_mm + 1e-6 {
+            probs.push(format!(
+                "内容高 {:.1}mm > 机器行程高 {:.1}mm",
+                span_y, self.machine_h_mm
+            ));
+        }
+        if !self.gcode_options().use_current_origin
+            && (min_x < -1e-6
+                || min_y < -1e-6
+                || max_x > self.machine_w_mm + 1e-6
+                || max_y > self.machine_h_mm + 1e-6)
+        {
+            probs.push(format!(
+                "绝对坐标模式：内容范围 ({:.1},{:.1})~({:.1},{:.1}) 超出工作区域 (0,0)~({:.0},{:.0})",
+                min_x, min_y, max_x, max_y, self.machine_w_mm, self.machine_h_mm
+            ));
+        }
+        if probs.is_empty() {
+            None
+        } else {
+            Some(probs.join("；"))
+        }
     }
 
     /// 当前固件/G-code 选项。

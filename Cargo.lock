@@ -4215,7 +4215,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "wrobot-cli"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "image",
  "wrobot-core",
@@ -4223,7 +4223,7 @@ dependencies = [
 
 [[package]]
 name = "wrobot-core"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "rand",
  "serde",
@@ -4233,7 +4233,7 @@ dependencies = [
 
 [[package]]
 name = "wrobot-gui"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "calamine",

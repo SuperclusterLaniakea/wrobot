@@ -416,6 +416,70 @@ pub fn count_pen_cycles(gcode: &str, opts: &GcodeOptions) -> (usize, usize) {
     (u, d)
 }
 
+/// 从一行指令里取指定轴字母后面的数值（如 `X12.5` → `12.5`）。
+fn axis_val(line: &str, axis: char) -> Option<f64> {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] as char == axis {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len()
+                && (b[j].is_ascii_digit() || b[j] == b'.' || b[j] == b'-' || b[j] == b'+')
+            {
+                j += 1;
+            }
+            if j > start {
+                return line[start..j].parse().ok();
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 解析一段 G-code 里的 **XY 坐标范围**（毫米），返回 `(min_x, min_y, max_x, max_y)`。
+///
+/// 逐行扫描 `G0/G1`（含 `G00/G01`）运动指令上的 `X`/`Y` 数值（`;` 后视为注释忽略）。
+/// 没有任何带坐标的运动指令（如 EBB 的 `SM` 步进指令、纯设置指令）时返回 `None`。
+///
+/// 用途：**运行前边界自检**——把范围与机器行程（工作幅面）比较，
+/// 超界就提醒用户，避免撞机 / 软限位报警。
+pub fn gcode_xy_bounds(text: &str) -> Option<(f64, f64, f64, f64)> {
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut found = false;
+    for raw in text.lines() {
+        // 去掉注释与行号（N123 G1 ...）
+        let mut line = raw.split(';').next().unwrap_or("").trim();
+        if let Some(rest) = line.strip_prefix('N') {
+            if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                line = rest.split_once(char::is_whitespace).map(|(_, r)| r.trim()).unwrap_or("");
+            }
+        }
+        // 只关心 G0/G1 运动指令
+        let head = line.split_whitespace().next().unwrap_or("");
+        if head != "G0" && head != "G1" && head != "G00" && head != "G01" {
+            continue;
+        }
+        if let Some(x) = axis_val(line, 'X') {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            found = true;
+        }
+        if let Some(y) = axis_val(line, 'Y') {
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+            found = true;
+        }
+    }
+    if found {
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +714,54 @@ mod tests {
                 "镜像两次应回到原值：({bx},{by})，rx={rx} ry={ry}"
             );
         }
+    }
+
+    /// 边界检测：解析出的 XY 范围必须**覆盖**笔迹经坐标变换（镜像/对调/原点角）后的
+    /// 全部落点——这是「超界提醒」能不能work的前提。
+    #[test]
+    fn gcode_xy_bounds_covers_transformed_extent() {
+        let paths = vec![
+            Polyline::new(vec![(10.0, 20.0), (60.0, 20.0)]),
+            Polyline::new(vec![(60.0, 90.0), (10.0, 90.0)]),
+        ];
+        let o = GcodeOptions {
+            page_w: 210.0,
+            page_h: 297.0,
+            min_step: 0.0,
+            ..Default::default()
+        };
+        // 笔迹四角经 transform 后的期望范围（默认 reverse_y=true：y → 297−y）
+        let corners = [(10.0, 20.0), (60.0, 20.0), (60.0, 90.0), (10.0, 90.0)];
+        let mut ex0 = f64::INFINITY;
+        let mut ey0 = f64::INFINITY;
+        let mut ex1 = f64::NEG_INFINITY;
+        let mut ey1 = f64::NEG_INFINITY;
+        for (px, py) in corners {
+            let (mx, my) = o.transform(px, py);
+            ex0 = ex0.min(mx);
+            ey0 = ey0.min(my);
+            ex1 = ex1.max(mx);
+            ey1 = ey1.max(my);
+        }
+        let g = generate(&paths, &o);
+        let (x0, y0, x1, y1) = gcode_xy_bounds(&g).expect("应有坐标");
+        assert!(
+            x0 <= ex0 + 0.01 && x1 >= ex1 - 0.01,
+            "X 应覆盖笔迹 {ex0}..{ex1}，实际 {x0}..{x1}"
+        );
+        assert!(
+            y0 <= ey0 + 0.01 && y1 >= ey1 - 0.01,
+            "Y 应覆盖笔迹 {ey0}..{ey1}，实际 {y0}..{y1}"
+        );
+        // 跨度不小于笔迹跨度（末尾「回零点」的空移只会让范围更大，不会更小）
+        assert!(x1 - x0 >= ex1 - ex0 - 0.01, "X 跨度不该小于笔迹跨度");
+        assert!(y1 - y0 >= ey1 - ey0 - 0.01, "Y 跨度不该小于笔迹跨度");
+    }
+
+    /// 没有坐标指令的文本（纯注释 / 设置指令）应返回 None，不能误报 0..0。
+    #[test]
+    fn gcode_xy_bounds_none_without_motion() {
+        assert!(gcode_xy_bounds("; 仅注释\nG21\nG90\nM2\n").is_none());
+        assert!(gcode_xy_bounds("").is_none());
     }
 }

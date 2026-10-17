@@ -103,6 +103,21 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// 载入应用图标（编译期把 `assets/icon.png` 嵌进可执行文件，运行时解码为 RGBA）。
+///
+/// 图标由 `tools/make_icon.py` 生成（纯标准库光栅化：蓝→青渐变圆角底板 +
+/// 纸张 + 手写波浪线 + 钢笔）。同时影响标题栏与任务栏。
+fn load_icon() -> Option<egui::IconData> {
+    let png = include_bytes!("../assets/icon.png");
+    let img = image::load_from_memory(png).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    Some(egui::IconData {
+        width: w,
+        height: h,
+        rgba: img.into_raw(),
+    })
+}
+
 fn main() -> eframe::Result {
     // 命令行：--port COM3 [--baud 115200] 直接连接；--auto 自动搜索并连接
     let args: Vec<String> = std::env::args().collect();
@@ -140,16 +155,21 @@ fn main() -> eframe::Result {
     // winit 会按系统默认值创建（在高分屏/多显示器上常常只有很小一块），
     // 三栏布局被挤成一团、内容显示不全。
     // 同时关掉窗口状态持久化：程序迭代中布局会变，旧的“小窗口”尺寸会被记住并一直复用。
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1600.0, 1000.0])
+        .with_min_inner_size([1180.0, 720.0])
+        .with_maximized(true)
+        .with_app_id("wrobot-gui")
+        .with_title("WritingRobot · 写字机器人上位机");
+    // 应用图标（标题栏 + 任务栏）：嵌入的 PNG 解码失败则退回系统默认图标
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         persist_window: false,
         centered: true,
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1600.0, 1000.0])
-            .with_min_inner_size([1180.0, 720.0])
-            .with_maximized(true)
-            .with_app_id("wrobot-gui")
-            .with_title("WritingRobot · 写字机器人上位机"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -625,6 +645,11 @@ mod tests {
             threshold: 0.5,
             edge_threshold: 0.25,
             invert: false,
+            crop: (0.0, 0.0, 1.0, 1.0),
+            scan_angle: 0,
+            merge_gap_px: 8,
+            order_mode: 0,
+            block_px: 40,
             background: false,
             out: true,
             base: Vec::new(),
@@ -749,6 +774,11 @@ mod tests {
             threshold: 0.5,
             edge_threshold: 0.5,
             invert: false,
+            crop: (0.0, 0.0, 1.0, 1.0),
+            scan_angle: 0,
+            merge_gap_px: 8,
+            order_mode: 0,
+            block_px: 40,
             background: false,
             out: true,
             base: vec![wrobot_core::Polyline::new(vec![(0.0, 0.0), (10.0, 10.0)])],
@@ -891,6 +921,11 @@ mod tests {
             edge_threshold: 0.5,
             invert: false,
             draw_type: 1, // 素描：逐行扫描（旧方式）
+            crop: (0.0, 0.0, 1.0, 1.0),
+            scan_angle: 0,
+            merge_gap_px: 8,
+            order_mode: 0,
+            block_px: 40,
         };
         let rowish = crate::io::gray_to_polylines(&gray, &base);
         let cont = crate::io::gray_to_polylines(
@@ -954,6 +989,11 @@ mod tests {
                 edge_threshold: 0.5,
                 invert: false,
                 draw_type: 2,
+                crop: (0.0, 0.0, 1.0, 1.0),
+                scan_angle: 0,
+                merge_gap_px: 8,
+                order_mode: 0,
+                block_px: 40,
             },
         );
         assert_eq!(
@@ -962,6 +1002,176 @@ mod tests {
             "左右两块应各自串成一条笔画，实际 {} 条",
             r.polylines.len()
         );
+    }
+
+    /// ① 边界自检：内容宽超过机器行程宽时要提醒，缩到幅面内就不再提醒。
+    #[test]
+    fn bounds_check_warns_when_content_exceeds_machine_area() {
+        let Some(mut app) = make_app() else { return };
+        assert!(app.bounds_check, "超界检测应默认开启");
+        app.texts[0].text = "测试".into();
+        app.rebuild_preview();
+        let g = app.generate_gcode();
+        assert!(
+            app.bounds_warning(&g).is_none(),
+            "默认 A4 页面应在默认机器幅面 (200×280) 之内"
+        );
+        // 把机器行程压窄到比内容小 → 必须报警
+        let (x0, _y0, x1, _y1) = wrobot_core::render::bounds_all(&app.preview);
+        app.machine_w_mm = (x1 - x0).ceil() - 1.0;
+        let warn = app
+            .bounds_warning(&g)
+            .expect("内容宽超过机器行程宽应报警");
+        assert!(warn.contains("机器行程宽"), "提示应说明是宽度超界：{warn}");
+        // 关掉检测开关只影响是否弹窗，计算本身照常
+        app.bounds_check = false;
+        assert!(
+            app.bounds_warning(&g).is_some(),
+            "关掉开关只是不弹窗，检测函数本身仍应能算出超界"
+        );
+    }
+
+    /// ② 裁剪：只保留原图一半时，输出宽度应减半且笔迹全部落在裁剪区域内。
+    #[test]
+    fn crop_limits_output_extent() {
+        // 左半黑右半白（200×100），不裁剪 → 宽=高（target 50mm、比例 2:1 → 100×50mm）
+        let (w, h) = (200u32, 100u32);
+        let gray = image::GrayImage::from_fn(w, h, |x, _| {
+            image::Luma([if x < w / 2 { 0u8 } else { 255u8 }])
+        });
+        let base = crate::io::ImageGenOpts {
+            target_h_mm: 50.0,
+            step_px: 10,
+            threshold: 0.5,
+            edge_threshold: 0.5,
+            invert: false,
+            draw_type: 1,
+            crop: (0.0, 0.0, 1.0, 1.0),
+            scan_angle: 0,
+            merge_gap_px: 8,
+            order_mode: 0,
+            block_px: 40,
+        };
+        let full = crate::io::gray_to_polylines(&gray, &base);
+        assert!((full.w_mm - 100.0).abs() < 0.1, "整图宽应=100mm，实际 {}", full.w_mm);
+
+        // 裁掉右半（右=0.5）→ 宽减半
+        let cropped = crate::io::gray_to_polylines(
+            &gray,
+            &crate::io::ImageGenOpts {
+                crop: (0.0, 0.0, 0.5, 1.0),
+                ..base
+            },
+        );
+        assert!(
+            (cropped.w_mm - 50.0).abs() < 0.2,
+            "裁剪后宽应≈50mm，实际 {}",
+            cropped.w_mm
+        );
+        let (_x0, _y0, x1, _y1) = wrobot_core::render::bounds_all(&cropped.polylines);
+        assert!(x1 <= 50.5, "笔迹应全落在裁剪区内：x1={x1}");
+        assert!(!cropped.polylines.is_empty(), "裁剪区里有墨就应有笔迹");
+    }
+
+    /// ③ 扫描方向：纵向扫描出来的影线应是「竖线」（y 跨度远大于 x 跨度）。
+    #[test]
+    fn scan_angle_vertical_draws_columns() {
+        let (w, h) = (100u32, 200u32);
+        let gray = image::GrayImage::from_pixel(w, h, image::Luma([0u8]));
+        let r = crate::io::gray_to_polylines(
+            &gray,
+            &crate::io::ImageGenOpts {
+                target_h_mm: 100.0,
+                step_px: 10,
+                threshold: 0.5,
+                edge_threshold: 0.5,
+                invert: false,
+                draw_type: 1,
+                crop: (0.0, 0.0, 1.0, 1.0),
+                scan_angle: 2, // 纵向
+                merge_gap_px: 8,
+                order_mode: 0,
+                block_px: 40,
+            },
+        );
+        assert!(!r.polylines.is_empty(), "纵向扫描应有笔迹");
+        let (x0, y0, x1, y1) = wrobot_core::render::bounds_all(&r.polylines);
+        assert!(
+            y1 - y0 > (x1 - x0) * 1.5,
+            "纵向扫描的笔画应以竖向为主：y 跨 {} vs x 跨 {}",
+            y1 - y0,
+            x1 - x0
+        );
+    }
+
+    /// ④ 连笔容差：容差小 → 跨不过空隙（笔画多）；容差大 → 串成长笔画（笔画少）。
+    #[test]
+    fn merge_gap_controls_chaining() {
+        // 两条窄墨带左右交替出现（行 0/2 只画左带 x∈[35,45)，行 1/3 只画右带 x∈[55,65)），
+        // 想串成一条长笔画必须逐行跨过带间空隙。
+        let (w, h) = (100u32, 40u32);
+        let gray = image::GrayImage::from_fn(w, h, |x, y| {
+            let left_band = (y / 10) % 2 == 0;
+            let ink = (left_band && (35..45).contains(&x)) || (!left_band && (55..65).contains(&x));
+            image::Luma([if ink { 0u8 } else { 255u8 }])
+        });
+        let mk = |gap: u32| crate::io::ImageGenOpts {
+            target_h_mm: 40.0,
+            step_px: 10,
+            threshold: 0.5,
+            edge_threshold: 0.5,
+            invert: false,
+            draw_type: 2,
+            crop: (0.0, 0.0, 1.0, 1.0),
+            scan_angle: 0,
+            merge_gap_px: gap,
+            order_mode: 2, // 按扫描顺序，排除最优路径重排的干扰
+            block_px: 40,
+        };
+        let tight = crate::io::gray_to_polylines(&gray, &mk(0));
+        let loose = crate::io::gray_to_polylines(&gray, &mk(30));
+        // 行距 10px + 空隙 20px → 跨行 22.4px：小容差接不上（4 条），大容差串成 1 条
+        assert_eq!(
+            tight.polylines.len(),
+            4,
+            "小容差跨不过空隙：{} 条",
+            tight.polylines.len()
+        );
+        assert_eq!(
+            loose.polylines.len(),
+            1,
+            "大容差应串成一条长笔画：{} 条",
+            loose.polylines.len()
+        );
+    }
+
+    /// ⑤ 分块蛇形：只重排不增减笔画，且顺序按块聚集（相邻块的笔迹位置相邻）。
+    #[test]
+    fn block_serpentine_keeps_all_strokes() {
+        let (w, h) = (120u32, 120u32);
+        let gray = image::GrayImage::from_fn(w, h, |x, y| {
+            // 三条竖黑条
+            let v = if x % 40 < 10 { 0u8 } else { 255u8 };
+            let _ = y;
+            image::Luma([v])
+        });
+        let r = crate::io::gray_to_polylines(
+            &gray,
+            &crate::io::ImageGenOpts {
+                target_h_mm: 60.0,
+                step_px: 10,
+                threshold: 0.5,
+                edge_threshold: 0.5,
+                invert: false,
+                draw_type: 1,
+                crop: (0.0, 0.0, 1.0, 1.0),
+                scan_angle: 0,
+                merge_gap_px: 8,
+                order_mode: 3, // 分块蛇形
+                block_px: 40,
+            },
+        );
+        assert_eq!(r.polylines.len(), 36, "12 行 × 3 条竖带 = 36 段，只重排不该增减");
     }
 
     /// ⑥ 行距 / 字间距可以为负：把行与字挤紧，但不能把排列搞反。
@@ -1006,6 +1216,11 @@ mod tests {
             threshold: 0.5,
             edge_threshold: 0.5,
             invert: false,
+            crop: (0.0, 0.0, 1.0, 1.0),
+            scan_angle: 0,
+            merge_gap_px: 8,
+            order_mode: 0,
+            block_px: 40,
             background: false,
             out: true,
             base: vec![wrobot_core::Polyline::new(vec![(0.0, 0.0), (10.0, 10.0)])],

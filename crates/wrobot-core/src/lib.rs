@@ -43,7 +43,9 @@ pub mod svg_import;
 pub use config::{MachineConfig, Firmware, PenMode};
 pub use error::{Result, WError};
 pub use font::{BuiltinFont, FontStack, StrokeFont};
-pub use gcode::{decimate, decimate_polylines, generate, GcodeOptions, DEFAULT_MIN_STEP};
+pub use gcode::{
+    decimate, decimate_polylines, generate, gcode_xy_bounds, GcodeOptions, DEFAULT_MIN_STEP,
+};
 pub use pdf::to_pdf;
 pub use pdfimport::{
     import_page, page_count as pdf_page_count, PdfError, PdfImage, PdfImageData, PdfImportOpts,

@@ -258,6 +258,9 @@ enum Export {
 }
 
 /// 开始绘制（顶栏与菜单共用）。
+///
+/// 生成 G-code 后先做**边界自检**：内容超出机器幅面时挂起并弹窗，
+/// 由用户决定「仍然执行」还是「取消」——见 [`bounds_warn_window`]。
 fn act_start_draw(app: &mut AppState) {
     let g = app.generate_gcode();
     if g.trim().is_empty() {
@@ -265,9 +268,78 @@ fn act_start_draw(app: &mut AppState) {
         return;
     }
     app.gcode_text = g.clone();
+    if app.bounds_check {
+        if let Some(msg) = app.bounds_warning(&g) {
+            app.pending_run_gcode = g;
+            app.bounds_warn_msg = msg;
+            app.show_bounds_warn = true;
+            app.status = "⚠ 内容超出机器边界，已暂停：请在弹窗中确认是否仍然执行".into();
+            return;
+        }
+    }
+    finish_start(app, g);
+}
+
+/// 边界检查通过（或用户确认）后真正开始运行。
+fn finish_start(app: &mut AppState, g: String) {
     let n = g.lines().filter(|l| !l.trim().is_empty()).count();
     app.start_run(g);
     app.status = format!("已开始传输 {} 行（进度见「运行中」页，传输结果见左下角）", n);
+}
+
+/// 超界确认弹窗：列出超出的方向与数值，用户可选「仍然执行」或「取消」。
+fn bounds_warn_window(app: &mut AppState, ctx: egui::Context) {
+    if !app.show_bounds_warn {
+        return;
+    }
+    // 先拷出一份开关：`.open()` 要独占借用，闭包里还要用 `app`
+    let mut open = app.show_bounds_warn;
+    // `.open(&mut open)` 会借用 open，闭包里不能再改它，改用独立标志记录用户选择
+    let mut confirmed = false; // 点了「仍然执行」
+    let mut cancelled = false; // 点了「取消」
+    egui::Window::new("⚠ 内容超出机器边界")
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .default_width(420.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(&ctx, |ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 90, 30),
+                RichText::new(&app.bounds_warn_msg).strong(),
+            );
+            ui.separator();
+            ui.weak(format!(
+                "机器幅面设置：{:.0} × {:.0} mm（可在「设置 → 机器幅面」修改）",
+                app.machine_w_mm, app.machine_h_mm
+            ));
+            ui.weak("超界运行可能导致撞机 / 软限位报警 / 皮带丢步，请确认纸张与原点位置。");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let g = app.pending_run_gcode.clone();
+                if ui.button(RichText::new("仍然执行").strong()).clicked() {
+                    confirmed = true;
+                    app.pending_run_gcode.clear();
+                    app.bounds_warn_msg.clear();
+                    finish_start(app, g);
+                }
+                if ui.button("取消").clicked() {
+                    cancelled = true;
+                    app.pending_run_gcode.clear();
+                    app.bounds_warn_msg.clear();
+                }
+            });
+        });
+    // 收尾：点了按钮、或点了右上角 ×（open 变 false）都关窗；
+    // 已确认的保留「已开始传输」状态，其余记为取消。
+    if !open || confirmed || cancelled {
+        app.show_bounds_warn = false;
+        app.pending_run_gcode.clear();
+        app.bounds_warn_msg.clear();
+        if !confirmed {
+            app.status = "已取消运行：内容超出机器边界".into();
+        }
+    }
 }
 
 /// 保存工程：有路径就直接覆盖，没有就弹另存为。
@@ -609,6 +681,7 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
 
     // 设置对话框（收纳不常用设置）
     settings_window(app, ui.ctx().clone());
+    bounds_warn_window(app, ui.ctx().clone());
 
     // ── 中央：预览 / 运行进度 ─────────────────────
     egui::CentralPanel::default().show(ui, |ui| {
@@ -2374,6 +2447,63 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
         ui.add(egui::Slider::new(&mut app.images[sel].edge_threshold, 0.05..=0.9).text("边缘阈值(线框)"));
         ui.checkbox(&mut app.images[sel].invert, "反相（黑变白）");
 
+        // —— 绘画方式（顺序 / 方向 / 连笔）——
+        ui.separator();
+        ui.label(RichText::new("绘画方式").strong());
+        ui.horizontal(|ui| {
+            ui.label("扫描方向:");
+            const ANGLES: [&str; 4] = ["横向 →", "对角 45° ↘", "纵向 ↓", "对角 135° ↗"];
+            for (i, name) in ANGLES.iter().enumerate() {
+                ui.selectable_value(&mut app.images[sel].scan_angle, i as u8, *name);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("笔画顺序:");
+            const ORDERS: [&str; 4] = ["默认", "最优路径", "按扫描顺序", "分块蛇形"];
+            for (i, name) in ORDERS.iter().enumerate() {
+                ui.selectable_value(&mut app.images[sel].order_mode, i as u8, *name);
+            }
+        });
+        ui.add_enabled(
+            dt == 2,
+            egui::Slider::new(&mut app.images[sel].merge_gap_px, 0..=40)
+                .text("连笔跨行容差(px)"),
+        );
+        ui.add_enabled(
+            app.images[sel].order_mode == 3,
+            egui::Slider::new(&mut app.images[sel].block_px, 16..=120).text("分块边长(px)"),
+        );
+        match app.images[sel].order_mode {
+            1 => ui.weak("最优路径：最近邻 + 2-opt 重排并允许笔画反向，空移最短。"),
+            2 => ui.weak("按扫描顺序：保持从上到下（或当前扫描方向）的原始顺序。"),
+            3 => ui.weak("分块蛇形：切成方格逐块「犁地」，块内最优、块间蛇形，路线规整。"),
+            _ => ui.weak("默认：素描/线框按扫描顺序，高效连续笔画自动做最优路径。"),
+        };
+
+        // —— 裁剪 ——
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("裁剪").strong());
+            if ui.button("重置裁剪").clicked() {
+                app.images[sel].crop = (0.0, 0.0, 1.0, 1.0);
+            }
+            if app.images[sel].is_cropped() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 120, 40),
+                    "已裁剪（比例基于原图）",
+                );
+            }
+        });
+        let crop = &mut app.images[sel].crop;
+        ui.add(egui::Slider::new(&mut crop.0, 0.0..=0.95).text("左"));
+        ui.add(egui::Slider::new(&mut crop.1, 0.0..=0.95).text("上"));
+        ui.add(egui::Slider::new(&mut crop.2, 0.05..=1.0).text("右"));
+        ui.add(egui::Slider::new(&mut crop.3, 0.05..=1.0).text("下"));
+        let (cl, ct, cr, cb) = app.images[sel].crop;
+        if cr - cl < 0.02 || cb - ct < 0.02 {
+            ui.colored_label(egui::Color32::from_rgb(200, 60, 60), "裁剪区域太小（宽/高不足 2%）");
+        }
+
         // 参数变化需要重算基础笔迹
         app.regenerate_image(sel);
 
@@ -2406,6 +2536,22 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
         if dt == 2 {
             ui.weak("连续笔画：把相邻影线串起来画，抬笔次数最少、绘制最快；行间距建议大于 XY 最小步进。");
         }
+        ui.horizontal(|ui| {
+            ui.label("默认扫描方向:");
+            const ANGLES: [&str; 4] = ["横向 →", "对角 45° ↘", "纵向 ↓", "对角 135° ↗"];
+            for (i, name) in ANGLES.iter().enumerate() {
+                ui.selectable_value(&mut app.img_scan_angle, i as u8, *name);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("默认笔画顺序:");
+            const ORDERS: [&str; 4] = ["默认", "最优路径", "按扫描顺序", "分块蛇形"];
+            for (i, name) in ORDERS.iter().enumerate() {
+                ui.selectable_value(&mut app.img_order_mode, i as u8, *name);
+            }
+        });
+        ui.add(egui::Slider::new(&mut app.img_merge_gap, 0..=40).text("连笔跨行容差(px)"));
+        ui.add(egui::Slider::new(&mut app.img_block_px, 16..=120).text("分块边长(px)"));
         ui.weak("以上为默认值；单张图片可在上方单独覆盖");
 }
 
@@ -2458,10 +2604,7 @@ fn panel_running(app: &mut AppState, ui: &mut Ui) {
     ui.separator();
     ui.horizontal(|ui| {
         if ui.button("开始运行").clicked() {
-            let g = app.generate_gcode();
-            app.gcode_text = g.clone();
-            app.start_run(g);
-            app.status = "已启动运行（见左侧「运行中」页）".into();
+            act_start_draw(app);
         }
         if snap.running && !snap.paused {
             if ui.button("暂停").clicked() {
@@ -2475,6 +2618,8 @@ fn panel_running(app: &mut AppState, ui: &mut Ui) {
         if ui.button("停止").clicked() {
             app.stop_run();
         }
+        ui.checkbox(&mut app.bounds_check, "超界检测");
+        ui.weak(format!("机器幅面 {:.0}×{:.0}mm", app.machine_w_mm, app.machine_h_mm));
     });
     ui.weak("运行中可切换到其他页继续编辑，绘制进度互不干扰");
 
