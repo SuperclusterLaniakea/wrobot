@@ -124,7 +124,7 @@ impl TextBox {
 }
 
 /// 图片绘制类型。
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ImgDraw {
     /// 线框：提取轮廓边缘
     Wire = 0,
@@ -132,21 +132,197 @@ pub enum ImgDraw {
     Sketch = 1,
     /// 高效：把相邻行的墨段串成连续笔画（蛇形）+ 最优路径排序
     Continuous = 2,
+    /// 中心线：细化成单像素骨架后再描线，适合线稿/logo/字帖
+    Centerline = 3,
+    /// 描边：等值轮廓线，只画明暗交界，不填影线
+    Contour = 4,
+    /// 交叉排线：主方向影线 + 暗部垂直排线
+    CrossHatch = 5,
+    /// 网点：按灰度疏密生成半调网点
+    Halftone = 6,
+    /// 素描原稿：沿原稿每一笔的墨脊逐笔追踪，穿过交叉点不串线，按明暗分层落笔
+    SketchOriginal = 7,
+    /// 素描调子：把明暗量化成多层，亮部留白，暗部叠交叉排线，轮廓单独加重
+    SketchHatch = 8,
+    /// 分区重绘：按深度分层、细分块定方向，浅层先铺、深层后叠，逐层压暗
+    RegionRedraw = 9,
+    /// 素描笔触：残差驱动短直线，暗部自动加密，方向沿轮廓或原稿笔触
+    StrokeSketch = 10,
 }
 
 impl ImgDraw {
     pub fn names() -> &'static [&'static str] {
-        &["线框（轮廓）", "素描（影线）", "高效（连续笔画）"]
+        &[
+            "线框（边缘影线）",
+            "素描（影线）",
+            "高效（连续笔画）",
+            "中心线（骨架）",
+            "描边（等值轮廓）",
+            "交叉排线（明暗）",
+            "网点（半调）",
+            "素描原稿",
+            "素描调子（分层排线）",
+            "分区重绘（深度分层）",
+            "素描笔触（融合布线）",
+        ]
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::names()[self as usize]
+    }
+
+    /// 当前模式的一句话说明（面板上直接显示，避免用户猜参数含义）。
+    pub fn hint(self) -> &'static str {
+        match self {
+            ImgDraw::Wire => "沿图像边缘铺影线，适合线条清晰的照片或扫描稿。",
+            ImgDraw::Sketch => "按明暗阈值逐行铺影线，最经典的素描效果。",
+            ImgDraw::Continuous => "把影线串成长笔画，抬落笔最少、绘制最快。",
+            ImgDraw::Centerline => "先把墨迹细化成单像素骨架再描线，适合线稿、logo、硬笔字。",
+            ImgDraw::Contour => "只画明暗交界的等值轮廓线，画面最干净，适合简笔画。",
+            ImgDraw::CrossHatch => "主方向影线打底，暗部再叠一层垂直排线，明暗层次更丰富。",
+            ImgDraw::Halftone => "按灰度生成大小不一的网点，适合照片/版画风格；网点越多越慢。",
+            ImgDraw::SketchOriginal => {
+                "逐笔还原原稿，但按**明暗**取舍：亮部留白、中间调稀疏、暗部排满，\
+                 轮廓/结构线自动加重。素描的明暗是靠线条疏密表现的，不是把原稿每根线\
+                 都描一遍。适合铅笔素描/速写草稿。"
+            }
+            ImgDraw::SketchHatch => {
+                "把明暗翻译成排线：亮部留白，中间调一层单向稀排线，越暗叠越多层\
+                 交叉排线；轮廓再用梯度单独提一遍重线。同一支笔靠疏密表现灰阶，\
+                 适合照片、铅笔素描和成片暗部。"
+            }
+            ImgDraw::RegionRedraw => {
+                "先量出画面里每一小片的深度层（约 5 层），再把每层切成细块单独定\
+                 排线方向：浅层用浅铅笔先铺，深层用深铅笔逐层叠加，最后压轮廓。\
+                 比调子模式更贴原稿的局部走向，适合铅笔素描、人像。"
+            }
+            ImgDraw::StrokeSketch => {
+                "按真实素描的工序走：先量每一小块还差多少墨，再用**短直线段**去补。\
+                 差得多就排得密、差得少就留得疏，线距不再全图统一；方向可沿轮廓\
+                 （等照度线）或原稿笔触，暗部再叠交叉层，最后压少量结构线。"
+            }
+        }
     }
 
     /// 由下拉序号构造；越界时退回「素描」（保留旧存档兼容）。
     pub fn from_usize(i: usize) -> Self {
         match i {
             0 => ImgDraw::Wire,
+            1 => ImgDraw::Sketch,
             2 => ImgDraw::Continuous,
+            3 => ImgDraw::Centerline,
+            4 => ImgDraw::Contour,
+            5 => ImgDraw::CrossHatch,
+            6 => ImgDraw::Halftone,
+            7 => ImgDraw::SketchOriginal,
+            8 => ImgDraw::SketchHatch,
+            9 => ImgDraw::RegionRedraw,
+            10 => ImgDraw::StrokeSketch,
             _ => ImgDraw::Sketch,
         }
     }
+}
+
+/// 一支真实的笔：线宽、满覆盖能压出的最深色、笔色、以及换笔后的套准偏移。
+///
+/// 写字机没有笔压，但可以换笔。HB、2B、4B、8B 或 0.25/0.5/1.0mm 的针管笔
+/// 能压出的最深处不同——把明暗带按这个值分给不同的笔，黑色才真正黑得下去；
+/// 只让一支 HB 靠排线密度硬撑，暗部永远是一层灰。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PenSpec {
+    /// 界面显示名（如「2B 0.5」）
+    pub name: String,
+    /// 笔尖线宽（毫米）
+    pub width_mm: f64,
+    /// 满覆盖时的视觉深度（0~1）：HB≈0.45，2B≈0.65，4B≈0.82，8B≈0.95
+    pub darkness: f64,
+    /// 笔色（预览与分笔标签用；铅笔用灰阶）
+    pub color: [u8; 3],
+    /// 换笔后的笔尖套准偏移 `(dx,dy)`（毫米）。换笔位置不可能完全重合，
+    /// 用这个小偏移把整层推回去，比重新对刀快。
+    pub offset_mm: [f64; 2],
+    /// 是否参与多笔分层（关掉后这支笔的层会分给其他笔）
+    #[serde(default = "default_true")]
+    pub on: bool,
+}
+
+impl PenSpec {
+    /// 转成算法只关心的两个量。
+    pub fn to_hatch(&self) -> crate::sketch::HatchPen {
+        crate::sketch::HatchPen {
+            width_mm: self.width_mm.clamp(0.15, 1.6),
+            darkness: self.darkness.clamp(0.2, 1.0) as f32,
+        }
+    }
+}
+
+/// 默认四支笔：从浅到深。
+///
+/// 真实铅笔换的是软硬（石墨浓度），不是笔尖粗细：一支削好的 8B 照样能画出
+/// 0.3mm 的线。原稿实测的发丝、睫毛都只有 0.2~0.4mm，上一版 0.7mm 的 8B
+/// 落在纸上仍是一根根粗黑杠。现在线宽收到 0.20~0.40mm：原稿的浅排线只有
+/// 1px（300mm 高时约 0.13mm），0.28mm 的 HB 叠上相邻几根就糊成一条粗带，
+/// 和「细而密」正好相反。明暗仍交给石墨浓度，密度交给更细的排线间距。
+pub fn default_pens() -> Vec<PenSpec> {
+    vec![
+        PenSpec {
+            name: "HB 0.20".to_string(),
+            width_mm: 0.20,
+            darkness: 0.42,
+            color: [150, 150, 150],
+            offset_mm: [0.0, 0.0],
+            on: true,
+        },
+        PenSpec {
+            name: "2B 0.26".to_string(),
+            width_mm: 0.26,
+            darkness: 0.62,
+            color: [105, 105, 105],
+            offset_mm: [0.0, 0.0],
+            on: true,
+        },
+        PenSpec {
+            name: "4B 0.32".to_string(),
+            width_mm: 0.32,
+            darkness: 0.80,
+            color: [62, 62, 62],
+            offset_mm: [0.0, 0.0],
+            on: true,
+        },
+        PenSpec {
+            name: "8B 0.40".to_string(),
+            width_mm: 0.40,
+            darkness: 0.93,
+            color: [25, 25, 25],
+            offset_mm: [0.0, 0.0],
+            on: true,
+        },
+    ]
+}
+
+/// 多笔绘制里「文字 / 边框」默认用第二支笔（2B 0.5）——比 HB 更清楚，
+/// 又不至于像 8B 那样把字压得发糊。
+fn default_main_pen() -> usize {
+    1
+}
+
+/// 针管笔组：0.25 / 0.5 / 0.8 / 1.0mm。针管笔颜色都接近纯黑，
+/// 明暗只靠线宽与密度，所以这里把「可压深」也按线宽排开。
+pub fn needle_pens() -> Vec<PenSpec> {
+    let mut v = default_pens();
+    let spec = [
+        ("0.25 针管", 0.25, 0.55, 90u8),
+        ("0.5 针管", 0.5, 0.72, 60),
+        ("0.8 针管", 0.8, 0.85, 35),
+        ("1.0 针管", 1.0, 0.95, 15),
+    ];
+    for (p, (name, w, d, c)) in v.iter_mut().zip(spec.iter()) {
+        p.name = (*name).to_string();
+        p.width_mm = *w;
+        p.darkness = *d;
+        p.color = [*c, *c, *c];
+    }
+    v
 }
 
 /// 一张已导入的图片（前景可打印 / 背景参考不打印）。
@@ -192,6 +368,39 @@ pub struct ImageObject {
     /// 分块边长（像素，`order_mode == 3` 时生效）。
     #[serde(default = "default_block_px")]
     pub block_px: u32,
+    /// **素描原稿模式**：暗部线条最多叠描几遍（1 = 只描一遍）。
+    ///
+    /// 叠描次数由每条笔迹的局部明暗决定：起稿轻线一遍，暗部按力度多描，
+    /// 偏移小于笔宽，叠成一根更重的线而不是并排几根。
+    #[serde(default = "default_sketch_pressure")]
+    pub sketch_pressure: u32,
+    /// **素描原稿模式**：手抖与重描的偏移幅度（毫米）。
+    ///
+    /// 沿线条法向做低频起伏（不是周期性正弦），并给长线加一点弓形；
+    /// 0 = 严格描摹原稿，0.2~0.4 接近铅笔的手感。
+    #[serde(default = "default_sketch_jitter")]
+    pub sketch_jitter: f64,
+    /// **素描原稿模式**：实际画笔线宽（毫米）。决定一条线盖多宽、两根线最近能排多密。
+    #[serde(default = "default_sketch_pen")]
+    pub sketch_pen: f64,
+    /// **素描调子模式**：明暗分成几层（3..=8）。层数越多，暗部叠的交叉排线越多。
+    #[serde(default = "default_hatch_levels")]
+    pub hatch_levels: u32,
+    /// **素描调子模式**：第一层排线的基准角（度）。暗部后续各层按固定角差交叉。
+    #[serde(default = "default_hatch_angle")]
+    pub hatch_angle: f64,
+    /// **分区重绘模式**：方向采样块的边长（毫米）。块越细，局部走向越贴原稿。
+    #[serde(default = "default_region_block_mm")]
+    pub region_block_mm: f64,
+    /// **素描笔触模式**：单根短直线的长度（毫米）。
+    #[serde(default = "default_stroke_len_mm")]
+    pub stroke_len_mm: f64,
+    /// **素描笔触模式**：走向参考（0 轮廓 / 1 原稿 / 2 混合）。
+    #[serde(default = "default_stroke_follow")]
+    pub stroke_follow: u8,
+    /// **多笔分层**：把明暗带分给不同的笔（HB/2B/4B/8B），分别出图、换笔绘制。
+    #[serde(default)]
+    pub multi_pen: bool,
     /// 是否作为背景参考（浅色显示、不参与打印）
     pub background: bool,
     /// **是否并入输出**（每张图单独控制）。
@@ -202,6 +411,10 @@ pub struct ImageObject {
     pub out: bool,
     /// 生成后的基础笔迹（页面毫米，未含 x/y/scale/rotation/flip 变换，尺寸为 natural_w × natural_h）
     pub base: Vec<Polyline>,
+    /// 与 `base` 一一对应：每根笔迹由哪支笔绘制（下标对应 [`AppState::pens`]）。
+    /// 旧工程没有这个字段，载入后视为全 0（单笔）。
+    #[serde(default)]
+    pub base_pens: Vec<u8>,
     /// 基础尺寸（毫米，scale=1 时）
     pub natural_w: f64,
     pub natural_h: f64,
@@ -211,9 +424,11 @@ pub struct ImageObject {
 
 impl ImageObject {
     /// 由导入参数计算「生成密钥」，任一参数变化即触发重算。
-    pub fn key(&self) -> u64 {
+    pub fn key(&self, pens_hash: u64) -> u64 {
         let mut h = self.bytes.len() as u64;
         h = h.wrapping_mul(31).wrapping_add(self.draw as u64);
+        h = h.wrapping_mul(31).wrapping_add(self.multi_pen as u64);
+        h = h.wrapping_mul(31).wrapping_add(pens_hash);
         h = h.wrapping_mul(31).wrapping_add(self.step_px as u64);
         h = h.wrapping_mul(31).wrapping_add((self.threshold * 1000.0) as u64);
         h = h.wrapping_mul(31).wrapping_add((self.edge_threshold * 1000.0) as u64);
@@ -229,6 +444,14 @@ impl ImageObject {
             self.merge_gap_px as f64,
             self.order_mode as f64,
             self.block_px as f64,
+            self.sketch_pressure as f64,
+            self.sketch_jitter,
+            self.sketch_pen,
+            self.hatch_levels as f64,
+            self.hatch_angle,
+            self.region_block_mm,
+            self.stroke_len_mm,
+            self.stroke_follow as f64,
         ] {
             h = h.wrapping_mul(31).wrapping_add((v * 1000.0) as u64);
         }
@@ -304,6 +527,177 @@ impl ImageObject {
     }
 }
 
+/// 大纸张分页布局：把页面按「可绘制幅面」切成 `cols × rows` 个图块。
+///
+/// 图块原点固定在页面尺寸的整数倍上（`start_col/start_row` 允许为负），
+/// 这样每页绘制的都是页面坐标的同一块区域；按行优先逐页绘制后，
+/// 只要把纸张按顺序边对边拼接即可复原整幅图。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TileLayout {
+    /// 单页可绘制宽/高（页面与机器幅面的较小者）
+    pub width_mm: f64,
+    pub height_mm: f64,
+    pub cols: usize,
+    pub rows: usize,
+    /// 第一列/行对应的页面网格序号（可能为负）
+    pub start_col: i64,
+    pub start_row: i64,
+}
+
+impl TileLayout {
+    pub fn count(&self) -> usize {
+        self.cols.saturating_mul(self.rows)
+    }
+
+    /// 第 `page` 页（0 起、行优先）左上角在页面毫米坐标中的位置。
+    pub fn origin(&self, page: usize) -> Option<(f64, f64)> {
+        if page >= self.count() || self.cols == 0 {
+            return None;
+        }
+        let c = (page % self.cols) as i64;
+        let r = (page / self.cols) as i64;
+        Some((
+            (self.start_col + c) as f64 * self.width_mm,
+            (self.start_row + r) as f64 * self.height_mm,
+        ))
+    }
+}
+
+/// 四角 1cm L 形定位标记：每个角的横/竖两条臂**各自从角点起笔**。
+///
+/// 之前把每个角写成一条 `(a,0)→(0,0)→(0,a)` 的三点折线，看似没问题，但
+/// 「角点」是折线的**中间点**：笔在臂端落笔后要走到角点再折返，落笔延迟 /
+/// 抽稀 / 空移任一环节出偏差，角点（尤其是起点 (0,0)）就会缺一小截。
+/// 拆成每条臂两点后，每条都从角点精确落笔，原点角一定有笔迹。
+///
+/// `origin` = `(原点在右边?, 原点在下边?)`：**原点那一角的两条臂加长一倍，
+/// 再加一道 45° 斜线**。四个 L 本身是完全对称的，光看 L 分不出 (0,0) 落在
+/// 哪个角——Y 反了也看不出来，只能等画正文时才发现整页颠倒。加了这标记，
+/// 一抬手就能确认方向对不对。
+pub fn corner_mark_polylines(w: f64, h: f64, arm: f64, origin: (bool, bool)) -> Vec<Polyline> {
+    let a = arm.min(w * 0.5).min(h * 0.5);
+    if a <= 0.0 || w <= 0.0 || h <= 0.0 {
+        return Vec::new();
+    }
+    let big = (a * 2.0).min(w).min(h);
+    let mut out: Vec<Polyline> = Vec::new();
+    for &(cx, cy) in &[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)] {
+        // 臂一律朝纸内
+        let sx = if cx > 0.0 { -1.0 } else { 1.0 };
+        let sy = if cy > 0.0 { -1.0 } else { 1.0 };
+        let is_origin = (cx > 0.0) == origin.0 && (cy > 0.0) == origin.1;
+        let len = if is_origin { big } else { a };
+        out.push(Polyline::new(vec![(cx, cy), (cx + sx * len, cy)]));
+        out.push(Polyline::new(vec![(cx, cy), (cx, cy + sy * len)]));
+        if is_origin {
+            // 从角点出发的 45° 短线，长度与普通臂相同：一眼就能认出原点角
+            let d = a * std::f64::consts::FRAC_1_SQRT_2;
+            out.push(Polyline::new(vec![(cx, cy), (cx + sx * d, cy + sy * d)]));
+        }
+    }
+    out
+}
+
+/// 把一条折线按矩形裁剪成若干连续可见段（Liang–Barsky，逐段求交）。
+fn clip_polyline_to_rect(
+    pts: &[(f64, f64)],
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+) -> Vec<Vec<(f64, f64)>> {
+    if pts.len() < 2 {
+        return Vec::new();
+    }
+    let mut out: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut run: Vec<(f64, f64)> = Vec::new();
+    for w in pts.windows(2) {
+        let clipped = clip_segment(w[0], w[1], x0, y0, x1, y1);
+        let Some((a, b)) = clipped else {
+            if run.len() >= 2 {
+                out.push(std::mem::take(&mut run));
+            } else {
+                run.clear();
+            }
+            continue;
+        };
+        if run.is_empty() {
+            run.push(a);
+            run.push(b);
+        } else {
+            let last = *run.last().unwrap();
+            if (last.0 - a.0).abs() < 1e-7 && (last.1 - a.1).abs() < 1e-7 {
+                run.push(b);
+            } else {
+                if run.len() >= 2 {
+                    out.push(std::mem::take(&mut run));
+                } else {
+                    run.clear();
+                }
+                run.push(a);
+                run.push(b);
+            }
+        }
+    }
+    if run.len() >= 2 {
+        out.push(run);
+    }
+    out.into_iter()
+        .filter(|r| {
+            r.len() >= 2
+                && r.first()
+                    .zip(r.last())
+                    .is_some_and(|(a, b)| (a.0 - b.0).abs() > 1e-9 || (a.1 - b.1).abs() > 1e-9)
+        })
+        .collect()
+}
+
+/// 线段 → 矩形内的可见部分（含两端都落在矩形外但穿过矩形的情况）。
+fn clip_segment(
+    a: (f64, f64),
+    b: (f64, f64),
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+) -> Option<((f64, f64), (f64, f64))> {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    let p = [-dx, dx, -dy, dy];
+    let q = [a.0 - x0, x1 - a.0, a.1 - y0, y1 - a.1];
+    for i in 0..4 {
+        if p[i].abs() < 1e-12 {
+            if q[i] < 0.0 {
+                return None;
+            }
+        } else {
+            let r = q[i] / p[i];
+            if p[i] < 0.0 {
+                if r > t1 {
+                    return None;
+                }
+                if r > t0 {
+                    t0 = r;
+                }
+            } else {
+                if r < t0 {
+                    return None;
+                }
+                if r < t1 {
+                    t1 = r;
+                }
+            }
+        }
+    }
+    if t0 > t1 {
+        return None;
+    }
+    Some((
+        (a.0 + dx * t0, a.1 + dy * t0),
+        (a.0 + dx * t1, a.1 + dy * t1),
+    ))
+}
+
 /// 格子类型。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GridKind {
@@ -357,12 +751,71 @@ fn default_block_px() -> u32 {
     40
 }
 
+/// 素描原稿：默认叠 3 遍（起稿 1 遍、暗部加到 3 遍），
+/// 这样原稿里的轻重层次才看得出来。
+fn default_sketch_pressure() -> u32 {
+    3
+}
+
+/// 素描原稿模式默认手抖/重描幅度 0.12mm。
+///
+/// 这是笔尖落在墨迹上的自然偏移量：原稿的线宽通常才 0.3mm，
+/// 抖动一旦超过半个线宽，线就开始从墨迹上滑开、多遍也会散成几根头发丝。
+fn default_sketch_jitter() -> f64 {
+    0.12
+}
+
+/// 素描原稿模式默认画笔线宽 0.5mm（中性笔/圆珠笔量级）。
+///
+/// 这个值直接决定「一格里能排几根线」：填得太细，算法会以为还能再密，
+/// 结果整页铺满；填得太粗，暗部会被压得过稀、层次塌掉。
+fn default_sketch_pen() -> f64 {
+    0.5
+}
+
+/// 素描调子默认 6 层：4 层以下暗部层次会明显断层，8 层以上同一支笔画不出更细的灰。
+fn default_hatch_levels() -> u32 {
+    6
+}
+
+/// 素描调子默认 35°：最接近人手自然的斜向排线，又能和 90° 的轮廓区分开。
+fn default_hatch_angle() -> f64 {
+    35.0
+}
+
+/// 分区重绘默认分块 2.5mm：A4 人像上约能分出 60×90 个方向块，
+/// 眼窝、鼻梁、脸颊各走各的；再细就只剩像素噪声，方向反而不稳。
+fn default_region_block_mm() -> f64 {
+    2.5
+}
+
+/// 素描笔触默认 3.2mm：真实素描除轮廓外大多是 2~4mm 的短直线。
+/// 再长就成排线，再短则碎成点画，明暗块面连不起来。
+fn default_stroke_len_mm() -> f64 {
+    3.2
+}
+
+/// 默认「混合」：先沿原稿笔触/轮廓，暗部再叠交叉层，兼顾形与调子。
+fn default_stroke_follow() -> u8 {
+    2
+}
+
+/// 四角定位框默认宽度（毫米）。
+fn default_corner_w() -> f64 {
+    200.0
+}
+
+/// 四角定位框默认高度（毫米）：留出 A4 上下的纸边，避免 L 标记贴到纸边。
+fn default_corner_h() -> f64 {
+    280.0
+}
+
 /// 页面外侧标尺（顶部 + 左侧毫米刻度）默认开启。
 fn default_ruler_on() -> bool {
     true
 }
 
-/// 自定义网格覆盖层默认关闭（保留原有 10mm 淡网格作为基线）。
+/// 页面网格默认关闭：不勾选时预览页不显示任何网格线。
 fn default_grid_overlay() -> bool {
     false
 }
@@ -379,6 +832,11 @@ fn default_grid_div_y() -> usize {
 
 fn one() -> usize {
     1
+}
+
+/// 画布视图缩放默认值：1.0 = 整页适应窗口。
+fn default_canvas_zoom() -> f32 {
+    1.0
 }
 
 /// 参考项目 `default.properties`：jog_speed=10000
@@ -429,6 +887,35 @@ fn trim_mm(v: f64) -> String {
     let s = format!("{:.1}", v);
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
+
+/// 当前页面的任务统计（只保留展示需要的量，避免每帧重复计算折线长度）。
+#[derive(Clone, Copy, Default)]
+pub struct JobStats {
+    /// 笔画条数（抬笔次数 + 1）
+    pub strokes: usize,
+    /// 折线点总数
+    pub points: usize,
+    /// 落笔墨线总长（mm）
+    pub ink_mm: f64,
+    /// 笔画之间的空移总长（mm）
+    pub travel_mm: f64,
+}
+
+/// 多笔绘制里的一支笔：一份独立 G-code + 进度页要显示的笔迹。
+#[derive(Clone)]
+pub struct PenJob {
+    /// 笔在**启用笔组**里的下标（与 [`ImageObject::base_pens`] 同一套编号）
+    pub pen: usize,
+    /// 界面显示名
+    pub name: String,
+    pub gcode: String,
+    pub paths: Vec<Polyline>,
+}
+
+/// 「不属于任何一支笔」的笔迹（文字、边框、四角标记、单笔图片）。
+///
+/// 多笔绘制时这些内容会被分给「主笔」；其余时候只用于预览按主题墨色显示。
+pub const NON_PEN: u8 = u8::MAX;
 
 /// 整个应用的可变状态。
 ///
@@ -560,6 +1047,39 @@ pub struct AppState {
     /// 图片页拖拽中记录的起始毫米坐标（None 表示未在拖动）
     #[serde(skip)]
     pub img_drag: Option<(f64, f64)>,
+    /// 待重算的「图片参数键」+ 它最后一次变化的时间。
+    ///
+    /// 拖滑杆时参数每帧都在变，若每帧都重算，界面会一顿一顿（素描模式一张图
+    /// 要跑一百多毫秒）。这里只记下「参数变了」，等它稳定片刻再算一次。
+    #[serde(skip)]
+    pub img_regen_at: Option<(u64, std::time::Instant)>,
+
+    // —— 大纸张分页（图片超出机器幅面时拆页绘制） ——
+    /// 是否启用分页绘制：把前景输出图片按可绘制幅面切成多页，逐页下发。
+    #[serde(default)]
+    pub tile_on: bool,
+    /// 每页是否绘制 1cm 四角 L 形定位标记（尖端朝页角、开口朝内）。
+    #[serde(default = "default_true")]
+    pub tile_marks: bool,
+    /// 当前要绘制/预览的分页序号（0 起，按行优先）。
+    #[serde(default)]
+    pub tile_page: usize,
+
+    // —— 四角定位框 ——
+    /// 定位框宽度（毫米）：四角 L 标记与分页幅面共用的有效绘制宽度。
+    #[serde(default = "default_corner_w")]
+    pub corner_w_mm: f64,
+    /// 定位框高度（毫米）：默认 280，避免 L 标记贴到 A4 纸边（297）。
+    #[serde(default = "default_corner_h")]
+    pub corner_h_mm: f64,
+
+    // —— 分页缩略图缓存（运行时，不入存档） ——
+    /// 缓存对应的参数指纹，变化时整表重置。
+    #[serde(skip)]
+    pub tile_cache_key: u64,
+    /// 各页图片笔迹缓存（`None` = 尚未计算）；与笔标签一起缓存，预览按笔色画。
+    #[serde(skip)]
+    pub tile_cache_pages: Vec<Option<Vec<(Polyline, u8)>>>,
 
     // —— PDF 导入 ——
     /// 最近选择的 PDF 路径
@@ -581,6 +1101,7 @@ pub struct AppState {
     pub img_thr: f64,
     pub img_edge: f64,
     pub img_invert: bool,
+    /// 默认绘制类型：0 线框 / 1 素描 / 2 连续 / 3 中心线 / 4 描边 / 5 交叉排线 / 6 网点
     pub img_draw_type: usize,
     /// 默认扫描方向：0 横向 / 1 对角 45° / 2 纵向 / 3 对角 135°
     #[serde(default)]
@@ -594,6 +1115,47 @@ pub struct AppState {
     /// 默认分块边长（像素）
     #[serde(default = "default_block_px")]
     pub img_block_px: u32,
+    /// 默认素描原稿叠描遍数
+    #[serde(default = "default_sketch_pressure")]
+    pub img_sketch_pressure: u32,
+    /// 默认素描原稿重描偏移（毫米）
+    #[serde(default = "default_sketch_jitter")]
+    pub img_sketch_jitter: f64,
+    /// 默认素描原稿画笔线宽（毫米）
+    #[serde(default = "default_sketch_pen")]
+    pub img_sketch_pen: f64,
+    /// 默认素描调子明暗层数
+    #[serde(default = "default_hatch_levels")]
+    pub img_hatch_levels: u32,
+    /// 默认素描调子排线基准角（度）
+    #[serde(default = "default_hatch_angle")]
+    pub img_hatch_angle: f64,
+    /// 默认分区重绘方向分块边长（毫米）
+    #[serde(default = "default_region_block_mm")]
+    pub img_region_block_mm: f64,
+    /// 默认素描笔触长度（毫米）
+    #[serde(default = "default_stroke_len_mm")]
+    pub img_stroke_len_mm: f64,
+    /// 默认素描笔触走向参考（0 轮廓 / 1 原稿 / 2 混合）
+    #[serde(default = "default_stroke_follow")]
+    pub img_stroke_follow: u8,
+
+    // —— 多笔分层 ——
+    /// 当前机器上的笔组（亮 → 暗）。换笔绘制时按这个顺序一支一支画。
+    #[serde(default = "default_pens")]
+    pub pens: Vec<PenSpec>,
+    /// 多笔绘制时文字 / 边框 / 四角标记用哪支笔（**启用笔组**里的下标）。
+    #[serde(default = "default_main_pen")]
+    pub main_pen: usize,
+
+    // —— 预览 ——
+    /// 笔尖实际粗细（毫米），**只用于预览显示**，不参与 G-code。
+    ///
+    /// 预览以前一律按 1.3px 画线，而 0.5mm 的笔在 1:1 显示下是
+    /// ~3px、放大后更粗。结果纸上已经排满的线，屏幕上看着稀稀拉拉，
+    /// 用户自然觉得「算法画得不像」。按真实笔宽折算才看得准。
+    #[serde(default = "default_sketch_pen")]
+    pub preview_pen_mm: f64,
 
     // —— 运行边界自检 ——
     /// 生成 G-code 后先与机器幅面（`machine_w_mm`×`machine_h_mm`）比对，超界弹窗询问
@@ -652,7 +1214,8 @@ pub struct AppState {
     /// 页面外侧**标尺**（顶部 + 左侧毫米刻度），帮助把内容放到精确位置。
     #[serde(default = "default_ruler_on")]
     pub ruler_on: bool,
-    /// 自定义**网格覆盖层**：可调节行/列数量的浅色虚线网格（仅用于定位，不打印）。
+    /// **页面网格开关**：关闭时预览（编辑页/进度页）不画任何网格线；
+    /// 打开后显示 10mm 基准网格，并按下方行/列数叠加浅色等分参考线。
     #[serde(default = "default_grid_overlay")]
     pub grid_overlay: bool,
     /// 自定义网格的**列数**（竖向分割线数量）。
@@ -735,6 +1298,12 @@ pub struct AppState {
     /// 标签形如 `串口线 · USB-SERIAL CH340 (COM3)`，用来把蓝牙和有线串口线分开显示。
     #[serde(skip)]
     pub port_labels: Vec<(String, String, bool)>,
+    /// 后台扫描线程的结果通道；为 `Some` 表示扫描仍在进行。
+    #[serde(skip)]
+    pub port_scan_rx: Option<std::sync::mpsc::Receiver<Vec<wrobot_core::serial::PortEntry>>>,
+    /// 启动时先等端口扫描完成再自动连接，避免两个线程同时试开同一个口。
+    #[serde(skip)]
+    pub auto_connect_after_scan: bool,
     /// 机器物理绘图幅面（毫米），用于画布比例提示与归零边界
     pub machine_w_mm: f64,
     pub machine_h_mm: f64,
@@ -783,14 +1352,62 @@ pub struct AppState {
     /// 机器测试：自定义单行 G-code
     pub test_custom_gcode: String,
 
+    // —— 界面 / 画布视图 ——
+    /// 深色主题（false = 浅色）。
+    #[serde(default)]
+    pub dark_mode: bool,
+    /// 画布缩放倍率：1.0 = 整页适应窗口，最高 6 倍。持久化，便于继续上次的观察位置。
+    #[serde(default = "default_canvas_zoom")]
+    pub canvas_zoom: f32,
+    /// 画布平移（屏幕点；仅在放大后生效，运行时不保存）。
+    #[serde(skip)]
+    pub canvas_pan: (f32, f32),
+    /// 快速上手 / 帮助窗口。
+    #[serde(skip)]
+    pub help_open: bool,
+    /// 关于窗口。
+    #[serde(skip)]
+    pub about_open: bool,
+    /// 缓存的任务统计（笔迹数 / 墨线 / 空移）。
+    #[serde(skip)]
+    pub stats: JobStats,
+    /// 已应用的主题（`None` 表示尚未初始化），用于按需重设样式。
+    #[serde(skip)]
+    pub theme_applied: Option<bool>,
+
     // —— 运行态 ——
     #[serde(skip)]
-    pub tab: usize, // 0文字 1表格 2格子 3绘图 4笔记 5图片 6设备 7导入导出 8运行中
+    pub tab: usize, // 0文字 1表格 2格子 3绘图 4笔记 5图片 6设备 7保留 8导入导出 9运行中
     #[serde(skip)]
     pub preview: Vec<Polyline>,
+    /// 与 `preview` 一一对应：每根笔迹由哪支笔绘制。
+    /// `NON_PEN` = 不属于笔组（文字/边框/单笔内容），按主题墨色显示。
+    #[serde(skip)]
+    pub preview_pens: Vec<u8>,
     /// 开始运行那一刻被「冻结」的页面笔迹（用于运行中进度页，与主编辑页互不干扰）。
     #[serde(skip)]
     pub run_preview: Vec<Polyline>,
+    /// 多笔绘制的分笔任务队列（每支笔一份 G-code）。
+    #[serde(skip)]
+    pub pen_jobs: Vec<PenJob>,
+    /// 当前正在画第几支笔（`pen_jobs` 下标）。
+    #[serde(skip)]
+    pub pen_job_idx: usize,
+    /// 已画完、等待用户换笔确认。
+    #[serde(skip)]
+    pub pen_wait: bool,
+    /// 队列运行中（用来捕捉「上一支笔刚画完」这一瞬间）。
+    #[serde(skip)]
+    pub pen_running: bool,
+    /// 当前这支笔已下发，等设备回报 running 后才能判断「画完了」。
+    #[serde(skip)]
+    pub pen_active: bool,
+    /// 本次下发是否已经见过 `running = true`（防止刚下发、线程还没起来就误判结束）。
+    #[serde(skip)]
+    pub pen_seen_running: bool,
+    /// 本次下发时刻（兜底：设备没连上时也会在超时后让用户重试/跳过）。
+    #[serde(skip)]
+    pub pen_dispatched_at: Option<std::time::Instant>,
     #[serde(skip)]
     pub gcode_text: String,
     #[serde(skip)]
@@ -894,6 +1511,10 @@ impl AppState {
             images: Vec::new(),
             sel_image: 0,
             img_drag: None,
+            img_regen_at: None,
+            tile_on: false,
+            tile_marks: true,
+            tile_page: 0,
             pdf_path: String::new(),
             pdf_pages: 0,
             pdf_page: 1,
@@ -908,6 +1529,17 @@ impl AppState {
             img_merge_gap: 8,
             img_order_mode: 0,
             img_block_px: 40,
+            img_sketch_pressure: 3,
+            img_sketch_jitter: 0.12,
+            img_sketch_pen: 0.5,
+            img_hatch_levels: 6,
+            img_hatch_angle: 35.0,
+            img_region_block_mm: 2.5,
+            img_stroke_len_mm: 3.2,
+            img_stroke_follow: 2,
+            pens: default_pens(),
+            main_pen: default_main_pen(),
+            preview_pen_mm: 0.5,
             bounds_check: true,
             show_bounds_warn: false,
             pending_run_gcode: String::new(),
@@ -963,8 +1595,14 @@ impl AppState {
             serial_ports: Vec::new(),
             serial_ports_all: Vec::new(),
             port_labels: Vec::new(),
+            port_scan_rx: None,
+            auto_connect_after_scan: false,
             machine_w_mm: 200.0,
-            machine_h_mm: 280.0,
+            machine_h_mm: 300.0,
+            corner_w_mm: 200.0,
+            corner_h_mm: 280.0,
+            tile_cache_key: u64::MAX,
+            tile_cache_pages: Vec::new(),
             flow_wait_ok: true,
             flow_unlock: true,
             flow_ok_timeout: 1200,
@@ -983,8 +1621,23 @@ impl AppState {
             test_frame_w: 100.0,
             test_frame_h: 100.0,
             test_custom_gcode: String::new(),
+            dark_mode: false,
+            canvas_zoom: 1.0,
+            canvas_pan: (0.0, 0.0),
+            help_open: false,
+            about_open: false,
+            stats: JobStats::default(),
+            theme_applied: None,
             preview: Vec::new(),
+            preview_pens: Vec::new(),
             run_preview: Vec::new(),
+            pen_jobs: Vec::new(),
+            pen_job_idx: 0,
+            pen_wait: false,
+            pen_running: false,
+            pen_active: false,
+            pen_seen_running: false,
+            pen_dispatched_at: None,
             gcode_text: String::new(),
             status: "就绪".to_string(),
             tab: 0,
@@ -1218,6 +1871,26 @@ impl AppState {
         for (k, b) in self.texts.iter_mut().enumerate() {
             b.name = format!("文本框 {}", k + 1);
         }
+    }
+
+    /// 按比例缩放某个文本框：字号 / 行距 / 字间距 / 框宽高一起变，围绕框中心。
+    ///
+    /// 画布上「不按 Ctrl 滚轮」走这里（Ctrl+滚轮留给画布视图缩放）。
+    pub fn scale_text_box(&mut self, i: usize, f: f64) {
+        let f = f.clamp(0.2, 5.0);
+        let (pw, ph) = (self.page_w_mm, self.page_h_mm);
+        let Some(b) = self.texts.get_mut(i) else {
+            return;
+        };
+        let cx = b.x + b.w * 0.5;
+        let cy = b.y + b.h * 0.5;
+        b.size = (b.size * f).clamp(6.0, 600.0);
+        b.line_gap = (b.line_gap * f).clamp(0.5, 50.0);
+        b.space = (b.space * f).clamp(0.0, 50.0);
+        b.w = (b.w * f).clamp(10.0, (pw - 2.0).max(10.0));
+        b.h = (b.h * f).clamp(10.0, (ph - 2.0).max(10.0));
+        b.x = (cx - b.w * 0.5).clamp(0.0, (pw - b.w).max(0.0));
+        b.y = (cy - b.h * 0.5).clamp(0.0, (ph - b.h).max(0.0));
     }
 
     /// 某字库「典型字身高度 / em」的比例，用于「字号自适应格高」按真实字身计算。
@@ -1611,7 +2284,10 @@ impl AppState {
     ///
     /// 元素按模块顺序收集，并带上「该元素是否允许随机变形」的标记：
     /// 文字框按各自的 `random` 勾选决定，其余模块沿用全局开关。
-    pub fn collect_polylines(&self, random: bool) -> Vec<Polyline> {
+    ///
+    /// 返回的每根笔迹都带笔标签（[`NON_PEN`] = 文字/边框/单笔内容）。
+    /// 多笔输出时标签会解析成**启用笔组**里的下标，并加上该笔的套准偏移。
+    pub fn collect_tagged_polylines(&self, random: bool) -> Vec<(Polyline, u8)> {
         let stack = crate::fontmgr::build_stack(&self.fonts, &self.compose_doc());
         let mut opts = LayoutOptions {
             px_per_mm: 1.0,
@@ -1646,7 +2322,7 @@ impl AppState {
         if self.module_active(4) {
             tagged.extend(self.build_notes_items().into_iter().map(|i| (i, true)));
         }
-        let mut all: Vec<Polyline> = Vec::new();
+        let mut all: Vec<(Polyline, u8)> = Vec::new();
         for (it, allow_random) in &tagged {
             if it.is_text() {
                 let use_rng = random && *allow_random;
@@ -1655,12 +2331,16 @@ impl AppState {
                 } else {
                     wrobot_core::layout::layout_item(it, &stack, &opts)
                 };
-                all.extend(wrobot_core::render::render(&lay.placements, &stack));
+                all.extend(
+                    wrobot_core::render::render(&lay.placements, &stack)
+                        .into_iter()
+                        .map(|p| (p, NON_PEN)),
+                );
             } else if it.is_shape() {
                 if let Some(shapes) = &it.shapes {
                     for sp in shapes {
                         if sp.len() >= 2 {
-                            all.push(Polyline::new(sp.clone()));
+                            all.push((Polyline::new(sp.clone()), NON_PEN));
                         }
                     }
                 }
@@ -1668,14 +2348,82 @@ impl AppState {
         }
         // 前景图片（可打印）：模块开关 + 每张图自己的「输出」开关都打开才并入
         if self.images_active() {
-            for (i, img) in self.images.iter().enumerate() {
+            for img in &self.images {
                 if img.background || !img.out {
                     continue;
                 }
-                all.extend(self.image_polylines_idx(i));
+                all.extend(self.image_polylines_tagged(img));
+            }
+        }
+        // 多笔输出时，不属于笔组的内容（文字/边框）由「主笔」来画；
+        // 同时把每支笔各自的套准偏移补上，让预览与真正落笔一致。
+        if self.multi_pen_active() {
+            let main = self.main_pen_idx();
+            let specs = self.active_pens();
+            for (pl, tag) in &mut all {
+                if *tag == NON_PEN {
+                    *tag = main as u8;
+                }
+                if let Some(spec) = specs.get(*tag as usize) {
+                    let (dx, dy) = (spec.offset_mm[0], spec.offset_mm[1]);
+                    if dx != 0.0 || dy != 0.0 {
+                        for p in &mut pl.pts {
+                            p.0 += dx;
+                            p.1 += dy;
+                        }
+                    }
+                }
             }
         }
         all
+    }
+
+    /// 只取笔迹（绝大多数调用方不关心笔标签）。
+    pub fn collect_polylines(&self, random: bool) -> Vec<Polyline> {
+        self.collect_tagged_polylines(random)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    /// 是否有「多笔分层」的图片参与输出。
+    ///
+    /// 只有真正要输出、且启用了多笔、且至少有两支笔时才成立；否则一切照旧走单笔。
+    pub fn multi_pen_active(&self) -> bool {
+        self.images_active()
+            && self.active_pens().len() >= 2
+            && self
+                .images
+                .iter()
+                .any(|im| !im.background && im.out && im.multi_pen)
+    }
+
+    /// 主笔在**启用笔组**里的下标（夹到有效范围）。
+    pub fn main_pen_idx(&self) -> usize {
+        let n = self.active_pens().len();
+        if n == 0 {
+            0
+        } else {
+            self.main_pen.min(n - 1)
+        }
+    }
+
+    /// 取笔色；越界或 `NON_PEN` 时返回 `None`（用主题墨色）。
+    pub fn pen_color(&self, tag: u8) -> Option<[u8; 3]> {
+        if tag == NON_PEN {
+            return None;
+        }
+        self.active_pens().get(tag as usize).map(|p| p.color)
+    }
+
+    /// 取笔宽；越界或 `NON_PEN` 时返回 `None`（用预览笔宽）。
+    pub fn pen_width_mm(&self, tag: u8) -> Option<f64> {
+        if tag == NON_PEN {
+            return None;
+        }
+        self.active_pens()
+            .get(tag as usize)
+            .map(|p| p.width_mm.clamp(0.15, 1.6))
     }
 
     /// 第 i 张图的页面毫米笔迹（不判断是否输出）。
@@ -1720,18 +2468,34 @@ impl AppState {
     /// 把单张图片的基础笔迹（未变换，尺寸 natural_w×natural_h）按
     /// x/y/scale/rotation/flip 变换到页面毫米坐标。
     fn image_polylines(&self, img: &ImageObject) -> Vec<Polyline> {
+        self.image_polylines_tagged(img)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    /// 同 [`Self::image_polylines`]，但每根笔迹带上「由哪支笔绘制」。
+    ///
+    /// 单笔图片一律返回 [`NON_PEN`]：它应该跟文字一样用「主笔」，
+    /// 而不是在多笔队列里被误当成 HB 那一层。
+    fn image_polylines_tagged(&self, img: &ImageObject) -> Vec<(Polyline, u8)> {
         if img.base.is_empty() || img.natural_w <= 0.0 || img.natural_h <= 0.0 {
             return Vec::new();
         }
         let mut out = Vec::with_capacity(img.base.len());
-        for pl in &img.base {
+        for (k, pl) in img.base.iter().enumerate() {
+            let tag = if img.multi_pen {
+                img.base_pens.get(k).copied().unwrap_or(0)
+            } else {
+                NON_PEN
+            };
             let pts: Vec<(f64, f64)> = pl
                 .pts
                 .iter()
                 .map(|&(px, py)| img.to_page(px, py))
                 .collect();
             if pts.len() >= 2 {
-                out.push(Polyline::new(pts));
+                out.push((Polyline::new(pts), tag));
             }
         }
         out
@@ -1748,8 +2512,483 @@ impl AppState {
         v
     }
 
+    /// 定位框尺寸（毫米）：用户设定值夹到页面与机器幅面内，至少 10mm。
+    ///
+    /// 四角 L 标记与分页幅面都用这一个尺寸——两处必须完全一致，
+    /// 否则换纸拼接时上一页的角标对不上下一页的内容。
+    pub fn corner_frame_size(&self) -> (f64, f64) {
+        (
+            self.corner_w_mm
+                .min(self.page_w_mm)
+                .min(self.machine_w_mm)
+                .max(10.0),
+            self.corner_h_mm
+                .min(self.page_h_mm)
+                .min(self.machine_h_mm)
+                .max(10.0),
+        )
+    }
+
+    /// 机器原点 (0,0) 落在纸面的哪个位置（页面坐标，y 向下）；`(0,0)` 就是纸的左上角。
+    ///
+    /// `origin_corner` 和 `reverse_x/reverse_y` **都**能镜像坐标，叠加后才是真实
+    /// 结果。写反了会互相抵消——比如把「原点角」选成左下、而「反转 Y」默认又是
+    /// 开着的，两次镜像抵消，整页反而上下颠倒。四角 L 本身完全对称，画完也看不出
+    /// 来，只能等正文出错才发现。所以必须有个地方把真实结果算出来给人看。
+    pub fn origin_page_point(&self) -> (f64, f64) {
+        let mx = (self.origin_corner & 1 != 0) ^ self.reverse_x; // 镜像的是「机器 X」
+        let my = (self.origin_corner & 2 != 0) ^ self.reverse_y; // 镜像的是「机器 Y」
+        let (pw, ph) = (self.page_w_mm, self.page_h_mm);
+        if self.swap_xy {
+            // 对调后：机器 X 装的是页面 Y，机器 Y 装的是页面 X
+            (if my { pw } else { 0.0 }, if mx { ph } else { 0.0 })
+        } else {
+            (if mx { pw } else { 0.0 }, if my { ph } else { 0.0 })
+        }
+    }
+
+    /// 单页实际可绘制尺寸：即定位框尺寸（已夹到页面与机器幅面的较小者）。
+    pub fn effective_draw_size(&self) -> (f64, f64) {
+        self.corner_frame_size()
+    }
+
+    /// 所有「参与输出」的前景图片在页面坐标中的包围盒 `(min_x,min_y,max_x,max_y)`。
+    pub fn output_image_bounds(&self) -> Option<(f64, f64, f64, f64)> {
+        if !self.images_active() {
+            return None;
+        }
+        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut found = false;
+        for (i, img) in self.images.iter().enumerate() {
+            if !self.image_outputs(i) || img.natural_w <= 0.0 || img.natural_h <= 0.0 {
+                continue;
+            }
+            for (x, y) in img.corners() {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                found = true;
+            }
+        }
+        found.then_some((min_x, min_y, max_x, max_y))
+    }
+
+    /// 当前图片输出对应的分页布局；没有可输出图片时返回 `None`。
+    pub fn tile_layout(&self) -> Option<TileLayout> {
+        let (min_x, min_y, max_x, max_y) = self.output_image_bounds()?;
+        let (tw, th) = self.effective_draw_size();
+        let eps = 1e-6;
+        // 图块与页面网格对齐：第 0 块是 0..tw，第 -1 块是 -tw..0。
+        let start_col = (min_x / tw).floor() as i64;
+        let end_col = ((max_x - eps) / tw).floor() as i64;
+        let start_row = (min_y / th).floor() as i64;
+        let end_row = ((max_y - eps) / th).floor() as i64;
+        Some(TileLayout {
+            width_mm: tw,
+            height_mm: th,
+            cols: (end_col - start_col + 1).max(1) as usize,
+            rows: (end_row - start_row + 1).max(1) as usize,
+            start_col,
+            start_row,
+        })
+    }
+
+    /// 第 `page` 页的图片笔迹（不含四角标记）：裁剪到该页范围、平移到页左上角。
+    #[cfg(test)]
+    pub fn tiled_page_content_polylines(&self, page: usize) -> Vec<Polyline> {
+        self.tiled_page_content_tagged_polylines(page)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    /// 与 [`Self::tiled_page_polylines`] 同源，但带上「由哪支笔绘制」。
+    pub fn tiled_page_content_tagged_polylines(&self, page: usize) -> Vec<(Polyline, u8)> {
+        let Some(layout) = self.tile_layout() else {
+            return Vec::new();
+        };
+        let Some((ox, oy)) = layout.origin(page) else {
+            return Vec::new();
+        };
+        let multi = self.multi_pen_active();
+        let specs = self.active_pens();
+        let mut out = Vec::new();
+        for (i, img) in self.images.iter().enumerate() {
+            if !self.image_outputs(i) || img.natural_w <= 0.0 || img.natural_h <= 0.0 {
+                continue;
+            }
+            for (mut pl, tag) in self.image_polylines_tagged(img) {
+                // 套准偏移必须在裁剪前补：否则贴边的笔迹会被裁掉一截。
+                if multi {
+                    if let Some(spec) = specs.get(tag as usize) {
+                        let (dx, dy) = (spec.offset_mm[0], spec.offset_mm[1]);
+                        if dx != 0.0 || dy != 0.0 {
+                            for p in &mut pl.pts {
+                                p.0 += dx;
+                                p.1 += dy;
+                            }
+                        }
+                    }
+                }
+                for run in clip_polyline_to_rect(
+                    &pl.pts,
+                    ox,
+                    oy,
+                    ox + layout.width_mm,
+                    oy + layout.height_mm,
+                ) {
+                    out.push((
+                        Polyline::new(run.into_iter().map(|(x, y)| (x - ox, y - oy)).collect()),
+                        tag,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// 第 `page` 页的全部笔迹（带笔标签）：图片内容 +（可选）1cm 四角定位 L 标记。
+    pub fn tiled_page_tagged_polylines(&self, page: usize) -> Vec<(Polyline, u8)> {
+        let mut out = self.tiled_page_content_tagged_polylines(page);
+        if let Some(layout) = self.tile_layout() {
+            if self.tile_marks {
+                out.extend(
+                    corner_mark_polylines(
+                        layout.width_mm,
+                        layout.height_mm,
+                        10.0,
+                        (false, true),
+                    )
+                    .into_iter()
+                    .map(|p| (p, NON_PEN)),
+                );
+            }
+        }
+        out
+    }
+
+    /// 第 `page` 页的全部笔迹：图片内容 +（可选）1cm 四角定位 L 标记。
+    pub fn tiled_page_polylines(&self, page: usize) -> Vec<Polyline> {
+        self.tiled_page_tagged_polylines(page)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    /// 当前分页序号（自动夹到有效范围内）。
+    pub fn tile_page_clamped(&self) -> usize {
+        match self.tile_layout() {
+            Some(layout) => self.tile_page.min(layout.count().saturating_sub(1)),
+            None => 0,
+        }
+    }
+
+    /// 分页内容缓存指纹：布局 + 每张输出图片的几何与生成参数。
+    ///
+    /// 缩略图条一次要画所有页，如果每帧都重新裁剪 + 平移整张图，页数一多
+    /// 界面就会明显卡顿。任一影响内容的参数变化时指纹变化，整表重算。
+    pub fn tile_cache_key(&self) -> u64 {
+        let Some(layout) = self.tile_layout() else {
+            return 0;
+        };
+        let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a
+        let mut add = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        };
+        add(layout.width_mm.to_bits());
+        add(layout.height_mm.to_bits());
+        add(layout.cols as u64);
+        add(layout.rows as u64);
+        add(layout.start_col as u64);
+        add(layout.start_row as u64);
+        add(self.images.len() as u64);
+        add(self.multi_pen_active() as u64);
+        for p in self.active_pens() {
+            add(p.offset_mm[0].to_bits());
+            add(p.offset_mm[1].to_bits());
+        }
+        for (i, img) in self.images.iter().enumerate() {
+            if !self.image_outputs(i) {
+                continue;
+            }
+            for v in [
+                img.x,
+                img.y,
+                img.scale,
+                img.rotation,
+                img.natural_w,
+                img.natural_h,
+            ] {
+                add(v.to_bits());
+            }
+            add(img.flip_h as u64);
+            add(img.flip_v as u64);
+            add(img.gen_key);
+            add(img.base.len() as u64);
+        }
+        h
+    }
+
+    /// 确认分页缓存与当前参数一致（不一致就清空，按需重算）。
+    pub fn ensure_tile_cache(&mut self) {
+        let key = self.tile_cache_key();
+        let count = self.tile_layout().map_or(0, |l| l.count());
+        if self.tile_cache_key == key && self.tile_cache_pages.len() == count {
+            return;
+        }
+        self.tile_cache_key = key;
+        self.tile_cache_pages = vec![None; count];
+    }
+
+    /// 取第 `page` 页的图片笔迹与笔标签（带缓存；不含四角标记）。
+    pub fn tile_page_tagged_cached(&mut self, page: usize) -> Vec<(Polyline, u8)> {
+        self.ensure_tile_cache();
+        if page >= self.tile_cache_pages.len() {
+            return Vec::new();
+        }
+        if self.tile_cache_pages[page].is_none() {
+            let p = self.tiled_page_content_tagged_polylines(page);
+            self.tile_cache_pages[page] = Some(p);
+        }
+        self.tile_cache_pages[page].clone().unwrap_or_default()
+    }
+
+    /// 一次性补齐所有分页的缓存（缩略图条要展示每一页）。
+    pub fn fill_tile_cache(&mut self) {
+        self.ensure_tile_cache();
+        for page in 0..self.tile_cache_pages.len() {
+            if self.tile_cache_pages[page].is_none() {
+                let p = self.tiled_page_content_tagged_polylines(page);
+                self.tile_cache_pages[page] = Some(p);
+            }
+        }
+    }
+
+    /// 生成第 `page` 页的分页 G-code（页面尺寸按单页幅面、强制以当前位置为零点）。
+    pub fn generate_tile_gcode(&self, page: usize) -> Option<String> {
+        let layout = self.tile_layout()?;
+        if page >= layout.count() {
+            return None;
+        }
+        let paths = self.tiled_page_polylines(page);
+        if paths.is_empty() {
+            return None;
+        }
+        let mut opts = self.gcode_options();
+        opts.page_w = layout.width_mm;
+        opts.page_h = layout.height_mm;
+        // 每页都是「先把笔放到该页左上角 → 清零 → 画」，不能沿用绝对坐标。
+        opts.use_current_origin = true;
+        let mut g = format!(
+            "; 大纸张分页：第 {}/{} 页（{} 列 × {} 行，单页 {:.0}×{:.0}mm）\n",
+            page + 1,
+            layout.count(),
+            layout.cols,
+            layout.rows,
+            layout.width_mm,
+            layout.height_mm
+        );
+        g.push_str(&wrobot_core::generate(&paths, &opts));
+        Some(g)
+    }
+
+    // ── 多笔绘制队列 ─────────────────────────────────────────────
+
+    /// 当前页面（分页时为当前页）的多笔任务：按启用笔组顺序，每支笔一份 G-code。
+    ///
+    /// 每份任务都是独立、完整、带锚点的 G-code：上一支画完会 `G0 X0 Y0` 回到页面零点，
+    /// 下一支开头再 `G92 X0 Y0` 重新认原点，所以换笔不会累积坐标漂移。
+    pub fn build_pen_jobs(&self) -> Vec<PenJob> {
+        if !self.multi_pen_active() {
+            return Vec::new();
+        }
+        let specs = self.active_pens();
+        if specs.len() < 2 {
+            return Vec::new();
+        }
+        let mut gopts = self.gcode_options();
+        let (tagged, tile) = if self.tile_on {
+            let Some(layout) = self.tile_layout() else {
+                return Vec::new();
+            };
+            let page = self.tile_page_clamped();
+            gopts.page_w = layout.width_mm;
+            gopts.page_h = layout.height_mm;
+            gopts.use_current_origin = true;
+            (
+                self.tiled_page_tagged_polylines(page),
+                Some((layout, page)),
+            )
+        } else {
+            (self.collect_tagged_polylines(self.use_random), None)
+        };
+        if tagged.is_empty() {
+            return Vec::new();
+        }
+        let main = self.main_pen_idx() as u8;
+        let last = (specs.len() - 1) as u8;
+        let mut groups: std::collections::BTreeMap<u8, Vec<Polyline>> =
+            std::collections::BTreeMap::new();
+        for (pl, tag) in tagged {
+            let pen = if tag == NON_PEN { main } else { tag.min(last) };
+            groups.entry(pen).or_default().push(pl);
+        }
+        let total = groups.len();
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(k, (pen, paths))| {
+                let spec = &specs[pen as usize];
+                let mut g = format!(
+                    "; 多笔绘制 {}/{} · 第 {} 支笔「{}」· 线宽 {:.2}mm · 深度 {:.0}%\n",
+                    k + 1,
+                    total,
+                    pen as usize + 1,
+                    spec.name,
+                    spec.width_mm,
+                    spec.darkness * 100.0
+                );
+                if let Some((layout, page)) = &tile {
+                    g.push_str(&format!(
+                        "; 大纸张分页：第 {}/{} 页\n",
+                        page + 1,
+                        layout.count()
+                    ));
+                }
+                g.push_str(&wrobot_core::generate(&paths, &gopts));
+                PenJob {
+                    pen: pen as usize,
+                    name: spec.name.clone(),
+                    gcode: g,
+                    paths,
+                }
+            })
+            .collect()
+    }
+
+    /// 尝试把本次绘制拆成多笔任务。成功返回 `true`（已就绪，等用户装笔）。
+    ///
+    /// 只有多笔内容、且真的分成了两支以上时才返回 `true`；
+    /// 其余情况返回 `false`，调用方照旧走单笔流程。
+    pub fn start_pen_jobs(&mut self) -> bool {
+        let jobs = self.build_pen_jobs();
+        if jobs.len() < 2 {
+            return false;
+        }
+        self.gcode_text = jobs
+            .iter()
+            .map(|j| j.gcode.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.pen_jobs = jobs;
+        self.pen_job_idx = 0;
+        self.pen_running = true;
+        self.pen_wait = true;
+        self.pen_active = false;
+        self.pen_seen_running = false;
+        self.pen_dispatched_at = None;
+        let name = self.pen_jobs[0].name.clone();
+        let n = self.pen_jobs.len();
+        self.status = format!("多笔绘制：共 {n} 支笔。装入第 1 支「{name}」后点「开始这支笔」");
+        true
+    }
+
+    /// 下发当前这支笔（由换笔确认窗口调用）。
+    pub fn start_pen_job(&mut self) {
+        if !self.pen_running {
+            return;
+        }
+        let Some(job) = self.pen_jobs.get(self.pen_job_idx) else {
+            self.finish_pen_jobs();
+            return;
+        };
+        let (g, paths, name, idx, total) = (
+            job.gcode.clone(),
+            job.paths.clone(),
+            job.name.clone(),
+            self.pen_job_idx,
+            self.pen_jobs.len(),
+        );
+        self.start_run_with_preview(g, paths);
+        self.pen_wait = false;
+        self.pen_active = true;
+        self.pen_seen_running = false;
+        self.pen_dispatched_at = Some(std::time::Instant::now());
+        self.status = format!("第 {}/{} 支笔「{}」绘制中…", idx + 1, total, name);
+    }
+
+    /// 取消整个多笔队列（已下发的这支不会停——要停请点「停止」）。
+    pub fn cancel_pen_jobs(&mut self) {
+        let had = self.pen_running;
+        self.pen_running = false;
+        self.pen_wait = false;
+        self.pen_active = false;
+        self.pen_seen_running = false;
+        self.pen_dispatched_at = None;
+        self.pen_jobs.clear();
+        self.pen_job_idx = 0;
+        if had {
+            self.status = "已取消多笔队列（当前这支仍会画完）".into();
+        }
+    }
+
+    fn finish_pen_jobs(&mut self) {
+        self.pen_running = false;
+        self.pen_wait = false;
+        self.pen_active = false;
+        self.pen_seen_running = false;
+        self.pen_dispatched_at = None;
+        self.pen_jobs.clear();
+        self.pen_job_idx = 0;
+        self.status = "多笔绘制完成：所有笔都已画完".into();
+    }
+
+    /// 每帧检查队列进度：上一支笔停下后，关掉队列或提示换下一支。
+    ///
+    /// `running` 来自设备线程。**不能用「G-code 已发完」判断画完**——
+    /// 发完最后一行时机器还在走，换笔会撞到正在运动的笔架，所以这里等
+    /// `running == false`（设备线程在最后一行确认后才清除），并要求用户
+    /// 在弹窗里亲眼确认机器已停稳才继续。
+    pub fn poll_pen_queue(&mut self, running: bool) {
+        if !self.pen_running || self.pen_wait || !self.pen_active {
+            return;
+        }
+        if running {
+            self.pen_seen_running = true;
+            return;
+        }
+        // 刚下发、后台线程还没把 running 置 true 的瞬间不能算画完。
+        if !self.pen_seen_running {
+            let grace = std::time::Duration::from_millis(1500);
+            if self
+                .pen_dispatched_at
+                .map_or(false, |t| t.elapsed() < grace)
+            {
+                return;
+            }
+        }
+        self.pen_active = false;
+        self.pen_seen_running = false;
+        self.pen_dispatched_at = None;
+        self.pen_job_idx += 1;
+        if self.pen_job_idx < self.pen_jobs.len() {
+            let name = self.pen_jobs[self.pen_job_idx].name.clone();
+            self.pen_wait = true;
+            self.status = format!(
+                "第 {} 支笔画完。请换「{}」并确认机器停稳",
+                self.pen_job_idx, name
+            );
+        } else {
+            self.finish_pen_jobs();
+        }
+    }
+
     /// 由图片对象当前的参数构造生成选项。
-    fn image_opts(img: &ImageObject) -> crate::io::ImageGenOpts {
+    fn image_opts(&self, img: &ImageObject) -> crate::io::ImageGenOpts {
+        let (pens, pen_count) = self.hatch_pens();
         crate::io::ImageGenOpts {
             target_h_mm: img.natural_h.max(1.0), // 已按 target_h 生成，这里仅用于重新生成时保持高度
             step_px: img.step_px,
@@ -1762,7 +3001,47 @@ impl AppState {
             merge_gap_px: img.merge_gap_px,
             order_mode: img.order_mode,
             block_px: img.block_px,
+            sketch_pressure: img.sketch_pressure,
+            sketch_jitter: img.sketch_jitter,
+            sketch_pen: img.sketch_pen,
+            hatch_levels: img.hatch_levels,
+            hatch_angle: img.hatch_angle,
+            region_block_mm: img.region_block_mm,
+            stroke_len_mm: img.stroke_len_mm,
+            stroke_follow: img.stroke_follow,
+            multi_pen: img.multi_pen && pen_count >= 2,
+            pens,
+            pen_count,
+            ..Default::default()
         }
+    }
+
+    /// 参与多笔分层的笔（只取勾选的，按亮 → 暗的列表顺序）。
+    pub fn active_pens(&self) -> Vec<&PenSpec> {
+        self.pens.iter().filter(|p| p.on).collect()
+    }
+
+    /// 转成算法用的定长笔组。
+    fn hatch_pens(&self) -> ([crate::sketch::HatchPen; 4], u8) {
+        let mut out = crate::io::NO_PENS;
+        let active = self.active_pens();
+        let n = active.len().min(4);
+        for (i, p) in active.iter().take(n).enumerate() {
+            out[i] = p.to_hatch();
+        }
+        (out, n as u8)
+    }
+
+    /// 笔组参数指纹：线宽 / 深浅 / 启用状态变化时，多笔结果必须重算。
+    /// 颜色和套准偏移不改变笔迹，只影响预览与输出，所以不计入。
+    fn pen_set_hash(&self) -> u64 {
+        let mut h = self.pens.len() as u64;
+        for p in &self.pens {
+            for v in [p.width_mm, p.darkness, p.on as u8 as f64] {
+                h = h.wrapping_mul(31).wrapping_add((v * 1000.0) as u64);
+            }
+        }
+        h
     }
 
     /// 按图片自身参数重新生成基础笔迹（参数变化时调用）。
@@ -1770,18 +3049,36 @@ impl AppState {
         if i >= self.images.len() {
             return;
         }
-        let key = self.images[i].key();
+        let key = self.images[i].key(self.pen_set_hash());
         if self.images[i].gen_key == key {
+            self.img_regen_at = None;
             return; // 参数未变，无需重算
         }
+        // 防抖：参数刚变时只记一笔，等它稳定 160ms 再算。
+        // 拖滑杆时键每帧都在变，于是整个拖动过程一次都不算——松手后补算一次。
+        // 不这样做的话，素描模式每拖一格都要停顿一百多毫秒，界面完全是卡死的。
+        let now = std::time::Instant::now();
+        match self.img_regen_at {
+            Some((k, t)) if k == key => {
+                if now.duration_since(t) < std::time::Duration::from_millis(160) {
+                    return;
+                }
+            }
+            _ => {
+                self.img_regen_at = Some((key, now));
+                return;
+            }
+        }
+        self.img_regen_at = None;
         // PDF 导入的矢量页没有原始图片字节，无法重算（也不该被重算）
         if self.images[i].bytes.is_empty() {
             self.images[i].gen_key = key;
             return;
         }
-        let opts = Self::image_opts(&self.images[i]);
+        let opts = self.image_opts(&self.images[i]);
         if let Ok(r) = crate::io::image_to_polylines(&self.images[i].bytes, &opts) {
             self.images[i].base = r.polylines;
+            self.images[i].base_pens = r.pens;
             self.images[i].natural_w = r.w_mm;
             self.images[i].natural_h = r.h_mm;
             self.images[i].gen_key = key;
@@ -1791,6 +3088,13 @@ impl AppState {
     /// 导入一张图片为图片对象（foreground 或 background）。
     pub fn import_image_file(&mut self, path: &Path, background: bool) -> anyhow::Result<usize> {
         let data = std::fs::read(path)?;
+        let (pens, pen_count) = self.hatch_pens();
+        let draw = ImgDraw::from_usize(self.img_draw_type);
+        // 素描调子 / 分区重绘 / 素描笔触默认走多笔：这正是导入用户最常要的效果；其他模式仍单笔。
+        let multi_pen = matches!(
+            draw,
+            ImgDraw::SketchHatch | ImgDraw::RegionRedraw | ImgDraw::StrokeSketch
+        ) && pen_count >= 2;
         let opts = crate::io::ImageGenOpts {
             target_h_mm: self.img_target_h,
             step_px: self.img_step,
@@ -1803,12 +3107,23 @@ impl AppState {
             merge_gap_px: self.img_merge_gap,
             order_mode: self.img_order_mode,
             block_px: self.img_block_px,
+            sketch_pressure: self.img_sketch_pressure,
+            sketch_jitter: self.img_sketch_jitter,
+            sketch_pen: self.img_sketch_pen,
+            hatch_levels: self.img_hatch_levels,
+            hatch_angle: self.img_hatch_angle,
+            region_block_mm: self.img_region_block_mm,
+            stroke_len_mm: self.img_stroke_len_mm,
+            stroke_follow: self.img_stroke_follow,
+            multi_pen,
+            pens,
+            pen_count,
+            ..Default::default()
         };
         let r = crate::io::image_to_polylines(&data, &opts)?;
         let n = r.polylines.len();
         // 默认放在页面左上角附近，避免与文字完全重叠
         let (x, y) = if background { (10.0, 10.0) } else { (30.0, 30.0) };
-        let draw = ImgDraw::from_usize(self.img_draw_type);
         let img = ImageObject {
             path: path.display().to_string(),
             bytes: data,
@@ -1828,9 +3143,19 @@ impl AppState {
             merge_gap_px: self.img_merge_gap,
             order_mode: self.img_order_mode,
             block_px: self.img_block_px,
+            sketch_pressure: self.img_sketch_pressure,
+            sketch_jitter: self.img_sketch_jitter,
+            sketch_pen: self.img_sketch_pen,
+            hatch_levels: self.img_hatch_levels,
+            hatch_angle: self.img_hatch_angle,
+            region_block_mm: self.img_region_block_mm,
+            stroke_len_mm: self.img_stroke_len_mm,
+            stroke_follow: self.img_stroke_follow,
+            multi_pen,
             background,
             out: true,
             base: r.polylines,
+            base_pens: r.pens,
             natural_w: r.w_mm,
             natural_h: r.h_mm,
             gen_key: 0,
@@ -1922,6 +3247,20 @@ impl AppState {
             self.img_order_mode,
             self.img_block_px,
         );
+        let (sketch_pressure, sketch_jitter) =
+            (self.img_sketch_pressure, self.img_sketch_jitter);
+        let sketch_pen = self.img_sketch_pen;
+        let (hatch_levels, hatch_angle, region_block_mm) = (
+            self.img_hatch_levels,
+            self.img_hatch_angle,
+            self.img_region_block_mm,
+        );
+        let (stroke_len_mm, stroke_follow) = (self.img_stroke_len_mm, self.img_stroke_follow);
+        let (pens, pen_count) = self.hatch_pens();
+        let multi_pen = matches!(
+            ImgDraw::from_usize(draw_type),
+            ImgDraw::SketchHatch | ImgDraw::RegionRedraw | ImgDraw::StrokeSketch
+        ) && pen_count >= 2;
         let tag = path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -1942,6 +3281,18 @@ impl AppState {
                 merge_gap_px: merge_gap,
                 order_mode,
                 block_px,
+                sketch_pressure,
+                sketch_jitter,
+                sketch_pen,
+                hatch_levels,
+                hatch_angle,
+                region_block_mm,
+                stroke_len_mm,
+                stroke_follow,
+                multi_pen,
+                pens,
+                pen_count,
+                ..Default::default()
             };
             let r = crate::io::pdf_image_to_polylines(im, &opts)?;
             if r.polylines.is_empty() {
@@ -1966,9 +3317,19 @@ impl AppState {
                 merge_gap_px: merge_gap,
                 order_mode,
                 block_px,
+                sketch_pressure,
+                sketch_jitter,
+                sketch_pen,
+                hatch_levels,
+                hatch_angle,
+                region_block_mm,
+                stroke_len_mm,
+                stroke_follow,
+                multi_pen,
                 background: false,
                 out: true,
                 base: r.polylines,
+                base_pens: r.pens,
                 natural_w: r.w_mm,
                 natural_h: r.h_mm,
                 gen_key: 0,
@@ -2011,18 +3372,29 @@ impl AppState {
                 merge_gap_px: merge_gap,
                 order_mode,
                 block_px,
+                sketch_pressure,
+                sketch_jitter,
+                sketch_pen,
+                hatch_levels,
+                hatch_angle,
+                region_block_mm,
+                stroke_len_mm,
+                stroke_follow,
+                multi_pen: false,
                 background: false,
                 out: true,
                 base,
+                base_pens: vec![],
                 natural_w: (pg.w_mm * scale).max(1.0),
                 natural_h: (pg.h_mm * scale).max(1.0),
                 gen_key: 0,
             });
             self.sel_image = self.images.len() - 1;
         }
+        let ph = self.pen_set_hash();
         for i in 0..self.images.len() {
             if self.images[i].bytes.is_empty() {
-                self.images[i].gen_key = self.images[i].key();
+                self.images[i].gen_key = self.images[i].key(ph);
             }
         }
         Ok((n_paths, img_count))
@@ -2218,7 +3590,10 @@ impl AppState {
 
     /// 重建预览笔迹（受「逼真化随机」开关控制，默认确定性）。
     pub fn rebuild_preview(&mut self) {
-        self.preview = self.collect_polylines(self.use_random);
+        let tagged = self.collect_tagged_polylines(self.use_random);
+        self.preview_pens = tagged.iter().map(|(_, t)| *t).collect();
+        self.preview = tagged.into_iter().map(|(p, _)| p).collect();
+        self.refresh_stats();
     }
 
     /// 重新播种并重建预览——真正产生一次「新的」随机手写变形。
@@ -2226,11 +3601,80 @@ impl AppState {
         self.rand_seed ^= 0x9E3779B97F4A7C15u64;
         self.rand_seed = self.rand_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         self.use_random = true;
-        self.preview = self.collect_polylines(true);
+        let tagged = self.collect_tagged_polylines(true);
+        self.preview_pens = tagged.iter().map(|(_, t)| *t).collect();
+        self.preview = tagged.into_iter().map(|(p, _)| p).collect();
+        self.refresh_stats();
+    }
+
+    /// 重算缓存的任务统计（笔迹数、点数、墨线长、空移长）。
+    ///
+    /// 只在预览重建时算一次：折线可能有几万个点，放到每帧 UI 里算会明显卡顿。
+    pub fn refresh_stats(&mut self) {
+        let paths = &self.preview;
+        let mut strokes = 0usize;
+        let mut points = 0usize;
+        for p in paths {
+            if p.len() >= 2 {
+                strokes += 1;
+            }
+            points += p.len();
+        }
+        let ink_mm = wrobot_core::total_length(paths);
+        let travel_mm = wrobot_core::path_travel(paths, (0.0, 0.0));
+        self.stats = JobStats {
+            strokes,
+            points,
+            ink_mm,
+            travel_mm,
+        };
+    }
+
+    /// 按当前速度与抬落笔延迟估算运行耗时（秒）。
+    ///
+    /// 用空移 + 墨线总行程除以进给速度，再加上每笔的落笔 / 抬笔等待；
+    /// 没有把加减速算进去，实际会略慢一些，用来说明数量级足够。
+    pub fn estimated_seconds(&self) -> f64 {
+        let f = self.feed_rate.max(1.0); // mm/min
+        let motion = self.stats.travel_mm / f * 60.0;
+        let pens = self.stats.strokes as f64;
+        let delays = pens * (self.tool_on_delay + self.tool_off_delay);
+        motion + delays
+    }
+
+    /// 按倍率缩放画布视图（围绕整页适应，1.0~6.0）。
+    pub fn zoom_by(&mut self, factor: f32) {
+        let z = self.canvas_zoom * factor;
+        self.set_zoom(z);
+    }
+
+    /// 设置画布缩放倍率；回到 1.0 时同时复位平移。
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.canvas_zoom = zoom.clamp(1.0, 6.0);
+        if self.canvas_zoom <= 1.001 {
+            self.canvas_pan = (0.0, 0.0);
+        }
+    }
+
+    /// 恢复「整页适应」视图。
+    pub fn reset_view(&mut self) {
+        self.canvas_zoom = 1.0;
+        self.canvas_pan = (0.0, 0.0);
     }
 
     /// 生成 G-code 文本（与当前预览使用同一随机种子，保证所见即所得）。
+    ///
+    /// 开启「大纸张分页」时只生成当前页：先将机器笔尖放到该页左上角，
+    /// 再从「运行监控」逐页绘制；每页自带定位标记与回原点。
     pub fn generate_gcode(&mut self) -> String {
+        if self.tile_on {
+            if let Some(layout) = self.tile_layout() {
+                let page = self.tile_page.min(layout.count().saturating_sub(1));
+                if let Some(g) = self.generate_tile_gcode(page) {
+                    return g;
+                }
+            }
+        }
         let all = self.collect_polylines(self.use_random);
         let gopts = self.gcode_options();
         wrobot_core::generate(&all, &gopts)
@@ -2429,13 +3873,53 @@ impl AppState {
         self.device.send(crate::device::DevCmd::AutoConnect);
     }
 
-    /// 扫描本机串口：列出**全部登记端口**并标注能否打开。
+    /// 启动一次后台串口扫描。
     ///
-    /// 旧实现只返回「能打开」的口，蓝牙已配对但未建立 SPP 链路时列表为空，
-    /// 用户只能瞎猜端口号——这是「连不到 COM」的诱因之一。
-    pub fn scan_ports(&mut self) -> usize {
+    /// 打开离线蓝牙口（只配对未连接）时 `CreateFile` 可能卡十几秒，
+    /// 绝不能放在 UI 线程上——启动时的自动扫描曾因此把窗口卡成“未响应”。
+    pub fn start_port_scan(&mut self) {
+        if self.port_scan_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let entries = wrobot_core::enumerate_ports();
+            let _ = tx.send(entries);
+        });
+        self.port_scan_rx = Some(rx);
+        self.status = "正在后台扫描串口…".into();
+    }
+
+    /// 每帧检查后台扫描是否完成；完成则应用结果。
+    pub fn poll_port_scan(&mut self) {
+        let Some(rx) = self.port_scan_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(entries) => {
+                self.port_scan_rx = None;
+                self.apply_port_entries(entries);
+                if self.auto_connect_after_scan {
+                    self.auto_connect_after_scan = false;
+                    self.auto_connect();
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.port_scan_rx = None;
+                self.status = "串口扫描线程异常结束".into();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// 串口扫描是否仍在后台进行。
+    pub fn port_scan_running(&self) -> bool {
+        self.port_scan_rx.is_some()
+    }
+
+    /// 应用扫描结果（不重复枚举端口）。
+    fn apply_port_entries(&mut self, mut entries: Vec<wrobot_core::serial::PortEntry>) -> usize {
         // 用带类型信息的枚举：蓝牙 / 有线串口线分开，排查建议也就不一样
-        let mut entries = wrobot_core::enumerate_ports();
         // 本程序已连着的口，试开必然失败（被自己占用，错误码 5）——直接标为在线，
         // 否则用户会看到「自己的端口离线」这种误导性结论。
         if self.dev_connected && self.dev_kind == 0 && !self.serial_port.is_empty() {
@@ -2474,9 +3958,17 @@ impl AppState {
                 "✗ 本机没有任何登记在册的 COM 口\n  有线：插上 USB-TTL（CH340/CP210x）后重扫；蓝牙：先配对【并连接】BtWriter，再添加“传出”COM 口\n",
             );
         } else {
-            // 按类型分组汇报：一眼看出「有没有串口线」「蓝牙链路建没建」
-            let wired = wrobot_core::wired_ports();
-            let bt = wrobot_core::bluetooth_ports();
+            // 按类型分组汇报：一眼看出「有没有串口线」「蓝牙链路建没建」。
+            // 直接复用本次扫描结果，别再调 wired_ports()/bluetooth_ports()——
+            // 它们会各自重新枚举并逐个试开端口，离线蓝牙口会把一次扫描拖成三倍。
+            let wired: Vec<&wrobot_core::serial::PortEntry> = entries
+                .iter()
+                .filter(|e| e.kind.is_wired())
+                .collect();
+            let bt: Vec<&wrobot_core::serial::PortEntry> = entries
+                .iter()
+                .filter(|e| e.kind == wrobot_core::PortKind::Bluetooth)
+                .collect();
             self.dev_log.push_str(&format!(
                 "● 已登记 {} 个端口：串口线 {} 个、蓝牙 {} 个\n",
                 total,
@@ -2489,7 +3981,10 @@ impl AppState {
                     e.display()
                 ));
             }
-            if !self.serial_ports.contains(&self.serial_port) {
+            // 保留用户已选的端口（即使暂时打不开，比如蓝牙还没连上）；
+            // 只有当前选择已从系统中消失时，才自动挑第一个。
+            let known = detailed.iter().any(|(p, _)| *p == self.serial_port);
+            if self.serial_port.is_empty() || !known {
                 if let Some(first) = self.serial_ports.first() {
                     self.serial_port = first.clone();
                 } else if let Some((p, _)) = detailed.first() {
@@ -2645,7 +4140,13 @@ impl AppState {
     /// 运行整段 G-code（后台逐行流控，不阻塞 UI；自动跳到「运行中」页）。
     /// 同时把当前页面笔迹「冻结」到 run_preview，供运行中进度页独立显示。
     pub fn start_run(&mut self, gcode: String) {
-        self.run_preview = self.collect_polylines(self.use_random);
+        let pv = self.collect_polylines(self.use_random);
+        self.start_run_with_preview(gcode, pv);
+    }
+
+    /// 运行 G-code，并显式指定进度页要显示的笔迹（分页 / 定位标记时用）。
+    pub fn start_run_with_preview(&mut self, gcode: String, preview: Vec<Polyline>) {
+        self.run_preview = preview;
         self.device.send(crate::device::DevCmd::StartRun(gcode));
         self.status = "开始运行…".into();
     }
@@ -2668,6 +4169,11 @@ impl AppState {
     /// 停止运行。
     pub fn stop_run(&mut self) {
         self.device.send(crate::device::DevCmd::StopRun);
+        // 停止是明确的「不画了」：多笔队列也一起取消，避免停笔后又弹换笔窗。
+        if self.pen_running {
+            self.cancel_pen_jobs();
+            self.status = "已停止，多笔队列已取消".into();
+        }
     }
 
     /// 生成点动 G-code（GRBL 用 $J=，其余用相对 G91）。
@@ -2803,6 +4309,41 @@ impl AppState {
         let g = Self::test_frame_gcode(w, h, self.pen_up, self.pen_down, self.feed_rate, self.fw());
         self.start_run(g);
         self.status = format!("开始画测试方框 {}×{}mm", w, h);
+    }
+
+    /// 绘制四角定位标记：一键在定位框（默认 200×280mm）四角各画一个 1cm L。
+    ///
+    /// **定位框贴在机器原点所在的那两个边上**（默认就是纸的左下角），并且
+    /// G-code 的镜像基准用**纸张尺寸**而不是框尺寸。之前这两处都写成了
+    /// 「左上角 + 用框高做基准」，于是：
+    /// - 预览里标记画在纸的左上角，机器却画在左下角；
+    /// - 标记的镜像基准比正文少 `纸张高 − 框高`（A4 是 17mm），
+    ///   标记和正文就整整齐齐地错开 17mm。
+    /// 现在标记与正文共用同一套纸张坐标，(0,0) 一定落在框的左下角。
+    pub fn draw_corner_marks(&mut self) {
+        let (w, h) = self.corner_frame_size();
+        let (pw, ph) = (self.page_w_mm.max(1.0), self.page_h_mm.max(1.0));
+        let (ox0, oy0) = self.origin_page_point();
+        let o_right = ox0 > pw * 0.5;
+        let o_bottom = oy0 > ph * 0.5;
+        // 框贴在原点那一侧
+        let fx = if o_right { (pw - w).max(0.0) } else { 0.0 };
+        let fy = if o_bottom { (ph - h).max(0.0) } else { 0.0 };
+        let paths: Vec<Polyline> = corner_mark_polylines(w, h, 10.0, (o_right, o_bottom))
+            .into_iter()
+            .map(|p| Polyline::new(p.pts.iter().map(|&(x, y)| (x + fx, y + fy)).collect()))
+            .collect();
+        let mut opts = self.gcode_options();
+        opts.page_w = pw;
+        opts.page_h = ph;
+        // 以落笔前的位置为 (0,0)，画完由 generate 统一回 G0 X0 Y0。
+        opts.use_current_origin = true;
+        let g = wrobot_core::generate(&paths, &opts);
+        self.start_run_with_preview(g, paths);
+        self.status = format!(
+            "开始绘制四角定位标记（{:.0}×{:.0}mm，长臂+斜线那角是原点 (0,0)，完成后回原点）",
+            w, h
+        );
     }
 
     /// 生成「测试方框」G-code。

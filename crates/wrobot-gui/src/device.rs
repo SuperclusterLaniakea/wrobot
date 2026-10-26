@@ -616,7 +616,7 @@ fn thread_main(rx: Receiver<DevCmd>, shared: Arc<Mutex<DevShared>>) {
                             if let Ok(mut s) = shared.lock() {
                                 let g = got.trim();
                                 if g.is_empty() {
-                                    append_log(&mut s.log, "· 端口已打开，但没收到开机欢迎语（部分固件不主动打招呼）——到「测试」页发一条指令看有没有 ← 回显\n");
+                                    append_log(&mut s.log, "· 端口已打开，但没收到开机欢迎语（部分固件不主动打招呼）——到「设备与调试 → 机器调试」发一条指令看有没有 ← 回显\n");
                                 } else {
                                     append_log(&mut s.log, &format!("← 收到：{}\n", g));
                                     let ratio = wrobot_core::garbage_ratio(g);
@@ -1270,7 +1270,7 @@ fn auto_connect(transport: &mut Option<Box<dyn Transport>>, shared: &Arc<Mutex<D
                     if !notes.is_empty() {
                         append_log(&mut s.log, &format!("⚠ {}\n", notes));
                     }
-                    append_log(&mut s.log, "  请到「测试」页点「解锁 $X」/「读位置」看有没有 ← 回显；没有回显说明链路没通。\n");
+                    append_log(&mut s.log, "  请到「设备与调试 → 机器调试」点「解锁 $X」/「读位置」看有没有 ← 回显；没有回显说明链路没通。\n");
                     append_log(&mut s.log, "  链路不通时优先怀疑：写字机没通电 / USB 线松 / 蓝牙只配对未连接。\n");
                 }
                 return;

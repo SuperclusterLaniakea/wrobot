@@ -10,26 +10,70 @@ use wrobot_core::StrokeFont;
 use crate::io;
 use crate::preview::{draw_canvas, draw_progress_page};
 use crate::state::{AppState, GridKind, ImgDraw, PAPER_CUSTOM, PAPER_PRESETS};
+use crate::theme;
 
 const MODULES: &[&str] = &[
     "文字",
     "表格",
-    "格子",
-    "绘图",
+    "练字格",
+    "手绘",
     "笔记",
     "图片",
-    "设备",
-    "测试",
-    "导入导出",
-    "运行中",
+    "设备与调试",
+    "机器测试",
+    "项目与输出",
+    "运行监控",
 ];
-const CONTENT_MODULES: &[&str] = &["文字", "表格", "格子", "绘图", "笔记"];
+const MODULE_DESC: &[&str] = &[
+    "多行文字排版，支持多文本框、逐框字体与随机手写",
+    "按行列生成表格，单元格文字自动排布",
+    "田字格 / 米字格 / 回宫格，可带示范字",
+    "鼠标自由手绘，或导入 DXF / SVG 矢量",
+    "页面上任意位置的自由文本块",
+    "照片影线描边，可作背景只临摹不打印",
+    "连接机器、蓝牙链路诊断、坐标与点动",
+    "解锁 / 回零 / 抬落笔 / 测试方框",
+    "工程、PDF / 字库导入，固件参数与导出",
+    "实时进度、耗时统计与 G-code 跟踪",
+];
+const CONTENT_MODULES: &[&str] = &["文字", "表格", "练字格", "手绘", "笔记"];
+
+/// 侧栏导航分组：(组名, [(tab, 图标, 名称, 说明)])
+const NAV_GROUPS: &[(&str, &[(usize, &str, &str, &str)])] = &[
+    (
+        "创作",
+        &[
+            (0, "文", "文字", "多行排版 / 多文本框"),
+            (1, "表", "表格", "行列与单元格文字"),
+            (2, "格", "练字格", "田字格 / 米字格"),
+            (4, "记", "笔记", "自由文本块"),
+        ],
+    ),
+    (
+        "图形",
+        &[
+            (5, "图", "图片", "照片描边 / 背景参照"),
+            (3, "绘", "手绘", "鼠标书写 / 矢量导入"),
+        ],
+    ),
+    (
+        "设备",
+        &[
+            (6, "机", "设备与调试", "连接 / 蓝牙 / 坐标"),
+            (9, "运", "运行监控", "进度 / 耗时 / G-code"),
+        ],
+    ),
+    (
+        "项目",
+        &[(8, "出", "项目与输出", "导入 / 固件 / 导出")],
+    ),
+];
 const ORIGINS: &[&str] = &["左上", "右上", "左下", "右下"];
 const BORDER_STYLES: &[&str] = &["实线", "虚线", "双线"];
 
-/// 强调色（蓝灰调，适配明暗两种主题）。
-fn accent() -> egui::Color32 {
-    egui::Color32::from_rgb(58, 122, 194)
+/// 当前主题调色板。
+fn pal(ui: &Ui) -> theme::Palette {
+    theme::palette(ui.visuals().dark_mode)
 }
 
 /// 次级文字色。
@@ -37,11 +81,33 @@ fn muted() -> egui::Color32 {
     egui::Color32::from_gray(140)
 }
 
-/// 分区标题。
+/// 分区标题（沿用旧调用点，内部走统一主题）。
 fn section(ui: &mut Ui, title: &str) {
-    ui.add_space(6.0);
-    ui.label(RichText::new(title).size(14.0).strong().color(accent()));
-    ui.separator();
+    let p = pal(ui);
+    theme::section(ui, &p, title, None);
+}
+
+/// 参数栏的通用宽度适配。
+///
+/// 主题里滑块轨道是 150pt，而侧栏最窄只有 300pt：长中文标签 + 数值 + 轨道
+/// 会顶出栏外被裁掉。按当前可用宽度收窄轨道，保证整行都落在栏内。
+fn fit_params_width(ui: &mut Ui) {
+    ui.spacing_mut().slider_width = (ui.available_width() - 210.0).clamp(60.0, 150.0);
+}
+
+/// 秒 → 「1 分 23 秒」。
+fn fmt_duration(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        return "—".into();
+    }
+    let s = secs.round() as u64;
+    if s >= 3600 {
+        format!("{} 时 {} 分", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{} 分 {} 秒", s / 60, s % 60)
+    } else {
+        format!("{} 秒", s)
+    }
 }
 
 /// 顶层界面。
@@ -84,8 +150,8 @@ fn menu_bar(app: &mut AppState, ui: &mut Ui) {
                 if let Some(p) = app.pick_file("PDF", &["pdf"]) {
                     match app.load_pdf_info(&p) {
                         Ok(n) => {
-                            app.status = format!("已读取 {} 页，请在「导入导出」页选页码后导入", n);
-                            app.tab = 8; // 直接跳到导入导出页
+                            app.status = format!("已读取 {} 页，请在「项目与输出」页选页码后导入", n);
+                            app.tab = 8; // 直接跳到项目与输出页
                         }
                         Err(e) => app.status = format!("读取 PDF 失败：{e}"),
                     }
@@ -140,8 +206,7 @@ fn menu_bar(app: &mut AppState, ui: &mut Ui) {
                 ui.close();
             }
             if ui.button("扫描串口").clicked() {
-                let n = app.scan_ports();
-                app.status = format!("已扫描：{} 个在线端口", n);
+                app.start_port_scan();
                 ui.close();
             }
             if ui.button("自动波特率").on_hover_text("连上但机器没反应时用它：逐个波特率握手，找出机器真正用的那个").clicked() {
@@ -208,6 +273,11 @@ fn menu_bar(app: &mut AppState, ui: &mut Ui) {
 
         // ── 视图 ──
         ui.menu_button("视图", |ui| {
+            let mut dark = app.dark_mode;
+            if ui.checkbox(&mut dark, "深色主题").changed() {
+                app.dark_mode = dark;
+                app.theme_applied = None;
+            }
             ui.checkbox(&mut app.log_open, "底部实时日志栏");
             ui.separator();
             ui.label(RichText::new("界面缩放").size(11.0).color(muted()));
@@ -216,15 +286,27 @@ fn menu_bar(app: &mut AppState, ui: &mut Ui) {
                 app.ui_scale = 1.0;
             }
             ui.separator();
+            if ui.button("适应页面 / 复位缩放").clicked() {
+                app.reset_view();
+                ui.close();
+            }
+            if ui.button("快速上手（F1）").clicked() {
+                app.help_open = true;
+                ui.close();
+            }
             if ui.button("设置…").clicked() {
                 app.settings_open = true;
                 ui.close();
             }
         });
 
+        // ── 关于 ──
+        if ui.button("关于").clicked() {
+            app.about_open = true;
+        }
+
         // 右侧常驻状态
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (dot, col, txt) = if app.dev_connected {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {            let (dot, col, txt) = if app.dev_connected {
                 if app.dev_kind == 2 {
                     ("●", egui::Color32::from_rgb(90, 150, 210), "模拟模式")
                 } else {
@@ -262,6 +344,21 @@ enum Export {
 /// 生成 G-code 后先做**边界自检**：内容超出机器幅面时挂起并弹窗，
 /// 由用户决定「仍然执行」还是「取消」——见 [`bounds_warn_window`]。
 fn act_start_draw(app: &mut AppState) {
+    // 多笔分层：拆成「一支笔一份」的队列，先请用户装第一支笔。
+    // 只有真的分成两支以上才这样做；否则完全沿用原来的单次绘制。
+    if !app.pen_running && app.start_pen_jobs() {
+        let g = app.gcode_text.clone();
+        if app.bounds_check {
+            if let Some(msg) = app.bounds_warning(&g) {
+                app.pending_run_gcode = g;
+                app.bounds_warn_msg = msg;
+                app.show_bounds_warn = true;
+                app.status = "⚠ 内容超出机器边界，已暂停：请在弹窗中确认是否仍然执行".into();
+                return;
+            }
+        }
+        return;
+    }
     let g = app.generate_gcode();
     if g.trim().is_empty() {
         app.status = "当前页面没有可绘制的内容".into();
@@ -283,8 +380,22 @@ fn act_start_draw(app: &mut AppState) {
 /// 边界检查通过（或用户确认）后真正开始运行。
 fn finish_start(app: &mut AppState, g: String) {
     let n = g.lines().filter(|l| !l.trim().is_empty()).count();
+    if app.tile_on {
+        if let Some(layout) = app.tile_layout() {
+            let page = app.tile_page_clamped();
+            let pv = app.tiled_page_polylines(page);
+            app.start_run_with_preview(g, pv);
+            app.status = format!(
+                "已开始传输第 {}/{} 页（{} 行）· 本页画完回到原点后再放下一张纸",
+                page + 1,
+                layout.count(),
+                n
+            );
+            return;
+        }
+    }
     app.start_run(g);
-    app.status = format!("已开始传输 {} 行（进度见「运行中」页，传输结果见左下角）", n);
+    app.status = format!("已开始传输 {} 行（进度见「运行监控」页，传输结果见左下角）", n);
 }
 
 /// 超界确认弹窗：列出超出的方向与数值，用户可选「仍然执行」或「取消」。
@@ -321,12 +432,20 @@ fn bounds_warn_window(app: &mut AppState, ctx: egui::Context) {
                     confirmed = true;
                     app.pending_run_gcode.clear();
                     app.bounds_warn_msg.clear();
-                    finish_start(app, g);
+                    // 多笔队列已经在等第一支笔：确认越界后不要绕过队列直接跑。
+                    if app.pen_running && app.pen_wait {
+                        app.status = "已确认越界。装入第一支笔后点「开始这支笔」".into();
+                    } else {
+                        finish_start(app, g);
+                    }
                 }
                 if ui.button("取消").clicked() {
                     cancelled = true;
                     app.pending_run_gcode.clear();
                     app.bounds_warn_msg.clear();
+                    if app.pen_running {
+                        app.cancel_pen_jobs();
+                    }
                 }
             });
         });
@@ -339,6 +458,87 @@ fn bounds_warn_window(app: &mut AppState, ctx: egui::Context) {
         if !confirmed {
             app.status = "已取消运行：内容超出机器边界".into();
         }
+    }
+}
+
+/// 多笔绘制：每支笔开始前的换笔确认窗口。
+///
+/// **不能自动连发下一支**：设备线程的「运行结束」只代表最后一行指令已发出，
+/// 笔架可能还在减速；换笔时手会伸到机器里。所以这里必须由人确认。
+fn pen_swap_window(app: &mut AppState, ctx: egui::Context) {
+    if !app.pen_wait || !app.pen_running {
+        return;
+    }
+    let Some(job) = app.pen_jobs.get(app.pen_job_idx) else {
+        app.cancel_pen_jobs();
+        return;
+    };
+    let idx = app.pen_job_idx;
+    let total = app.pen_jobs.len();
+    let name = job.name.clone();
+    let pen = job.pen;
+    let paths = job.paths.len();
+    let ink_mm = wrobot_core::total_length(&job.paths);
+    let spec = app
+        .active_pens()
+        .get(pen)
+        .map(|p| (p.width_mm, p.darkness, p.color, p.offset_mm));
+    let mut open = true;
+    let mut start = false;
+    let mut cancel = false;
+    egui::Window::new("换笔")
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .default_width(420.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(&ctx, |ui| {
+            ui.heading(format!("第 {}/{} 支笔：{name}", idx + 1, total));
+            if let Some((w, d, c, off)) = spec {
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::Vec2::splat(18.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        rect,
+                        3.0,
+                        egui::Color32::from_rgb(c[0], c[1], c[2]),
+                    );
+                    ui.label(format!(
+                        "线宽 {w:.2}mm · 可压深 {:.0}% · {paths} 根笔迹 · 墨线 {ink_mm:.0}mm",
+                        d * 100.0
+                    ));
+                });
+                if off[0] != 0.0 || off[1] != 0.0 {
+                    ui.weak(format!("套准偏移：X {:.2}mm / Y {:.2}mm", off[0], off[1]));
+                }
+            }
+            ui.separator();
+            ui.label(RichText::new("装入这支笔，并确认：").strong());
+            ui.label("1. 机器已完全停稳（进度 100% 只代表指令发送完毕，笔架可能还在走）");
+            ui.label("2. 笔尖已落到页面原点附近、抬笔高度正常");
+            ui.label("3. 旧笔已取下，新笔夹紧");
+            ui.add_space(4.0);
+            ui.weak(
+                "每支笔的 G-code 都以当前位置为零点重新锚定，换笔不需要重新对刀；\
+                 若落点有系统性偏差，可在「图片 → 多笔分层」里调该笔的套准偏移。",
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("开始这支笔").strong()))
+                    .clicked()
+                {
+                    start = true;
+                }
+                if ui.button("取消剩余笔").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    if start {
+        app.start_pen_job();
+    } else if cancel || !open {
+        app.cancel_pen_jobs();
     }
 }
 
@@ -405,14 +605,20 @@ fn act_export(app: &mut AppState, kind: Export) {
             Export::Png => io::export_png(app, &p),
         };
         match r {
-            Ok(()) => app.status = format!("{} 已导出：{}", name, p.display()),
+            Ok(()) => {
+                // 多笔导出会在 export_gcode 里写好更具体的状态（含分笔文件数），别覆盖掉。
+                if !(matches!(kind, Export::Nc) && app.status.contains("分笔")) {
+                    app.status = format!("{} 已导出：{}", name, p.display());
+                }
+            }
             Err(e) => app.status = format!("导出失败：{e}"),
         }
     }
 }
 
 /// 底部「实时日志」栏：所有页面都能看到设备通信与操作回显。
-fn log_panel(app: &mut AppState, ui: &mut Ui) {
+fn log_panel(app: &mut AppState, ui: &mut Ui) -> bool {
+    let mut hide = false;
     ui.horizontal(|ui| {
         ui.label(RichText::new("实时日志").strong());
         ui.weak("（设备通信 / 下发回显 / 错误诊断都在这里）");
@@ -422,7 +628,7 @@ fn log_panel(app: &mut AppState, ui: &mut Ui) {
                 app.dev_log.clear();
             }
             if ui.button("隐藏").clicked() {
-                app.log_open = false;
+                hide = true;
             }
             let snap = app.device.snapshot();
             if snap.running {
@@ -456,6 +662,7 @@ fn log_panel(app: &mut AppState, ui: &mut Ui) {
                     .font(egui::TextStyle::Monospace),
             );
         });
+    hide
 }
 
 pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -464,6 +671,12 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
     let want = (native * app.ui_scale.clamp(0.6, 3.0)).clamp(0.5, 4.0);
     if (ui.ctx().pixels_per_point() - want).abs() > 0.01 {
         ui.ctx().set_pixels_per_point(want);
+    }
+
+    // 主题只在切换时重设一次（每帧 set_style 会让滚动条/动画状态被重置）。
+    if app.theme_applied != Some(app.dark_mode) {
+        theme::apply(ui.ctx(), app.dark_mode);
+        app.theme_applied = Some(app.dark_mode);
     }
 
     // 启动时打印一次画面尺寸，便于排查「窗口太小 / 显示不全」这类问题。
@@ -482,12 +695,13 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
         );
     });
 
-    // 快捷键：Ctrl+S 保存工程 / Ctrl+O 打开工程 / Ctrl+E 导出 G-code
-    let (mut k_save, mut k_open, mut k_export) = (false, false, false);
+    // 快捷键：Ctrl+S 保存工程 / Ctrl+O 打开工程 / Ctrl+E 导出 G-code / F1 帮助
+    let (mut k_save, mut k_open, mut k_export, mut k_help) = (false, false, false, false);
     ui.ctx().input_mut(|i| {
         k_save = i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
         k_open = i.consume_key(egui::Modifiers::CTRL, egui::Key::O);
         k_export = i.consume_key(egui::Modifiers::CTRL, egui::Key::E);
+        k_help = i.consume_key(egui::Modifiers::NONE, egui::Key::F1);
     });
     if k_save {
         act_save_project(app);
@@ -498,6 +712,9 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
     if k_export {
         act_export(app, Export::Nc);
     }
+    if k_help {
+        app.help_open = true;
+    }
 
     app.rebuild_preview();
     // 页面尺寸可能被改过（PDF 导入 / 滑块 / 载入旧工程），规格名跟着重判一次。
@@ -506,14 +723,17 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
     // 每帧从后台设备线程同步连接状态与日志（非阻塞，只读共享状态）。
     app.dev_log = app.device.log_snapshot();
     app.dev_connected = app.device.is_connected();
+    app.poll_pen_queue(app.device.snapshot().running);
     // 处理设备线程请求切换 tab（例如点「运行」后自动跳到「运行中」页）。
     if let Some(t) = app.device.take_request_tab() {
         app.tab = t;
     }
     // 绑定蓝牙串口后系统会新建 COM 口，设备线程会请求重新扫描一次。
     if app.device.take_request_scan() {
-        app.scan_ports();
+        app.start_port_scan();
     }
+    // 后台扫描完成后取回结果（扫描本身不占用 UI 线程）。
+    app.poll_port_scan();
     // 同步蓝牙体检 / 可见性观察报告（后台跑完才填，避免 UI 阻塞）。
     let r = app.device.bt_report_snapshot();
     if !r.is_empty() {
@@ -527,244 +747,646 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
     // 坐标轮询开关/固件变了才下发，避免每帧打扰设备线程
     app.apply_status_poll();
 
-    // ── 顶部：菜单栏（最常用的功能都在这里）──────
-    egui::Panel::top("menubar").show(ui, |ui| {
-        menu_bar(app, ui);
-    });
+    let p = pal(ui);
+
+    // ── 顶部：菜单栏 ────────────────────────────
+    egui::Panel::top("menubar")
+        .frame(
+            egui::Frame::new()
+                .fill(p.panel)
+                .inner_margin(egui::Margin::symmetric(10, 4)),
+        )
+        .show(ui, |ui| {
+            menu_bar(app, ui);
+        });
 
     // ── 底部：实时日志栏（可折叠 / 可拖动调高）────
-    // 必须在 CentralPanel 之前注册，中央面板才会给它让出空间。
+    // 先注册日志栏，再注册操作栏，操作栏就会叠在日志栏上方。
     let mut log_open = app.log_open;
+    let mut log_hide = false;
     egui::Panel::bottom("logbar")
         .resizable(true)
-        .default_size(180.0)
+        .default_size(170.0)
         .min_size(60.0)
         .max_size(460.0)
         .show_collapsible(ui, &mut log_open, |ui| {
-            log_panel(app, ui);
+            log_hide = log_panel(app, ui);
         });
+    // 「隐藏」按钮在本帧内部改动，不能直接用帧首拷贝的 log_open 覆盖回去。
+    if log_hide {
+        log_open = false;
+    }
     app.log_open = log_open;
 
-    // ── 左侧：模块导航 ─────────────────────────────
-    // 可拖动调宽（坐标区是等宽数字，窄了会换行），高度不够时整块可滚动，
-    // 否则小窗口下「坐标」区会被挤到看不见。
+    // ── 底部：全局操作条（连接状态 / 运行控制 / 统计）──
+    egui::Panel::bottom("actionbar")
+        .frame(
+            egui::Frame::new()
+                .fill(p.panel)
+                .stroke(egui::Stroke::new(1.0, p.stroke))
+                .inner_margin(egui::Margin::symmetric(12, 7)),
+        )
+        .show(ui, |ui| {
+            action_bar(app, ui, &p);
+        });
+
+    // ── 工作区标题 / 视图工具条（整窗宽，避免被左右侧栏挤成两行）──
+    if app.tab != 9 {
+        egui::Panel::top("workspacebar")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(12, 5)),
+            )
+            .show(ui, |ui| {
+                workspace_header(app, ui, &p);
+            });
+    }
+
+    // ── 左侧：分组导航 + 输出图层 + 坐标 ──────────
     egui::Panel::left("modules")
         .resizable(true)
-        .default_size(196.0)
-        .min_size(150.0)
+        .default_size(220.0)
+        .min_size(190.0)
         .max_size(340.0)
+        .frame(
+            egui::Frame::new()
+                .fill(p.panel)
+                .inner_margin(egui::Margin::symmetric(8, 6)),
+        )
         .show(ui, |ui| {
-            ScrollArea::vertical()
-                .id_salt("left_scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("WritingRobot").size(20.0).strong());
-                ui.label(RichText::new("写字机器人上位机").size(11.0).color(muted()));
-            });
-            ui.separator();
-
-            ui.label(RichText::new("功能模块").strong().color(muted()));
-            for (i, name) in MODULES.iter().enumerate() {
-                let label = RichText::new(format!("  {}", name)).size(14.0);
-                let is_cur = app.tab == i;
-                let r = ui.selectable_value(&mut app.tab, i, label);
-                if is_cur {
-                    // 当前项高亮描边（用 painter 画左侧指示条）
-                    let rect = r.rect;
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(
-                            rect.min,
-                            egui::Vec2::new(3.0, rect.height()),
-                        ),
-                        1.5,
-                        accent(),
-                    );
-                }
-                if r.clicked() {
-                    app.status = format!("切换到「{}」模块", name);
-                    app.confirm_clear = false;
-                }
-            }
-
-            ui.separator();
-            ui.label(RichText::new("并入当前页面").strong().color(muted()));
-            if app.tab < CONTENT_MODULES.len() {
-                ui.label(RichText::new("默认只输出当前模块，勾选可叠加").size(10.0).color(muted()));
-            } else {
-                ui.label(
-                    RichText::new("非内容页：默认只显示已勾选叠加的模块").size(10.0).color(muted()),
-                );
-            }
-            for (i, name) in CONTENT_MODULES.iter().enumerate() {
-                ui.checkbox(&mut app.module_on[i], *name);
-            }
-            // 图片是独立导入的元素，此前不受任何开关控制、总被叠加进来。
-            // 这里给它一个显式勾选，语义与其它模块一致。
-            ui.checkbox(&mut app.images_on, "图片");
-            if !app.images.is_empty() && !app.images_active() {
-                ui.label(
-                    RichText::new("图片未勾选：不写入 G-code（画布上仍可编辑定位）")
-                        .size(10.0)
-                        .color(muted()),
-                );
-            }
-
-            ui.separator();
-            if app.fonts.is_empty() {
-                ui.colored_label(egui::Color32::from_rgb(200, 60, 60), "未加载到字库！");
-            } else {
-                ui.label(
-                    RichText::new(format!("已加载 {} 个单线字库", app.fonts.fonts.len()))
-                        .size(12.0),
-                );
-                ui.label(RichText::new(&app.font_dir).size(10.0).color(muted()));
-            }
-
-            // ── 坐标（字库下面、实时日志上面）──────────────────
-            coord_panel(app, ui);
-                });
-
-            // 状态行固定在底部（不随上面的内容滚动）
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.label(RichText::new(&app.status).size(11.0).color(muted()));
-                // 传输结果单独一行：让用户明确知道「代码到底发出去了没有」
-                if !app.transfer_status.is_empty() {
-                    let col = if app.transfer_status.starts_with('✓') {
-                        egui::Color32::from_rgb(60, 170, 90)
-                    } else {
-                        egui::Color32::from_rgb(210, 90, 60)
-                    };
-                    ui.label(RichText::new(&app.transfer_status).size(11.0).color(col));
-                }
-                ui.separator();
-            });
+            left_sidebar(app, ui, &p);
         });
 
-    // ── 右侧：参数 ────────────────────────────────
+    // ── 右侧：当前模块参数 ───────────────────────
     egui::Panel::right("params")
         .resizable(true)
+        .default_size(340.0)
+        .min_size(300.0)
+        // 上限要给死，否则长按钮/滑块会把栏位一路撑大、挤压预览；
+        // 但图片页的多笔笔组和长标签滑块确实需要更宽的栏位，
+        // 400 不够用时用户又拖不过去，所以留到 520。
+        .max_size(520.0)
+        .frame(
+            egui::Frame::new()
+                .fill(p.panel)
+                .inner_margin(egui::Margin::symmetric(0, 0)),
+        )
         .show(ui, |ui| {
-            ui.set_min_width(310.0);
-            ScrollArea::vertical().show(ui, |ui| {
-                match app.tab {
-                    0 => panel_text(app, ui),
-                    1 => panel_table(app, ui),
-                    2 => panel_grid(app, ui),
-                    3 => panel_draw(app, ui),
-                    4 => panel_notes(app, ui),
-                    5 => panel_images(app, ui),
-                    6 => panel_device(app, ui),
-                    7 => panel_test(app, ui),
-                    8 => panel_io(app, ui),
-                    9 => panel_running(app, ui),
-                    _ => {}
-                }
-                // 公共区段（页面边框 / 固件 / 导出）：内容页与导入导出页直接铺开，
-                // 设备 / 测试 / 运行中页本身已经很长，折叠起来免得把本页参数挤到看不见。
-                if matches!(app.tab, 0..=5 | 8) {
-                    panel_border(app, ui);
-                    ui.separator();
-                    panel_export(app, ui);
-                } else {
-                    egui::CollapsingHeader::new("页面边框 / 固件 / 生成导出")
-                        .id_salt("common_tail")
-                        .default_open(false)
+            ScrollArea::vertical()
+                .id_salt("params_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(12, 8))
                         .show(ui, |ui| {
-                            panel_border(app, ui);
-                            ui.separator();
-                            panel_export(app, ui);
+                            // 主题的滑块轨道宽 150pt，侧栏最窄 300pt：长中文标签 +
+                            // 数值 + 轨道会顶出栏外被裁掉。按当前栏宽收窄轨道，
+                            // 保证整行（标签、数值、滑块）都完整显示。
+                            fit_params_width(ui);
+                            match app.tab {
+                                0 => panel_text(app, ui),
+                                1 => panel_table(app, ui),
+                                2 => panel_grid(app, ui),
+                                3 => panel_draw(app, ui),
+                                4 => panel_notes(app, ui),
+                                5 => panel_images(app, ui),
+                                6 | 7 => panel_device(app, ui),
+                                8 => panel_io(app, ui),
+                                9 => panel_running(app, ui),
+                                _ => {}
+                            }
+                            // 手写风格是全体内容模块的公共参数，放一个入口即可。
+                            if app.tab <= 4 || app.tab == 5 {
+                                panel_style(app, ui);
+                            }
                         });
-                }
-            });
+                });
         });
 
-    // 设置对话框（收纳不常用设置）
+    // 设置 / 帮助 / 关于 / 越界确认
     settings_window(app, ui.ctx().clone());
+    help_window(app, ui.ctx().clone());
+    about_window(app, ui.ctx().clone());
     bounds_warn_window(app, ui.ctx().clone());
+    pen_swap_window(app, ui.ctx().clone());
 
-    // ── 中央：预览 / 运行进度 ─────────────────────
-    egui::CentralPanel::default().show(ui, |ui| {
-        if app.tab == 9 {
-            // 运行中页：显示冻结的整页进度（已完成=黑，未完成=浅灰）。
-            let snap = app.device.snapshot();
+    // ── 中央：工作区 ─────────────────────────────
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::new()
+                .fill(p.bg)
+                .inner_margin(egui::Margin::symmetric(12, 8)),
+        )
+        .show(ui, |ui| {
+            if app.tab == 9 {
+                running_header(app, ui, &p);
+                let snap = app.device.snapshot();
+                let frac = if snap.total_lines > 0 {
+                    snap.done_lines as f64 / snap.total_lines as f64
+                } else {
+                    0.0
+                };
+                draw_progress_page(
+                    ui,
+                    &app.run_preview,
+                    frac,
+                    app.page_w_mm,
+                    app.page_h_mm,
+                    app.grid_overlay,
+                    app.grid_overlay_cols,
+                    app.grid_overlay_rows,
+                );
+            } else {
+                let freehand = app.tab == 3 && app.freehand_on;
+                let image_tab = app.tab == 5;
+                // 手绘临时点集用局部变量，避免与整块 `app` 的可变借用冲突。
+                let mut acc = std::mem::take(&mut app.freehand);
+                let (_map, committed) = draw_canvas(ui, app, freehand, image_tab, &mut acc);
+                if committed && acc.len() >= 2 {
+                    let pts = std::mem::take(&mut acc);
+                    app.draw_paths.push(Polyline::new(pts));
+                    app.status = format!("已添加手绘笔迹（共 {} 条）", app.draw_paths.len());
+                }
+                app.freehand = acc;
+            }
+        });
+}
+
+/// 当前实际参与输出的图层数（内容模块 + 图片）。
+fn active_layer_count(app: &AppState) -> usize {
+    (0..CONTENT_MODULES.len())
+        .filter(|i| app.module_active(*i))
+        .count()
+        + usize::from(app.images_active() && !app.images.is_empty())
+}
+
+/// 左侧导航：分组模块，输出图层常驻最底部。
+fn left_sidebar(app: &mut AppState, ui: &mut Ui, p: &theme::Palette) {
+    // 停靠在模块列表下方、底部连接状态上方。
+    egui::Panel::bottom("output_layers_dock")
+        .resizable(false)
+        .frame(
+            egui::Frame::new()
+                .fill(p.card)
+                .stroke(egui::Stroke::new(1.0, p.accent.gamma_multiply(0.45)))
+                .corner_radius(egui::CornerRadius::same(9))
+                .inner_margin(egui::Margin::symmetric(8, 6)),
+        )
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            output_layers_body(app, ui, p);
+        });
+    ui.add_space(2.0);
+
+    ScrollArea::vertical()
+        .id_salt("left_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (gi, (group, items)) in NAV_GROUPS.iter().enumerate() {
+                if gi > 0 {
+                    ui.add_space(6.0);
+                }
+                ui.label(
+                    RichText::new(*group)
+                        .size(10.0)
+                        .strong()
+                        .color(p.muted),
+                );
+                for (tab, icon, name, hint) in items.iter() {
+                    let selected = app.tab == *tab;
+                    if theme::nav_item(ui, p, icon, name, hint, selected).clicked() {
+                        app.tab = *tab;
+                        app.confirm_clear = false;
+                        app.status = format!("切换到「{name}」");
+                    }
+                }
+            }
+        });
+}
+
+/// 输出图层开关组：常驻左侧栏底部，默认仅输出当前页。
+fn output_layers_body(app: &mut AppState, ui: &mut Ui, p: &theme::Palette) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("输出图层")
+                .size(12.0)
+                .strong()
+                .color(p.text),
+        )
+        .on_hover_text("默认只输出当前页，勾选可叠加输出");
+        theme::pill(
+            ui,
+            &format!("{} 层", active_layer_count(app)),
+            p.accent,
+            p.accent_soft,
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("当前")
+                .on_hover_text("恢复默认：只输出当前所在页面")
+                .clicked()
+            {
+                for (i, m) in app.module_on.iter_mut().enumerate() {
+                    *m = app.tab == i;
+                }
+                app.images_on = app.tab == 5;
+            }
+            if ui
+                .small_button("全部")
+                .on_hover_text("勾选所有图层，全部叠加输出")
+                .clicked()
+            {
+                for m in app.module_on.iter_mut() {
+                    *m = true;
+                }
+                app.images_on = true;
+            }
+        });
+    });
+    ui.spacing_mut().item_spacing = egui::Vec2::new(4.0, 1.0);
+    egui::Grid::new("layer_grid")
+        .num_columns(3)
+        .spacing([4.0, 1.0])
+        .show(ui, |ui| {
+            for (i, name) in CONTENT_MODULES.iter().enumerate() {
+                // 当前页始终参与输出，因此显示为选中且不可取消；
+                // 其它模块的勾选才真正对应 `module_on` 叠加开关。
+                let current = app.tab == i;
+                let mut on = app.module_active(i);
+                if current {
+                    ui.add_enabled(false, egui::Checkbox::new(&mut on, *name))
+                        .on_disabled_hover_text("当前页默认输出，无需勾选");
+                } else {
+                    let resp = ui.checkbox(&mut on, *name);
+                    if resp.changed() {
+                        app.module_on[i] = on;
+                    }
+                    resp.on_hover_text("叠加到同一页输出");
+                }
+                if i % 3 == 2 {
+                    ui.end_row();
+                }
+            }
+            ui.checkbox(&mut app.images_on, "图片")
+                .on_hover_text("把图片模块叠加到同一页");
+            ui.end_row();
+        });
+    if !app.images.is_empty() && !app.images_on {
+        ui.label(
+            RichText::new("图片未勾选：不会写入 G-code")
+                .size(9.0)
+                .color(p.warning),
+        );
+    }
+}
+
+/// 全局操作条：左侧运行控制，中间进度，右侧统计。
+fn action_bar(app: &mut AppState, ui: &mut Ui, p: &theme::Palette) {
+    let snap = app.device.snapshot();
+    ui.horizontal(|ui| {
+        // 连接状态
+        let (col, txt) = if app.dev_connected {
+            (
+                if app.dev_kind == 2 { p.accent } else { p.success },
+                if app.dev_kind == 2 { "模拟" } else { "已连接" },
+            )
+        } else {
+            (p.muted, "未连接")
+        };
+        let (rect, resp) = ui.allocate_exact_size(egui::Vec2::splat(10.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, col);
+        ui.label(RichText::new(txt).size(11.5).color(col));
+        if ui
+            .add(theme::soft_button(p, "连接"))
+            .on_hover_text("跳到设备页连接机器")
+            .clicked()
+        {
+            app.tab = 6;
+        }
+        let _ = resp;
+
+        ui.add_space(6.0);
+
+        if !snap.running {
+            let tile_layout = app.tile_on.then(|| app.tile_layout()).flatten();
+            // 分页时先选页再绘制：页码直接决定「开始绘制」下发哪一页。
+            if let Some(layout) = &tile_layout {
+                let count = layout.count().max(1);
+                let mut page = app.tile_page_clamped();
+                egui::ComboBox::from_id_salt("action_tile_page")
+                    .selected_text(format!("第 {}/{} 页", page + 1, count))
+                    .width(104.0)
+                    .show_ui(ui, |ui| {
+                        ui.set_max_height(260.0);
+                        for i in 0..count {
+                            ui.selectable_value(&mut page, i, format!("第 {} 页", i + 1));
+                        }
+                    });
+                if page != app.tile_page {
+                    app.tile_page = page;
+                    app.status = format!("已选择第 {}/{} 页", page + 1, count);
+                }
+            }
+            let start_label = match &tile_layout {
+                Some(_) => format!("绘制第 {} 页", app.tile_page_clamped() + 1),
+                None => "开始绘制".to_string(),
+            };
+            if ui
+                .add(theme::primary_button(p, &start_label))
+                .on_hover_text(if tile_layout.is_some() {
+                    "生成当前分页的 G-code 并下发（含四角定位标记）"
+                } else {
+                    "生成 G-code 并下发（会先做边界自检）"
+                })
+                .clicked()
+            {
+                act_start_draw(app);
+            }
+        } else if snap.paused {
+            if ui
+                .add(theme::soft_button(p, "继续绘制"))
+                .clicked()
+            {
+                app.resume_run();
+                app.status = "已继续".into();
+            }
+        } else if ui.add(theme::soft_button(p, "暂停")).clicked() {
+            app.pause_run();
+            app.status = "已暂停".into();
+        }
+
+        if ui
+            .add_enabled(
+                snap.running,
+                theme::danger_button(p, "停止", false),
+            )
+            .clicked()
+        {
+            app.stop_run();
+            app.status = "已停止".into();
+        }
+
+        // 一键四角定位：不依赖分页 / 图片，任何页签都能直接下发。
+        if ui
+            .add_enabled(
+                !snap.running,
+                theme::soft_button(p, "四角定位"),
+            )
+            .on_hover_text(
+                "在当前定位框（默认 200×280mm）四角各画一个 1cm L 标记，完成后回到原点",
+            )
+            .clicked()
+        {
+            app.draw_corner_marks();
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        if snap.running {
             let frac = if snap.total_lines > 0 {
                 snap.done_lines as f64 / snap.total_lines as f64
             } else {
                 0.0
             };
-            draw_progress_page(ui, &app.run_preview, frac, app.page_w_mm, app.page_h_mm);
+            ui.add(
+                egui::ProgressBar::new(frac as f32)
+                    .desired_width(220.0)
+                    .text(format!("{:.0}%", frac * 100.0)),
+            );
+            ui.label(
+                RichText::new(format!("第 {} / {} 行", snap.done_lines, snap.total_lines))
+                    .size(11.0)
+                    .color(p.muted),
+            );
+            let remain = if snap.done_lines > 0 {
+                (snap.elapsed_ms as f64 / 1000.0) / snap.done_lines as f64
+                    * (snap.total_lines.saturating_sub(snap.done_lines)) as f64
+            } else {
+                app.estimated_seconds()
+            };
+            ui.label(
+                RichText::new(format!(
+                    "剩余 {}",
+                    fmt_duration(remain)
+                ))
+                .size(11.0)
+                .color(p.text),
+            );
         } else {
-            // 标题条 + 纸张 + 运行控制条
-            ui.horizontal_wrapped(|ui| {
-                let name = MODULES.get(app.tab).copied().unwrap_or("预览");
-                ui.label(RichText::new(name).size(17.0).strong());
-                ui.label(
-                    RichText::new(format!("{} 条笔迹", app.preview.len()))
-                        .size(11.0)
-                        .color(muted()),
-                );
-                ui.separator();
-                ui.label(RichText::new("页面").size(11.0).color(muted()));
-                paper_row(app, ui);
-            });
-            ui.separator();
-            run_control_bar(app, ui);
-            ui.separator();
-
-            // 视图辅助（页面外侧）：标尺开关 + 可调节行/列数量的浅色虚线网格
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut app.ruler_on, "标尺");
-                ui.checkbox(&mut app.grid_overlay, "网格");
-                if app.grid_overlay {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("列").size(11.0).color(muted()));
-                    ui.add(
-                        egui::DragValue::new(&mut app.grid_overlay_cols)
-                            .range(1..=60)
-                            .clamp_existing_to_range(true)
-                            .speed(1),
-                    );
-                    ui.label(RichText::new("行").size(11.0).color(muted()));
-                    ui.add(
-                        egui::DragValue::new(&mut app.grid_overlay_rows)
-                            .range(1..=80)
-                            .clamp_existing_to_range(true)
-                            .speed(1),
-                    );
-                    ui.weak("可调行/列分割数（浅色虚线，不打印）");
-                }
-            });
-            ui.separator();
-
-            let freehand = app.tab == 3 && app.freehand_on;
-            let image_tab = app.tab == 5;
-            // 手绘临时点集用局部变量，避免与整块 `app` 的可变借用冲突。
-            let mut acc = std::mem::take(&mut app.freehand);
-            let (_map, committed) = draw_canvas(ui, app, freehand, image_tab, &mut acc);
-            if committed && acc.len() >= 2 {
-                let pts = std::mem::take(&mut acc);
-                app.draw_paths.push(Polyline::new(pts));
-                app.status = format!("已添加手绘笔迹（共 {} 条）", app.draw_paths.len());
-            }
-            app.freehand = acc;
+            ui.label(
+                RichText::new(format!(
+                    "{} 笔 · 墨线 {:.2} m · 空移 {:.1} m · 预计 {}",
+                    app.stats.strokes,
+                    app.stats.ink_mm / 1000.0,
+                    app.stats.travel_mm / 1000.0,
+                    fmt_duration(app.estimated_seconds())
+                ))
+                .size(11.0)
+                .color(p.muted),
+            );
         }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !app.transfer_status.is_empty() {
+                let ok = app.transfer_status.starts_with('✓');
+                theme::pill(
+                    ui,
+                    if ok { "已下发" } else { "下发异常" },
+                    if ok { p.success } else { p.danger },
+                    p.card,
+                );
+            }
+        });
     });
 }
 
-/// 左栏「坐标」区：机器物理坐标（MPos）/ 当前工件坐标（WPos）/ 页面坐标 → 机器坐标。
+/// 工作区标题栏：模块信息 + 定位辅助 + 视图比例 + 纸张，**压成一行**把高度留给预览。
+fn workspace_header(app: &mut AppState, ui: &mut Ui, p: &theme::Palette) {
+    let icon = match app.tab {
+        0 => "文",
+        1 => "表",
+        2 => "格",
+        3 => "绘",
+        4 => "记",
+        5 => "图",
+        6 => "机",
+        7 => "测",
+        8 => "出",
+        _ => "页",
+    };
+    let name = MODULES.get(app.tab).copied().unwrap_or("预览");
+    let desc = MODULE_DESC.get(app.tab).copied().unwrap_or("");
+
+    ui.horizontal(|ui| {
+        let (tile, _) = ui.allocate_exact_size(egui::Vec2::splat(24.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(tile, egui::CornerRadius::same(6), p.accent);
+        ui.painter().text(
+            tile.center(),
+            egui::Align2::CENTER_CENTER,
+            icon,
+            egui::FontId::proportional(13.0),
+            egui::Color32::WHITE,
+        );
+        ui.label(RichText::new(name).size(15.0).strong().color(p.text))
+            .on_hover_text(desc);
+        theme::pill(ui, &format!("{} 笔", app.stats.strokes), p.muted, p.card);
+        if app.images_on {
+            theme::pill(ui, "图片叠加中", p.success, p.card);
+        }
+
+        ui.separator();
+        ui.checkbox(&mut app.ruler_on, "标尺");
+        ui.checkbox(&mut app.grid_overlay, "网格")
+            .on_hover_text("显示按列/行等分的虚线参考网格（仅定位，不打印）");
+        if app.grid_overlay {
+            ui.label(RichText::new("列").size(10.0).color(p.muted));
+            ui.add(
+                egui::DragValue::new(&mut app.grid_overlay_cols)
+                    .range(1..=60)
+                    .clamp_existing_to_range(true)
+                    .speed(1),
+            );
+            ui.label(RichText::new("行").size(10.0).color(p.muted));
+            ui.add(
+                egui::DragValue::new(&mut app.grid_overlay_rows)
+                    .range(1..=80)
+                    .clamp_existing_to_range(true)
+                    .speed(1),
+            );
+        }
+        if app.tab <= 4 || app.tab == 5 {
+            ui.separator();
+            let label = if app.confirm_clear {
+                "确认清空？"
+            } else {
+                "清空本页"
+            };
+            let btn = if app.confirm_clear {
+                theme::danger_button(p, label, true)
+            } else {
+                theme::soft_button(p, label)
+            };
+            if ui.add(btn).clicked() {
+                if app.confirm_clear {
+                    app.clear_current_module();
+                    app.confirm_clear = false;
+                } else {
+                    app.confirm_clear = true;
+                    app.status = "再点一次确认清空本页".into();
+                }
+            }
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // 纸张 / 方向
+            paper_row(app, ui);
+            ui.separator();
+            // 笔尖粗细：只影响预览显示，让屏幕上的线宽和纸上一致
+            ui.add(
+                egui::DragValue::new(&mut app.preview_pen_mm)
+                    .range(0.1..=1.6)
+                    .speed(0.05)
+                    .fixed_decimals(2)
+                    .prefix("笔 ")
+                    .suffix(" mm"),
+            )
+            .on_hover_text(
+                "笔尖实际粗细，只影响预览显示，不改 G-code。\n0.3 ≈ 针管笔 / 0.5 ≈ 中性笔 / 0.7~1.0 ≈ 记号笔。",
+            );
+            ui.separator();
+            // 视图比例：适应 / + / % / −
+            if ui
+                .add(theme::soft_button(p, "适应"))
+                .on_hover_text("恢复整页适应窗口（也支持 Ctrl+滚轮缩放 / 空格 + 拖动平移）")
+                .clicked()
+            {
+                app.reset_view();
+            }
+            if ui.small_button("+").on_hover_text("放大画布").clicked() {
+                app.zoom_by(1.25);
+            }
+            ui.label(
+                RichText::new(format!("{:.0}%", app.canvas_zoom * 100.0))
+                    .size(11.0)
+                    .monospace()
+                    .color(p.text),
+            );
+            if ui.small_button("−").on_hover_text("缩小画布").clicked() {
+                app.zoom_by(1.0 / 1.25);
+            }
+            if let Some((x, y)) = app.cursor_mm {
+                ui.label(
+                    RichText::new(format!("{:.1}, {:.1} mm", x, y))
+                        .size(10.0)
+                        .monospace()
+                        .color(p.muted),
+                )
+                .on_hover_text("鼠标在页面上的位置");
+            }
+        });
+    });
+    ui.add_space(2.0);
+    theme::divider(ui, p);
+}
+
+/// 运行监控页标题栏。
+fn running_header(app: &mut AppState, ui: &mut Ui, p: &theme::Palette) {
+    let snap = app.device.snapshot();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("运行监控").size(17.0).strong().color(p.text));
+        let state = if snap.running {
+            if snap.paused {
+                "已暂停"
+            } else {
+                "运行中"
+            }
+        } else {
+            "空闲"
+        };
+        theme::pill(
+            ui,
+            state,
+            if snap.running { p.success } else { p.muted },
+            p.card,
+        );
+        ui.label(
+            RichText::new(format!(
+                "{} / {} 行 · 已用 {}",
+                snap.done_lines,
+                snap.total_lines,
+                fmt_duration(snap.elapsed_ms as f64 / 1000.0)
+            ))
+            .size(11.0)
+            .color(p.muted),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(theme::soft_button(p, "返回编辑"))
+                .clicked()
+            {
+                app.tab = 0;
+            }
+        });
+    });
+    ui.add_space(4.0);
+    theme::divider(ui, p);
+}
+
+/// 实时坐标：机器物理坐标（MPos）/ 当前工件坐标（WPos）/ 页面坐标 → 机器坐标。
 ///
 /// 放在字库下面、实时日志上面：字库是「静态信息」，日志在最底部，
 /// 坐标是运行中唯一想一直盯着的东西，插在两者之间最顺眼。
 fn coord_panel(app: &mut AppState, ui: &mut Ui) {
-    ui.separator();
-    ui.label(RichText::new("坐标").strong().color(muted()));
-
     let snap = app.device.snapshot();
     let p = snap.pos;
+    // 等宽坐标串不能太长：三行并排会撑宽参数栏，把中间画布挤小。
     let line = |v: Option<[f64; 3]>| match v {
-        Some(a) => format!("X {:>8.2}   Y {:>8.2}   Z {:>7.2}", a[0], a[1], a[2]),
-        None => "X        —    Y        —    Z       —".to_string(),
+        Some(a) => format!("X{:>7.2}  Y{:>7.2}  Z{:>6.2}", a[0], a[1], a[2]),
+        None => "X  —      Y  —      Z  —".to_string(),
     };
     egui::Grid::new("coord_grid")
         .num_columns(2)
@@ -773,7 +1395,7 @@ fn coord_panel(app: &mut AppState, ui: &mut Ui) {
             ui.label(RichText::new("机器物理").size(10.0).color(muted()));
             ui.label(
                 RichText::new(line(p.m))
-                    .size(11.5)
+                    .size(11.0)
                     .monospace()
                     .color(egui::Color32::from_rgb(40, 110, 240)),
             );
@@ -781,7 +1403,7 @@ fn coord_panel(app: &mut AppState, ui: &mut Ui) {
             ui.label(RichText::new("当前坐标").size(10.0).color(muted()));
             ui.label(
                 RichText::new(line(p.w))
-                    .size(11.5)
+                    .size(11.0)
                     .monospace()
                     .color(egui::Color32::from_rgb(40, 170, 90)),
             );
@@ -802,12 +1424,9 @@ fn coord_panel(app: &mut AppState, ui: &mut Ui) {
     }
 
     ui.horizontal_wrapped(|ui| {
-        if ui.small_button("刷新").on_hover_text("发一次 ? / M114 查询当前位置").clicked() {
-            app.read_position();
-        }
         let mut poll = app.status_poll_ms > 0;
         if ui
-            .checkbox(&mut poll, "自动")
+            .checkbox(&mut poll, "自动刷新坐标")
             .on_hover_text("每秒自动查询一次坐标（GRBL 不主动推送，只能定时问）")
             .changed()
         {
@@ -815,24 +1434,10 @@ fn coord_panel(app: &mut AppState, ui: &mut Ui) {
         }
     });
 
-    // 一键回原点：把笔移到坐标零点 (0,0)。放在实时坐标下方、左下角，
-    // 运行中想随时把笔退回家时不用切到顶部运行条。
-    if ui
-        .add_sized(
-            [110.0, 26.0],
-            egui::Button::new(RichText::new("↺ 回原点").size(12.0))
-                .fill(egui::Color32::from_rgb(46, 120, 200)),
-        )
-        .on_hover_text("发送 G0 X0 Y0，把笔移动到坐标零点 (0,0)")
-        .clicked()
-    {
-        app.go_zero();
-    }
-
     if !app.dev_connected {
         ui.label(RichText::new("未连接：连上机器后才有坐标").size(10.0).color(muted()));
     } else if !p.any() {
-        ui.label(RichText::new("暂无坐标回报，点「刷新」试一次").size(10.0).color(muted()));
+        ui.label(RichText::new("暂无坐标回报，点下方「读取当前位置」查询一次").size(10.0).color(muted()));
     }
     ui.weak("「机器物理」是相对机械原点，「当前坐标」受 G92 设零点影响。");
 }
@@ -902,112 +1507,6 @@ fn paper_row(app: &mut AppState, ui: &mut Ui) {
     }
 }
 
-/// 顶部运行控制条：**开始绘制** / 暂停 / 继续 / 停止 / 回原点 / 设置 / 清空本页。
-fn run_control_bar(app: &mut AppState, ui: &mut Ui) {
-    let snap = app.device.snapshot();
-
-    ui.horizontal_wrapped(|ui| {
-        let (dot, col) = if app.dev_connected {
-            ("●", egui::Color32::from_rgb(60, 170, 90))
-        } else {
-            ("○", egui::Color32::from_gray(150))
-        };
-        ui.colored_label(
-            col,
-            RichText::new(format!(
-                "{} {}",
-                dot,
-                if app.dev_connected { "已连接" } else { "未连接" }
-            ))
-            .size(13.0),
-        );
-
-        // 主按钮：开始绘制
-        let start = egui::Button::new(
-            RichText::new("开始绘制").size(15.0).strong().color(egui::Color32::WHITE),
-        )
-        .fill(egui::Color32::from_rgb(46, 160, 90))
-        .min_size(egui::Vec2::new(115.0, 30.0));
-        if ui.add_enabled(!snap.running, start).clicked() {
-            let g = app.generate_gcode();
-            if g.trim().is_empty() {
-                app.status = "当前页面没有可绘制的内容".into();
-            } else {
-                app.gcode_text = g.clone();
-                app.start_run(g);
-                app.status = "已开始绘制（进度见「运行中」页）".into();
-            }
-        }
-
-        if snap.running && !snap.paused {
-            if ui
-                .add_sized([66.0, 30.0], egui::Button::new("暂停"))
-                .clicked()
-            {
-                app.pause_run();
-                app.status = "已暂停".into();
-            }
-        } else if snap.paused {
-            if ui
-                .add_sized([66.0, 30.0], egui::Button::new("继续"))
-                .clicked()
-            {
-                app.resume_run();
-                app.status = "已继续".into();
-            }
-        }
-
-        if ui
-            .add_enabled(snap.running, egui::Button::new("停止").min_size(egui::Vec2::new(60.0, 30.0)))
-            .clicked()
-        {
-            app.stop_run();
-            app.status = "已停止".into();
-        }
-
-        if ui.add_sized([78.0, 30.0], egui::Button::new("回原点")).clicked() {
-            app.go_zero();
-        }
-
-        if ui.add_sized([60.0, 30.0], egui::Button::new("设置")).clicked() {
-            app.settings_open = true;
-        }
-
-        // 非内容页清的是「全部内容」，且要二次确认，防止误删整页
-        let on_content = app.tab < CONTENT_MODULES.len();
-        let label = if on_content { "清空本页" } else { "清空内容" };
-        let btn = if app.confirm_clear {
-            egui::Button::new(RichText::new("确认清空？").color(egui::Color32::WHITE))
-                .fill(egui::Color32::from_rgb(190, 70, 60))
-        } else {
-            egui::Button::new(label)
-        };
-        if ui.add_sized([96.0, 30.0], btn).clicked() {
-            if app.confirm_clear {
-                app.clear_current_module();
-            } else {
-                app.confirm_clear = true;
-                app.status = "再点一次确认清空".into();
-            }
-        }
-
-        if snap.running {
-            ui.label(
-                RichText::new(format!("第 {}/{} 行", snap.done_lines, snap.total_lines))
-                    .size(12.0)
-                    .color(muted()),
-            );
-        }
-    });
-
-    if !app.dev_connected {
-        ui.colored_label(
-            egui::Color32::from_rgb(200, 120, 40),
-            "未连接设备：请到「设备」页连接，或把连接方式选为「模拟」先试跑流程。",
-        );
-    }
-}
-
 /// 设置对话框：收纳不常用设置（固件高级 / 坐标系 / 运行流控 / 逼真化 / 图片默认参数 / 机器幅面）。
 fn settings_window(app: &mut AppState, ctx: egui::Context) {
     if !app.settings_open {
@@ -1021,13 +1520,21 @@ fn settings_window(app: &mut AppState, ctx: egui::Context) {
         .show(&ctx, |ui| {
             ScrollArea::vertical().show(ui, |ui| {
                 section(ui, "界面");
+                let mut dark = app.dark_mode;
+                if ui.checkbox(&mut dark, "深色主题").changed() {
+                    app.dark_mode = dark;
+                    app.theme_applied = None;
+                }
                 ui.add(egui::Slider::new(&mut app.ui_scale, 0.7..=2.0).text("界面缩放(×)"));
                 ui.weak("窗口里放不下内容 / 字太小时调它；改完立即生效。");
                 if ui.button("恢复 1.0×").clicked() {
                     app.ui_scale = 1.0;
                 }
                 ui.checkbox(&mut app.axes_on, "画布显示 XY 方向箭头（蓝 X / 绿 Y）");
-                ui.checkbox(&mut app.text_frame_on, "文字模块显示文本框虚框（不打印）");
+                ui.checkbox(&mut app.text_frame_on, "显示文本框虚框（不打印）");
+                if ui.button("打开快速上手 / 快捷键").clicked() {
+                    app.help_open = true;
+                }
 
                 section(ui, "运行流控（机器不动时先看这里）");
                 ui.checkbox(
@@ -1045,7 +1552,7 @@ fn settings_window(app: &mut AppState, ctx: egui::Context) {
                     app.apply_flow_settings();
                     app.status = "流控设置已应用".into();
                 }
-                ui.weak("机器完全不动时：保持勾选解锁，并到「测试」页手动发一次 $X 看回显。");
+                ui.weak("机器完全不动时：保持勾选解锁，并到「设备与调试 → 机器调试」手动发一次 $X 看回显。");
 
                 section(ui, "链路保活（蓝牙几分钟就断时看这里）");
                 ui.checkbox(&mut app.auto_reconnect, "断线自动重连（蓝牙/USB 闪断时自动恢复）");
@@ -1083,311 +1590,291 @@ fn settings_window(app: &mut AppState, ctx: egui::Context) {
                 });
                 ui.weak("仅作越界提示，不影响绘制坐标。");
 
-                section(ui, "高级（激光 / 休眠 / 延时）");
-                ui.checkbox(&mut app.laser_on, "激光模式（M3/M5 代替落笔）");
-                ui.add_enabled(
-                    app.laser_on,
-                    egui::Slider::new(&mut app.laser_power, 0.0..=1000.0).text("激光功率 S"),
-                );
-                ui.checkbox(&mut app.auto_sleep, "完成后自动休眠");
-                ui.add(egui::Slider::new(&mut app.tool_on_delay, 0.0..=2.0).text("落笔后暂停(s)"));
-                ui.add(egui::Slider::new(&mut app.tool_off_delay, 0.0..=2.0).text("抬笔前暂停(s)"));
-                ui.collapsing("EBB 舵机", |ui| {
-                    ui.add(egui::Slider::new(&mut app.ebb_servo_speed, 0.0..=32767.0).text("舵机速度"));
-                    ui.add(egui::Slider::new(&mut app.ebb_max_pen, 0.0..=65535.0).text("最大舵机值"));
-                });
-
-                section(ui, "机器参数（与参考项目 default.properties 一致）");
-                ui.add(egui::Slider::new(&mut app.feed_rate, 100.0..=30000.0).text("绘图速度(mm/min)"));
-                ui.add(egui::Slider::new(&mut app.jog_speed, 100.0..=30000.0).text("点动速度(mm/min)"));
-                ui.checkbox(&mut app.auto_set_zero, "运行前自动设原点（G92 X0 Y0）");
+                section(ui, "启动与发送");
                 ui.checkbox(&mut app.auto_connect, "启动后自动连接机器");
-                ui.checkbox(&mut app.single_step, "单步下发（逐行发送并等待）");
-
-                ui.collapsing("GRBL（给 zOn / zOff / zSpeed）", |ui| {
-                    ui.add(egui::Slider::new(&mut app.pen_down, -20.0..=40.0).text("落笔 Z(mm)"));
-                    ui.add(egui::Slider::new(&mut app.pen_up, -20.0..=40.0).text("抬笔 Z(mm)"));
-                    ui.add(egui::Slider::new(&mut app.z_speed, 100.0..=30000.0).text("Z 轴速度(mm/min)"));
-                });
-                ui.collapsing("Marlin（给 marlin_pen_* / marlin_z_speed）", |ui| {
-                    if app.pen_mode_sel == 1 {
-                        ui.add(egui::Slider::new(&mut app.marlin_servo_down, 0.0..=180.0).text("落笔角度"));
-                        ui.add(egui::Slider::new(&mut app.marlin_servo_up, 0.0..=180.0).text("抬笔角度"));
-                    } else {
-                        ui.add(egui::Slider::new(&mut app.marlin_pen_down, -20.0..=40.0).text("落笔 Z(mm)"));
-                        ui.add(egui::Slider::new(&mut app.marlin_pen_up, -20.0..=40.0).text("抬笔 Z(mm)"));
-                    }
-                    ui.add(
-                        egui::Slider::new(&mut app.marlin_z_speed, 100.0..=30000.0)
-                            .text("Z 轴速度(mm/min)"),
-                    );
-                });
-                ui.collapsing("EBB", |ui| {
-                    ui.add(egui::Slider::new(&mut app.ebb_servo_speed, 0.0..=32767.0).text("舵机速度"));
-                    ui.add(egui::Slider::new(&mut app.ebb_max_pen, 0.0..=65535.0).text("最大舵机值"));
-                    ui.add(egui::Slider::new(&mut app.mm_to_steps, 1.0..=1000.0).text("毫米→步数"));
-                    ui.add(
-                        egui::Slider::new(&mut app.max_pen_speed, 1000.0..=32767.0)
-                            .text("最大抬落笔速度"),
-                    );
-                });
-                ui.weak("抬/落笔参数按固件分别保存，切换固件时不会互相覆盖。");
-
-                section(ui, "坐标系");
-                ui.horizontal(|ui| {
-                    ui.label("原点角:");
-                    for (i, nm) in ORIGINS.iter().enumerate() {
-                        ui.selectable_value(&mut app.origin_corner, i, *nm);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut app.reverse_x, "反转X");
-                    ui.checkbox(&mut app.reverse_y, "反转Y");
-                    ui.checkbox(&mut app.swap_xy, "对调XY");
-                });
-
-                section(ui, "回到机器原点 / 设当前点为原点");
-                if !app.dev_connected {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 120, 40),
-                        "未连接设备：下面的按钮会发出指令，但机器收不到（可先到「设备」页连接）",
-                    );
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .button("回到机器原点")
-                        .on_hover_text("GRBL 发 $H、Marlin 发 G28：靠限位开关找机械原点")
-                        .clicked()
-                    {
-                        app.home_machine();
-                    }
-                    if ui
-                        .button("移到 (0,0)")
-                        .on_hover_text("没有限位开关就用这个：直接快速移动到坐标零点")
-                        .clicked()
-                    {
-                        app.go_zero();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .button("设当前位置为原点")
-                        .on_hover_text("G92 X0 Y0：机器不动，把「现在站着的位置」记为坐标零点")
-                        .clicked()
-                    {
-                        app.set_zero_here();
-                    }
-                    if ui
-                        .button("清除坐标偏置")
-                        .on_hover_text("G92.1：撤掉 G92 设的零点，回到机器坐标系")
-                        .clicked()
-                    {
-                        app.clear_zero_offset();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("读取当前位置").clicked() {
-                        app.read_position();
-                    }
-                    if ui
-                        .button("解锁 $X")
-                        .on_hover_text("GRBL 上电是 Alarm 锁定态，不解锁所有移动指令都会被忽略")
-                        .clicked()
-                    {
-                        app.unlock_machine();
-                    }
-                });
-                ui.weak("回显都写在窗口最下方的「实时日志」栏里。");
-
-                section(ui, "自定义 G-code");
-                ui.label("起始（多条用 ; 分隔）：");
-                ui.text_edit_singleline(&mut app.custom_start);
-                ui.label("结束：");
-                ui.text_edit_singleline(&mut app.custom_end);
-
-                section(ui, "逼真化（随机手写变形）");
-                ui.checkbox(&mut app.use_random, "启用随机变形");
-                ui.add_enabled(
-                    app.use_random,
-                    egui::Slider::new(&mut app.rand_x, 0.0..=1.0).text("水平抖动(mm)"),
-                );
-                ui.add_enabled(
-                    app.use_random,
-                    egui::Slider::new(&mut app.rand_y, 0.0..=1.0).text("垂直抖动(mm)"),
-                );
-                ui.add_enabled(
-                    app.use_random,
-                    egui::Slider::new(&mut app.rand_scale, 0.0..=0.2).text("大小抖动(±比例)"),
-                );
-                ui.add_enabled(
-                    app.use_random,
-                    egui::Slider::new(&mut app.rand_head, 0.0..=8.0).text("行首随机(mm)"),
-                );
-
-                section(ui, "图片默认导入参数");
-                ui.add(egui::Slider::new(&mut app.img_target_h, 30.0..=250.0).text("目标高度(mm)"));
-                ui.add(egui::Slider::new(&mut app.img_step, 1..=12).text("影线间隔(px)"));
-                ui.add(egui::Slider::new(&mut app.img_thr, 0.1..=0.95).text("暗部阈值(素描)"));
-                ui.add(egui::Slider::new(&mut app.img_edge, 0.05..=0.9).text("边缘阈值(线框)"));
-                ui.checkbox(&mut app.img_invert, "反相");
-                let mut dt = app.img_draw_type;
-                ui.horizontal(|ui| {
-                    ui.label("默认类型:");
-                    for (i, name) in ImgDraw::names().iter().enumerate() {
-                        ui.selectable_value(&mut dt, i, *name);
-                    }
-                });
-                app.img_draw_type = dt;
-
-                section(ui, "点动");
-                ui.add(egui::Slider::new(&mut app.jog_step, 1.0..=50.0).text("步长(mm)"));
+                ui.checkbox(&mut app.auto_set_zero, "运行前自动设原点（G92 X0 Y0）");
+                ui.checkbox(&mut app.single_step, "单步下发（逐行发送并等待回显）");
+                ui.checkbox(&mut app.bounds_check, "开始前做机器幅面边界检查");
+                ui.weak("固件、抬落笔、速度、坐标系等生成参数在「项目与输出」页统一设置。");
             });
         });
     app.settings_open = open;
 }
 
-/// 机器测试模块：XY 移动 / 回零 / 定位零点 / 抬落笔 / 画测试方框。
-fn panel_test(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "⑧ 机器测试");
-
-    ui.horizontal(|ui| {
-        let (dot, col) = if app.dev_connected {
-            ("●", egui::Color32::from_rgb(60, 170, 90))
-        } else {
-            ("○", egui::Color32::from_gray(150))
-        };
-        ui.colored_label(
-            col,
-            format!("{} {}", dot, if app.dev_connected { "已连接" } else { "未连接" }),
+/// 内容模块共用的「手写风格」：随机抖动参数与生效范围。
+fn panel_style(app: &mut AppState, ui: &mut Ui) {
+    let p = pal(ui);
+    ui.add_space(8.0);
+    theme::collapsible_card(ui, &p, "手写风格 · 随机变形", false, |ui| {
+        ui.checkbox(&mut app.use_random, "启用随机变形（更接近真人手写）");
+        ui.add_enabled(
+            app.use_random,
+            egui::Slider::new(&mut app.rand_x, 0.0..=1.0).text("水平抖动(mm)"),
         );
-        if !app.dev_connected {
-            ui.weak("请先在「设备」页连接");
-        }
-        let snap = app.device.snapshot();
-        if snap.running {
-            ui.weak(format!("运行中 {}/{} 行", snap.done_lines, snap.total_lines));
-        }
-    });
+        ui.add_enabled(
+            app.use_random,
+            egui::Slider::new(&mut app.rand_y, 0.0..=1.0).text("垂直抖动(mm)"),
+        );
+        ui.add_enabled(
+            app.use_random,
+            egui::Slider::new(&mut app.rand_scale, 0.0..=0.2).text("大小抖动(±比例)"),
+        );
+        ui.add_enabled(
+            app.use_random,
+            egui::Slider::new(&mut app.rand_head, 0.0..=8.0).text("行首随机(mm)"),
+        );
 
-    ui.separator();
-    ui.label(RichText::new("解锁 / 复位").strong());
-    ui.horizontal(|ui| {
-        if ui.button("解锁 $X").clicked() {
-            app.unlock_machine();
+        if app.tab == 0 && !app.texts.is_empty() {
+            ui.add_enabled_ui(app.use_random, |ui| {
+                theme::divider(ui, &p);
+                ui.label(RichText::new("生效范围（只对勾上的文本框）").size(10.5).color(p.muted));
+                let n = app.texts.len();
+                for i in 0..n {
+                    let nm = app.texts[i].name.clone();
+                    ui.checkbox(&mut app.texts[i].random, nm);
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("全选").clicked() {
+                        for b in app.texts.iter_mut() {
+                            b.random = true;
+                        }
+                    }
+                    if ui.small_button("全不选").clicked() {
+                        for b in app.texts.iter_mut() {
+                            b.random = false;
+                        }
+                    }
+                    if ui.small_button("只选当前").clicked() {
+                        let cur = app.sel_text.min(n.saturating_sub(1));
+                        for (i, b) in app.texts.iter_mut().enumerate() {
+                            b.random = i == cur;
+                        }
+                    }
+                });
+            });
         }
-        if ui.button("软复位").clicked() {
-            app.soft_reset();
-        }
-    });
-    ui.weak("GRBL 上电/急停后是 Alarm 锁定态，所有移动指令会被忽略。先点「解锁 $X」，日志看到 ok 才能动。");
 
-    ui.separator();
-    ui.label(RichText::new("回零 / 定位零点").strong());
-    ui.horizontal(|ui| {
-        if ui.button("回原点 $H").clicked() {
-            app.home_machine();
-        }
-        if ui.button("移到 (0,0)").clicked() {
-            app.go_zero();
-        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(app.use_random, theme::soft_button(&p, "换一种笔迹"))
+                .clicked()
+            {
+                app.rebuild_preview_random();
+                app.status = "已重新随机".into();
+            }
+            if ui
+                .add_enabled(app.use_random, theme::soft_button(&p, "复位参数"))
+                .clicked()
+            {
+                app.rand_x = 0.0;
+                app.rand_y = 0.0;
+                app.rand_scale = 0.0;
+                app.rand_head = 0.0;
+                app.status = "随机参数已复位".into();
+            }
+        });
     });
-    ui.horizontal(|ui| {
-        if ui.button("当前点设为零点").clicked() {
-            app.set_zero_here();
-        }
-        if ui.button("清除坐标偏置").clicked() {
-            app.clear_zero_offset();
-        }
-    });
-    ui.weak("「回原点 $H」需要限位开关；没有限位开关的写字机请用「移到 (0,0)」或「当前点设为零点」。");
+}
 
-    ui.separator();
-    ui.label(RichText::new("XY 移动（点动）").strong());
-    ui.add(egui::Slider::new(&mut app.jog_step, 1.0..=50.0).text("步长(mm)"));
-    let s = app.jog_step;
-    ui.horizontal(|ui| {
-        if ui.button("X −").clicked() {
-            send_jog(app, -s, 0.0);
-        }
-        if ui.button("X +").clicked() {
-            send_jog(app, s, 0.0);
-        }
-        if ui.button("Y −").clicked() {
-            send_jog(app, 0.0, -s);
-        }
-        if ui.button("Y +").clicked() {
-            send_jog(app, 0.0, s);
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui.button("↖").clicked() {
-            send_jog(app, -s, -s);
-        }
-        if ui.button("↗").clicked() {
-            send_jog(app, s, -s);
-        }
-        if ui.button("↙").clicked() {
-            send_jog(app, -s, s);
-        }
-        if ui.button("↘").clicked() {
-            send_jog(app, s, s);
-        }
-    });
-
-    ui.separator();
-    ui.label(RichText::new("笔 / Z").strong());
-    ui.horizontal(|ui| {
-        if ui.button("抬笔").clicked() {
-            app.pen_up_now();
-        }
-        if ui.button("落笔").clicked() {
-            app.pen_down_now();
-        }
-        if ui.button("读当前位置").clicked() {
-            app.read_position();
-        }
-    });
-
-    ui.separator();
-    ui.label(RichText::new("画测试方框（验证方向与比例）").strong());
-    ui.horizontal(|ui| {
-        ui.add(egui::Slider::new(&mut app.test_frame_w, 10.0..=300.0).text("宽(mm)"));
-        ui.add(egui::Slider::new(&mut app.test_frame_h, 10.0..=300.0).text("高(mm)"));
-    });
-    if ui.button("开始画方框").clicked() {
-        let (w, h) = (app.test_frame_w, app.test_frame_h);
-        app.draw_test_frame(w, h);
+/// 关于窗口：产品介绍、版本与运行环境。
+fn about_window(app: &mut AppState, ctx: egui::Context) {
+    if !app.about_open {
+        return;
     }
-    ui.weak("画出来是矩形说明方向正常；若是镜像/旋转，到设置里调「反转X/反转Y/对调XY」。");
+    let p = theme::palette(app.dark_mode);
+    let mut open = app.about_open;
+    let mut close = false;
 
-    ui.separator();
-    ui.label(RichText::new("发送自定义单行 G-code").strong());
-    ui.text_edit_singleline(&mut app.test_custom_gcode);
-    if ui.button("发送").clicked() {
-        let g = app.test_custom_gcode.clone();
-        if !g.trim().is_empty() {
-            app.send_gcode(&g);
-            app.status = format!("已发送：{}", g);
-        }
+    egui::Window::new("关于 WritingRobot")
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .default_width(480.0)
+        .show(&ctx, |ui| {
+            ui.set_max_width(480.0);
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(52.0), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(rect, egui::CornerRadius::same(14), p.accent);
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "写",
+                    egui::FontId::proportional(26.0),
+                    egui::Color32::WHITE,
+                );
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("WritingRobot").size(22.0).strong().color(p.text));
+                        theme::pill(
+                            ui,
+                            &format!("v{}", env!("CARGO_PKG_VERSION")),
+                            p.accent,
+                            p.accent_soft,
+                        );
+                    });
+                    ui.label(
+                        RichText::new("写字机器人上位机 · 从排版到落笔的一站式控制台")
+                            .size(11.0)
+                            .color(p.muted),
+                    );
+                });
+            });
+
+            ui.add_space(8.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "WritingRobot 把文字排版、表格、练字格、手绘、笔记和图片线稿集中到一个所见即所得的页面里，\
+                         自动生成 G-code，并通过 USB 串口、蓝牙或 TCP 直接驱动写字机落笔。\
+                         无需安装驱动，断线可自动重连，也提供模拟模式用于完整试跑流程。",
+                    )
+                    .size(12.5)
+                    .color(p.text),
+                )
+                .wrap(),
+            );
+
+            ui.add_space(4.0);
+            theme::section(ui, &p, "主要能力", None);
+            egui::Grid::new("about_features")
+                .num_columns(2)
+                .spacing([16.0, 5.0])
+                .show(ui, |ui| {
+                    for (k, v) in [
+                        ("创作", "文字 / 表格 / 练字格 / 手绘 / 笔记，多图层叠加输出"),
+                        ("图片", "8 种线稿模式（含素描原稿），前景可打印、背景仅作临摹参考"),
+                        ("设备", "串口 / 蓝牙 / TCP / 模拟，后台扫描与蓝牙链路体检"),
+                        ("输出", "GRBL / Marlin / EBB，支持 G-code / SVG / PDF / PNG"),
+                    ] {
+                        ui.label(RichText::new(k).size(11.5).strong().color(p.accent));
+                        ui.add(egui::Label::new(RichText::new(v).size(11.5)).wrap());
+                        ui.end_row();
+                    }
+                });
+
+            ui.add_space(6.0);
+            theme::divider(ui, &p);
+            egui::Grid::new("about_build")
+                .num_columns(2)
+                .spacing([20.0, 3.0])
+                .show(ui, |ui| {
+                    for (k, v) in [
+                        (
+                            "版本",
+                            format!(
+                                "v{} · {}版",
+                                env!("CARGO_PKG_VERSION"),
+                                if cfg!(debug_assertions) { "开发" } else { "正式" }
+                            ),
+                        ),
+                        (
+                            "运行平台",
+                            format!(
+                                "{} {}",
+                                std::env::consts::OS,
+                                std::env::consts::ARCH
+                            ),
+                        ),
+                        ("界面框架", "egui / eframe · OpenGL (Glow)".to_string()),
+                    ] {
+                        ui.label(RichText::new(k).size(10.5).color(p.muted));
+                        ui.label(RichText::new(v).size(10.5).color(p.text));
+                        ui.end_row();
+                    }
+                });
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.add(theme::soft_button(&p, "快速上手")).clicked() {
+                    app.help_open = true;
+                    close = true;
+                }
+                if ui.add(theme::primary_button(&p, "关闭")).clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    app.about_open = open && !close;
+}
+
+/// 快速上手窗口：把分散在各页的操作顺序讲清楚。
+fn help_window(app: &mut AppState, ctx: egui::Context) {
+    if !app.help_open {
+        return;
     }
+    let p = theme::palette(app.dark_mode);
+    let mut open = app.help_open;
+    egui::Window::new("快速上手")
+        .open(&mut open)
+        .resizable(true)
+        .default_size([520.0, 560.0])
+        .show(&ctx, |ui| {
+            ScrollArea::vertical().show(ui, |ui| {
+                theme::section(ui, &p, "1. 选模块，勾图层", Some("左侧导航按创作 / 图形 / 设备 / 项目分组"));
+                ui.label("· 「创作」「图形」里选一个模块编辑内容。");
+                ui.label("· 左侧栏「输出图层」决定哪些模块叠加到同一页并写入 G-code。");
+                ui.label("· 默认只输出当前页；点「全部」让文字、表格、图片等一起叠加，点「当前」恢复默认。");
 
-    ui.separator();
-    ui.horizontal(|ui| {
-        if ui.button("停止运动").clicked() {
-            app.stop_run();
-        }
-        if ui.button("清空日志").clicked() {
-            app.clear_current_module();
-        }
-    });
+                theme::section(ui, &p, "2. 连接机器", Some("有线 USB 或蓝牙串口都可以"));
+                ui.label("· 打开「设备与调试」→ 扫描串口 → 选在线端口 → 连接。");
+                ui.label("· 连上但机器不动：先「自动波特率」，再解锁 $X。");
+                ui.label("· 没有机器：连接方式选「模拟」，可以完整试跑流程。");
 
-    ui.separator();
-    ui.label("日志：");
-    ui.add(TextEdit::multiline(&mut app.dev_log).desired_rows(10).interactive(false));
+                theme::section(ui, &p, "3. 调整与预览", Some("所见即所得"));
+                ui.label("· 右侧参数栏只显示当前模块的参数；纸张、缩放、标尺在画布上方。");
+                ui.label("· Ctrl + 滚轮缩放画布，中键或空格 + 左键拖动平移。");
+                ui.label("· 右栏底部「手写风格」可开启随机抖动。");
+
+                theme::section(ui, &p, "4. 输出与运行", None);
+                ui.label("· 底部操作条「开始绘制」会先做幅面边界检查，再下发 G-code。");
+                ui.label("· 「项目与输出」页集中了固件、速度、抬落笔、坐标系、导入与导出。");
+                ui.label("· 运行进度、耗时和剩余时间显示在底部操作条与「运行监控」页。");
+
+                theme::section(ui, &p, "快捷键", None);
+                egui::Grid::new("help_keys")
+                    .num_columns(2)
+                    .spacing([24.0, 4.0])
+                    .show(ui, |ui| {
+                        for (k, v) in [
+                            ("Ctrl + S", "保存工程"),
+                            ("Ctrl + O", "打开工程"),
+                            ("Ctrl + E", "导出 G-code"),
+                            ("Ctrl + 滚轮", "缩放画布"),
+                            ("F1", "打开本窗口"),
+                        ] {
+                            ui.label(RichText::new(k).monospace().color(p.accent));
+                            ui.label(v);
+                            ui.end_row();
+                        }
+                    });
+
+                theme::section(ui, &p, "常见问题", None);
+                ui.label("· 中文变方块：未加载 .gfont 字库，到「项目与输出 → 导入」重新扫描。");
+                ui.label("· 超界报警：在「项目与输出 → 坐标系与幅面」核对机器行程，或调整纸张/缩放。");
+                ui.label("· 蓝牙几分钟断一次：设置里开启保活心跳与断线自动重连。");
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "WritingRobot v{} · {} 构建 · {}",
+                        env!("CARGO_PKG_VERSION"),
+                        if cfg!(debug_assertions) { "调试" } else { "发布" },
+                        if cfg!(target_os = "windows") { "Windows x64" } else { std::env::consts::OS },
+                    ))
+                    .size(10.0)
+                    .color(p.muted),
+                );
+            });
+        });
+    app.help_open = open;
 }
 
 fn panel_text(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "① 文字");
+    section(ui, "文字内容");
     app.ensure_texts();
 
     // ── 多个文本框：增删与切换 ───────────────────────────
@@ -1452,63 +1939,11 @@ fn panel_text(app: &mut AppState, ui: &mut Ui) {
         app.status = "已把文本框收进页面内".into();
     }
     ui.checkbox(&mut app.text_frame_on, "在画布上显示文本框虚框");
-    ui.weak("虚框只是定位参考，不会写进 G-code。");
-
-    section(ui, "逼真化（随机手写变形）");
-    ui.checkbox(&mut app.use_random, "启用随机变形");
-    ui.add_enabled(
-        app.use_random,
-        egui::Slider::new(&mut app.rand_x, 0.0..=1.0).text("水平抖动(mm)"),
-    );
-    ui.add_enabled(
-        app.use_random,
-        egui::Slider::new(&mut app.rand_y, 0.0..=1.0).text("垂直抖动(mm)"),
-    );
-    ui.add_enabled(
-        app.use_random,
-        egui::Slider::new(&mut app.rand_scale, 0.0..=0.2).text("大小抖动(±比例)"),
-    );
-    ui.add_enabled(
-        app.use_random,
-        egui::Slider::new(&mut app.rand_head, 0.0..=8.0).text("行首随机(mm)"),
-    );
-
-    // 「对哪些文本框生效」：以前一开就整页所有文字都抖，现在可以只挑其中几框
-    ui.add_enabled_ui(app.use_random, |ui| {
-        ui.separator();
-        ui.label(RichText::new("生效范围（只对勾上的文本框生效）").strong());
-        let n = app.texts.len();
-        for i in 0..n {
-            let nm = app.texts[i].name.clone();
-            ui.checkbox(&mut app.texts[i].random, nm);
-        }
-        ui.horizontal(|ui| {
-            if ui.button("全选").clicked() {
-                for b in app.texts.iter_mut() {
-                    b.random = true;
-                }
-            }
-            if ui.button("全不选").clicked() {
-                for b in app.texts.iter_mut() {
-                    b.random = false;
-                }
-            }
-            if ui.button("只选当前框").clicked() {
-                let cur = app.sel_text.min(app.texts.len() - 1);
-                for (i, b) in app.texts.iter_mut().enumerate() {
-                    b.random = i == cur;
-                }
-            }
-        });
-    });
-    if ui.add_enabled(app.use_random, egui::Button::new("换一种随机笔迹")).clicked() {
-        app.rebuild_preview_random();
-        app.status = "已重新随机".into();
-    }
+    ui.weak("虚框只是定位参考，不会写进 G-code。手写抖动在右栏底部「手写风格」里调。");
 }
 
 fn panel_table(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "② 表格");
+    section(ui, "表格");
     usize_slider(ui, "行数", &mut app.table_rows, 1, 30);
     usize_slider(ui, "列数", &mut app.table_cols, 1, 20);
     ui.add(egui::Slider::new(&mut app.table_cell, 6.0..=40.0).text("单元格(mm)"));
@@ -1540,7 +1975,7 @@ fn panel_table(app: &mut AppState, ui: &mut Ui) {
 }
 
 fn panel_grid(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "③ 格子（练字格）");
+    section(ui, "练字格");
     ui.horizontal(|ui| {
         ui.label("格型:");
         for (i, name) in GridKind::names().iter().enumerate() {
@@ -1577,55 +2012,77 @@ fn panel_grid(app: &mut AppState, ui: &mut Ui) {
 }
 
 fn panel_draw(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "④ 绘图");
-
-    ui.checkbox(&mut app.freehand_on, "手绘模式（在页面内拖动鼠标）");
-    if app.freehand_on {
-        ui.label(RichText::new("提示：拖动完成即生成一条笔迹").size(10.0).color(muted()));
-        if ui.button("清空手绘笔迹").clicked() {
-            app.draw_paths.clear();
-            app.freehand.clear();
-            app.status = "已清空手绘".into();
-        }
-    }
-
-    ui.separator();
-    ui.label(RichText::new("图片描边").strong());
-    ui.add(egui::Slider::new(&mut app.draw_target_h, 30.0..=250.0).text("目标高度(mm)"));
-    ui.add(egui::Slider::new(&mut app.draw_step, 1.0..=10.0).text("影线间距(px)"));
-    ui.add(egui::Slider::new(&mut app.draw_thresh, 0.1..=0.95).text("阈值(越低越黑)"));
-    if ui.button("导入图片并生成描边").clicked() {
-        if let Some(p) = app.pick_file("图片", &["png", "jpg", "jpeg", "gif", "bmp"]) {
-            match app.import_image_file(&p, false) {
-                Ok(n) => app.status = format!("已导入图片（{} 条笔迹），可在「图片」页调整", n),
-                Err(e) => app.status = format!("导入失败：{e}"),
+    let p = pal(ui);
+    section(ui, "鼠标手绘");
+    theme::card(ui, &p, |ui| {
+        ui.checkbox(&mut app.freehand_on, "启用手绘（在纸张范围内按住拖动）");
+        ui.label(
+            RichText::new("拖动松手即生成一条笔迹；画布支持 Ctrl+滚轮缩放，方便写小字。")
+                .size(10.0)
+                .color(p.muted),
+        );
+        ui.horizontal(|ui| {
+            theme::pill(
+                ui,
+                &format!("{} 条笔迹", app.draw_paths.len()),
+                if app.draw_paths.is_empty() { p.muted } else { p.accent },
+                p.card_hover,
+            );
+            if ui
+                .add_enabled(!app.draw_paths.is_empty(), theme::soft_button(&p, "撤销最后一条"))
+                .clicked()
+            {
+                app.draw_paths.pop();
+                app.status = "已撤销最后一条手绘".into();
             }
-        }
-    }
-    ui.label(if app.draw_path.is_empty() {
-        "尚未导入图片".to_string()
-    } else {
-        format!("来源：{}", app.draw_path)
+            if ui
+                .add_enabled(!app.draw_paths.is_empty(), theme::soft_button(&p, "清空手绘"))
+                .clicked()
+            {
+                app.draw_paths.clear();
+                app.freehand.clear();
+                app.status = "已清空手绘".into();
+            }
+        });
     });
 
-    ui.separator();
-    ui.label(RichText::new("矢量文件（CAD / SVG 背景）").strong());
-    ui.add(
-        egui::Slider::new(&mut app.draw_target_h, 30.0..=250.0).text("目标高度(mm)"),
-    );
-    ui.weak("导入后等比缩放到该高度、锚定页面左上角（与图片描边一致）。");
-    if ui.button("导入 DXF / SVG 矢量文件").clicked() {
-        if let Some(p) = app.pick_file("矢量文件", &["dxf", "svg"]) {
-            match app.import_vector_file(&p, app.draw_target_h) {
-                Ok(n) => app.status = format!("已导入矢量：{n} 条笔迹"),
-                Err(e) => app.status = format!("导入失败：{e}"),
+    ui.add_space(6.0);
+    section(ui, "导入矢量文件");
+    theme::card(ui, &p, |ui| {
+        ui.label(
+            RichText::new("支持 DXF / SVG：等比缩放到目标高度，锚定页面左上角。")
+                .size(10.0)
+                .color(p.muted),
+        );
+        ui.add(egui::Slider::new(&mut app.draw_target_h, 20.0..=280.0).text("目标高度(mm)"));
+        if ui.add(theme::soft_button(&p, "选择 DXF / SVG 文件…")).clicked() {
+            if let Some(path) = app.pick_file("矢量文件", &["dxf", "svg"]) {
+                match app.import_vector_file(&path, app.draw_target_h) {
+                    Ok(n) => app.status = format!("已导入矢量：{n} 条笔迹"),
+                    Err(e) => app.status = format!("导入失败：{e}"),
+                }
             }
         }
-    }
+        if !app.draw_path.is_empty() {
+            ui.label(
+                RichText::new(format!("最近导入：{}", app.draw_path))
+                    .size(9.5)
+                    .color(p.muted),
+            );
+        }
+    });
+
+    ui.add_space(6.0);
+    theme::notice(
+        ui,
+        &p,
+        "图片描边（照片转影线）属于「图片」模块：那里可以调描边类型、旋转、裁剪，并单独控制每张图是否输出。",
+        p.accent,
+    );
 }
 
 fn panel_notes(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "⑤ 笔记（自由文本块）");
+    section(ui, "笔记");
     if ui.button("+ 添加文本块").clicked() {
         app.notes.push(crate::state::NoteBlock {
             text: "新文本".into(),
@@ -1649,10 +2106,9 @@ fn panel_notes(app: &mut AppState, ui: &mut Ui) {
             ui.add(TextEdit::multiline(&mut b.text).desired_rows(2));
             font_combo(ui, "字体", &mut b.font, font_names.clone());
             ui.add(egui::Slider::new(&mut b.size_mm, 3.0..=30.0).text("字高(mm)"));
-            ui.horizontal(|ui| {
-                ui.add(egui::Slider::new(&mut b.x, 0.0..=200.0).text("X"));
-                ui.add(egui::Slider::new(&mut b.y, 0.0..=260.0).text("Y"));
-            });
+            // 两个滑块横排会超出窄参数栏，改成竖排避免把面板撑宽。
+            ui.add(egui::Slider::new(&mut b.x, 0.0..=200.0).text("X"));
+            ui.add(egui::Slider::new(&mut b.y, 0.0..=260.0).text("Y"));
             ui.horizontal(|ui| {
                 ui.label("对齐:");
                 ui.selectable_value(&mut b.align, 0, "左");
@@ -1667,7 +2123,7 @@ fn panel_notes(app: &mut AppState, ui: &mut Ui) {
 }
 
 fn panel_device(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "⑦ 设备");
+    section(ui, "设备连接");
 
     // ── 连接状态横幅：把「现在到底卡在哪一步」直接写在最上面 ──
     {
@@ -1679,7 +2135,7 @@ fn panel_device(app: &mut AppState, ui: &mut Ui) {
                 String::new()
             };
             (
-                format!("● 已连接 {}{}（到「测试」页发条指令验证机器动不动）", snap.cur_addr, baud),
+                format!("● 已连接 {}{}（可在下方「机器调试」发指令验证）", snap.cur_addr, baud),
                 egui::Color32::from_rgb(60, 170, 90),
             )
         } else if app.serial_ports_all.is_empty() {
@@ -1698,7 +2154,7 @@ fn panel_device(app: &mut AppState, ui: &mut Ui) {
                 egui::Color32::from_rgb(210, 150, 40),
             )
         };
-        ui.label(RichText::new(txt).color(col).strong());
+        ui.add(egui::Label::new(RichText::new(txt).color(col).strong()).wrap());
     }
 
     ui.horizontal(|ui| {
@@ -1713,8 +2169,9 @@ fn panel_device(app: &mut AppState, ui: &mut Ui) {
         // 窄面板里横向塞两个下拉框会互相挤压重叠，这里统一改成竖排。
         ui.label("端口:");
         let cur = app.serial_port.clone();
+        let combo_w = (ui.available_width() - 4.0).clamp(160.0, 280.0);
         egui::ComboBox::from_id_salt("ser_port")
-            .width(280.0)
+            .width(combo_w)
             .selected_text(if cur.is_empty() { "（未选择）".to_string() } else { cur })
             .show_ui(ui, |ui| {
                 // 未扫描时给出登记名单或常见候选；扫描后标注在线/离线。
@@ -1743,7 +2200,7 @@ fn panel_device(app: &mut AppState, ui: &mut Ui) {
         ui.label("波特率:");
         let bauds = wrobot_core::COMMON_BAUDS;
         egui::ComboBox::from_id_salt("ser_baud")
-            .width(280.0)
+            .width(combo_w)
             .selected_text(format!("{}", app.serial_baud))
             .show_ui(ui, |ui| {
                 for b in bauds {
@@ -1752,12 +2209,16 @@ fn panel_device(app: &mut AppState, ui: &mut Ui) {
             });
 
         ui.horizontal_wrapped(|ui| {
-            if ui.button("扫描串口").clicked() {
-                let cur = app.serial_port.clone();
-                app.scan_ports();
-                if app.serial_ports.contains(&cur) || !cur.is_empty() {
-                    app.serial_port = cur;
-                }
+            if ui
+                .add_enabled(!app.port_scan_running(), egui::Button::new("扫描串口"))
+                .on_hover_text("后台扫描，不会卡住界面；离线蓝牙口可能需要等几秒")
+                .clicked()
+            {
+                app.start_port_scan();
+            }
+            if app.port_scan_running() {
+                ui.spinner();
+                ui.label(RichText::new("扫描中…").size(11.0).color(muted()));
             }
             if ui.button("自动连接").clicked() {
                 app.auto_connect();
@@ -1802,15 +2263,23 @@ fn panel_device(app: &mut AppState, ui: &mut Ui) {
                 } else {
                     String::from("打不开：设备未插好/驱动故障，拔插 USB 后重扫")
                 };
-                ui.colored_label(col, format!("{} {}  {}", mark, label, hint));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{} {}  {}", mark, label, hint)).color(col),
+                    )
+                    .wrap(),
+                );
                 let _ = p;
             }
             if !app.port_labels.iter().any(|(_, l, _)| l.starts_with("串口线"))
                 && !app.port_labels.is_empty()
             {
-                ui.colored_label(
-                    egui::Color32::from_rgb(210, 150, 40),
-                    "⚠ 没有检测到串口线（USB-TTL）：插上适配器后点「扫描」，带 USB/SERIAL 字样的就是它",
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("⚠ 没有检测到串口线（USB-TTL）：插上适配器后点「扫描」，带 USB/SERIAL 字样的就是它")
+                            .color(egui::Color32::from_rgb(210, 150, 40)),
+                    )
+                    .wrap(),
                 );
             }
         }
@@ -1819,7 +2288,7 @@ fn panel_device(app: &mut AppState, ui: &mut Ui) {
     // ── 蓝牙专区 ───────────────────────────────────────────────
     // 「设置里看得到设备」≠「有能用的串口」。这里直接问蓝牙栈：
     // 写字机在不在、装没装 SPP、COM 口绑没绑对，并且能一键绑定。
-    egui::CollapsingHeader::new("蓝牙链路（看得到设备但仍连不上，先看这里）")
+    egui::CollapsingHeader::new("蓝牙链路（连不上先看这里）")
         .default_open(true)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1896,7 +2365,7 @@ fn panel_device(app: &mut AppState, ui: &mut Ui) {
                     "点「扫描串口」→ 选在线的口 → 点「连接」",
                     "连上了但机器不动：点「自动波特率」——波特率不对时机器一声不吭，日志里还会刷一堆 <F8> 之类的十六进制乱码",
                     "还不行就点「诊断端口」，看日志里 WriteFile/ReadFile 两行：能开但不通 = 链路没建立",
-                    "到「测试」页点「解锁 $X」：有 ← 回显说明通了，没回显说明线没通",
+                    "展开下方「机器调试」点「解锁 $X」：有 ← 回显说明通了，没回显说明线没通",
                 ]
                 .iter()
                 .enumerate()
@@ -1983,108 +2452,161 @@ fn panel_device(app: &mut AppState, ui: &mut Ui) {
     ui.add(egui::Slider::new(&mut app.machine_h_mm, 50.0..=800.0).text("高(mm)"));
     ui.weak("电动移动 / 回零将以此为边界提示，避免越界碰撞");
 
-    // 运行控制（开始绘制 / 暂停 / 停止 / 回原点）
+    // 机器调试：原先独立的「测试」页整体并入这里，避免两处重复一套点动/回零按钮。
     ui.separator();
-    ui.label(RichText::new("运行控制").strong());
-    let snap = app.device.snapshot();
-    ui.horizontal(|ui| {
-        let start = egui::Button::new(
-            RichText::new("开始绘制").strong().color(egui::Color32::WHITE),
-        )
-        .fill(egui::Color32::from_rgb(46, 160, 90))
-        .min_size(egui::Vec2::new(95.0, 28.0));
-        if ui.add_enabled(!snap.running, start).clicked() {
-            let g = app.generate_gcode();
-            if g.trim().is_empty() {
-                app.status = "当前页面没有可绘制的内容".into();
-            } else {
-                app.gcode_text = g.clone();
-                app.start_run(g);
-                app.status = "已开始绘制".into();
-            }
-        }
-        if snap.running && !snap.paused {
-            if ui.add_sized([58.0, 28.0], egui::Button::new("暂停")).clicked() {
-                app.pause_run();
-            }
-        } else if snap.paused {
-            if ui.add_sized([58.0, 28.0], egui::Button::new("继续")).clicked() {
-                app.resume_run();
-            }
-        }
-        if ui
-            .add_enabled(snap.running, egui::Button::new("停止").min_size(egui::Vec2::new(52.0, 28.0)))
-            .clicked()
-        {
-            app.stop_run();
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui.button("回原点").clicked() {
-            app.go_zero();
-        }
-        if ui.button("解锁 $X").clicked() {
-            app.unlock_machine();
-        }
-        if ui.button("移到 (0,0)").clicked() {
-            app.go_zero();
-        }
-    });
-
-    // 点动
-    ui.separator();
-    ui.label(RichText::new("点动").strong());
-    ui.add(egui::Slider::new(&mut app.jog_step, 1.0..=50.0).text("步长(mm)"));
-    let s = app.jog_step;
-    ui.horizontal(|ui| {
-        if ui.button("X−").clicked() {
-            send_jog(app, -s, 0.0);
-        }
-        if ui.button("X+").clicked() {
-            send_jog(app, s, 0.0);
-        }
-        if ui.button("Y−").clicked() {
-            send_jog(app, 0.0, -s);
-        }
-        if ui.button("Y+").clicked() {
-            send_jog(app, 0.0, s);
-        }
+    let p = pal(ui);
+    theme::collapsible_card(ui, &p, "机器调试（坐标 / 点动 / 回零）", true, |ui| {
+        machine_debug(app, ui);
     });
 
     ui.separator();
     ui.horizontal(|ui| {
-        ui.label("日志：");
-        if ui.button("清空日志").clicked() {
+        if ui.add(theme::soft_button(&p, "清空日志")).clicked() {
             app.device.clear_log();
             app.dev_log.clear();
             app.status = "已清空设备日志".into();
         }
         let btn = if app.log_open { "隐藏底部日志栏" } else { "显示底部日志栏" };
-        if ui.button(btn).clicked() {
+        if ui.add(theme::soft_button(&p, btn)).clicked() {
             app.log_open = !app.log_open;
         }
     });
-    ui.weak("完整日志在窗口最下方的「实时日志」栏（可拖动调高，任何页面都可见）。");
+    ui.weak("完整日志在窗口最下方的「实时日志」栏；运行控制固定在底部操作条，任何页面都能用。");
+}
 
-    // 页面内容的一键清除（设备页也能清，不必切回编辑页）
-    ui.separator();
-    let clear_btn = if app.confirm_clear {
-        egui::Button::new(RichText::new("确认清空全部内容？").color(egui::Color32::WHITE))
-            .fill(egui::Color32::from_rgb(190, 70, 60))
-            .min_size(egui::Vec2::new(200.0, 28.0))
-    } else {
-        egui::Button::new("清空页面内容（文字/表格/格子/手绘/笔记/图片）")
-            .min_size(egui::Vec2::new(200.0, 28.0))
-    };
-    if ui.add(clear_btn).clicked() {
-        if app.confirm_clear {
-            app.clear_all_content();
-        } else {
-            app.confirm_clear = true;
-            app.status = "再点一次确认清空全部内容".into();
+/// 机器调试区：实时坐标 / 解锁 / 回零 / 点动 / 抬落笔 / 测试方框 / 单行 G-code。
+fn machine_debug(app: &mut AppState, ui: &mut Ui) {
+    let p = pal(ui);
+    ui.label(RichText::new("实时坐标").size(12.0).strong().color(p.text));
+    coord_panel(app, ui);
+    theme::divider(ui, &p);
+    ui.horizontal_wrapped(|ui| {
+        if ui.add(theme::soft_button(&p, "解锁 $X")).clicked() {
+            app.unlock_machine();
         }
+        if ui.add(theme::soft_button(&p, "软复位")).clicked() {
+            app.soft_reset();
+        }
+        if ui.add(theme::soft_button(&p, "回机械原点 $H")).clicked() {
+            app.home_machine();
+        }
+        if ui.add(theme::soft_button(&p, "移到 (0,0)")).clicked() {
+            app.go_zero();
+        }
+    });
+    ui.weak("GRBL 上电 / 急停后处于 Alarm 锁定态，先「解锁 $X」，日志看到 ok 才能移动。");
+
+    theme::divider(ui, &p);
+    ui.label(RichText::new("零点").size(12.0).strong().color(p.text));
+    ui.horizontal_wrapped(|ui| {
+        if ui.add(theme::soft_button(&p, "当前点设为零点")).clicked() {
+            app.set_zero_here();
+        }
+        if ui.add(theme::soft_button(&p, "清除坐标偏置")).clicked() {
+            app.clear_zero_offset();
+        }
+        if ui.add(theme::soft_button(&p, "读取当前位置")).clicked() {
+            app.read_position();
+        }
+    });
+    ui.weak("没有限位开关的写字机用「移到 (0,0)」或「当前点设为零点」，不要点 $H。");
+
+    theme::divider(ui, &p);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("点动").size(12.0).strong().color(p.text));
+        ui.add(egui::Slider::new(&mut app.jog_step, 1.0..=50.0).text("步长(mm)"));
+    });
+    let s = app.jog_step;
+    ui.horizontal(|ui| {
+        if ui.button("↖").clicked() {
+            send_jog(app, -s, -s);
+        }
+        if ui.button("Y−").clicked() {
+            send_jog(app, 0.0, -s);
+        }
+        if ui.button("↗").clicked() {
+            send_jog(app, s, -s);
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("X−").clicked() {
+            send_jog(app, -s, 0.0);
+        }
+        if ui.button("⌂").clicked() {
+            app.go_zero();
+        }
+        if ui.button("X+").clicked() {
+            send_jog(app, s, 0.0);
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("↙").clicked() {
+            send_jog(app, -s, s);
+        }
+        if ui.button("Y+").clicked() {
+            send_jog(app, 0.0, s);
+        }
+        if ui.button("↘").clicked() {
+            send_jog(app, s, s);
+        }
+    });
+
+    theme::divider(ui, &p);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("笔 / Z").size(12.0).strong().color(p.text));
+        if ui.add(theme::soft_button(&p, "抬笔")).clicked() {
+            app.pen_up_now();
+        }
+        if ui.add(theme::soft_button(&p, "落笔")).clicked() {
+            app.pen_down_now();
+        }
+    });
+
+    theme::divider(ui, &p);
+    ui.label(RichText::new("测试方框").size(12.0).strong().color(p.text));
+    // 两个滑块并排会超出参数栏宽度，竖排各占一行。
+    ui.add(egui::Slider::new(&mut app.test_frame_w, 10.0..=300.0).text("宽(mm)"));
+    ui.add(egui::Slider::new(&mut app.test_frame_h, 10.0..=300.0).text("高(mm)"));
+    if ui.add(theme::soft_button(&p, "开始画方框")).clicked() {
+        let (w, h) = (app.test_frame_w, app.test_frame_h);
+        app.draw_test_frame(w, h);
     }
-    ui.weak("当前页面显示的是「最近停留的内容模块」，可在左侧「并入当前页面」勾选叠加。");
+    ui.weak("画出来是矩形说明方向正常；镜像 / 旋转请在「项目与输出 → 坐标系」里调。");
+
+    theme::divider(ui, &p);
+    ui.label(RichText::new("四角定位标记").size(12.0).strong().color(p.text));
+    // 两个滑块并排会超出参数栏宽度，竖排各占一行。
+    ui.add(egui::Slider::new(&mut app.corner_w_mm, 20.0..=600.0).text("定位框宽(mm)"));
+    ui.add(egui::Slider::new(&mut app.corner_h_mm, 20.0..=800.0).text("定位框高(mm)"));
+    let (ew, eh) = app.corner_frame_size();
+    ui.weak(format!(
+        "实际绘制 {:.0}×{:.0}mm（超出纸张/机器幅面会自动收窄）。四角各一个 1cm L（尖端朝角点、开口朝内），完成后回到原点。",
+        ew, eh
+    ));
+    let running = app.device.snapshot().running;
+    if ui
+        .add_enabled(
+            !running,
+            theme::soft_button(&p, "一键绘制四角 L 形"),
+        )
+        .on_disabled_hover_text("运行中不能重新下发定位标记")
+        .clicked()
+    {
+        app.draw_corner_marks();
+    }
+
+    theme::divider(ui, &p);
+    ui.label(RichText::new("发送单行 G-code").size(12.0).strong().color(p.text));
+    ui.horizontal(|ui| {
+        ui.add(TextEdit::singleline(&mut app.test_custom_gcode).desired_width(180.0));
+        if ui.add(theme::soft_button(&p, "发送")).clicked() {
+            let g = app.test_custom_gcode.clone();
+            if !g.trim().is_empty() {
+                app.send_gcode(&g);
+                app.status = format!("已发送：{}", g);
+            }
+        }
+    });
 }
 
 fn send_jog(app: &mut AppState, dx: f64, dy: f64) {
@@ -2094,170 +2616,345 @@ fn send_jog(app: &mut AppState, dx: f64, dy: f64) {
 }
 
 fn panel_io(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "⑨ 导入 / 导出");
-    ui.label(RichText::new("纸张 / 页面尺寸").strong());
-    paper_row(app, ui);
-    ui.horizontal(|ui| {
-        ui.add(egui::Slider::new(&mut app.page_w_mm, 20.0..=600.0).text("宽"));
-        ui.add(egui::Slider::new(&mut app.page_h_mm, 20.0..=800.0).text("高"));
-    });
-    ui.weak("改宽高后会自动判定规格名（不再是标准尺寸就显示为「自定义」）。");
-    ui.separator();
-    ui.horizontal(|ui| {
-        if ui.button("新建（清空全部内容）").clicked() {
-            app.new_project();
-        }
-    });
-    ui.weak("清空全部编辑内容，保留字库与设备连接。");
-    ui.separator();
-    if ui.button("打开工程 JSON").clicked() {
-        if let Some(p) = app.pick_file("JSON", &["json"]) {
-            match io::open_project(&p) {
-                Ok(doc) => {
-                    // 工程里的每个文字元素 → 一个独立的文本框，不再挤成一大段
-                    let items: Vec<String> = doc
-                        .text_items()
-                        .map(|it| it.text().to_string())
-                        .filter(|s| !s.trim().is_empty())
-                        .collect();
-                    app.texts.clear();
-                    if items.is_empty() {
-                        app.ensure_texts();
-                        app.status = "已载入工程（没有文字内容）".into();
-                    } else {
-                        for (k, t) in items.into_iter().enumerate() {
-                            let mut b = app.texts.first().cloned().unwrap_or_default();
-                            b.name = format!("文本框 {}", k + 1);
-                            b.text = t;
-                            b.on = true;
-                            app.texts.push(b);
-                        }
-                        app.sel_text = 0;
-                        app.status = format!("已载入工程（{} 个文本框）", app.texts.len());
-                    }
-                }
-                Err(e) => app.status = format!("打开失败：{e}"),
-            }
-        }
-    }
-    if ui.button("保存工程 JSON").clicked() {
-        if let Some(p) = app.save_file_as("JSON", &["json"], "工程.json") {
-            match io::save_project(app, &p) {
-                Ok(()) => app.status = format!("工程已保存：{}", p.display()),
-                Err(e) => app.status = format!("保存失败：{e}"),
-            }
-        }
-    }
+    let p = pal(ui);
+    section(ui, "页面与边框");
 
-    // 完整工程（含图片 / 文本块 / 设备设置等全部编辑内容）
-    section(ui, "完整工程（含图片与全部设置）");
-    ui.label(RichText::new("保存/载入整个编辑工程（.wprj），下次可直接继续").size(11.0).color(muted()));
-    ui.horizontal(|ui| {
-        if ui.button("保存完整工程").clicked() {
-            if let Some(p) = app.save_file_as("工程", &["wprj", "json"], "我的工程.wprj") {
-                match io::save_project_full(app, &p) {
-                    Ok(()) => app.status = format!("完整工程已保存：{}", p.display()),
-                    Err(e) => app.status = format!("保存失败：{e}"),
-                }
-            }
-        }
-        if ui.button("打开完整工程").clicked() {
-            if let Some(p) = app.pick_file("工程", &["wprj", "json"]) {
-                match io::load_project_full(app, &p) {
-                    Ok(()) => app.status = format!("完整工程已载入：{}", p.display()),
-                    Err(e) => app.status = format!("载入失败：{e}"),
-                }
-            }
-        }
+    theme::card(ui, &p, |ui| {
+        paper_row(app, ui);
+        ui.weak(format!(
+            "当前页面 {:.0} × {:.0} mm · 内容 {} 笔",
+            app.page_w_mm, app.page_h_mm, app.stats.strokes
+        ));
+        egui::CollapsingHeader::new("页面边框")
+            .id_salt("border_card")
+            .show(ui, |ui| {
+                panel_border(app, ui);
+            });
     });
 
-    // PDF 导入：可选页，默认 1:1 原始尺寸
-    section(ui, "导入 PDF（可指定页）");
-    ui.horizontal(|ui| {
-        if ui.button("选择 PDF…").clicked() {
-            if let Some(p) = app.pick_file("PDF", &["pdf"]) {
-                match app.load_pdf_info(&p) {
-                    Ok(n) => app.status = format!("已读取：{} 页（选好页码后点「导入该页」）", n),
-                    Err(e) => app.status = format!("读取 PDF 失败：{e}"),
-                }
-            }
-        }
-        if app.pdf_pages > 0 {
-            ui.weak(format!("共 {} 页", app.pdf_pages));
-        }
-    });
-    if app.pdf_pages > 0 {
-        ui.weak(&app.pdf_path);
-        ui.horizontal(|ui| {
-            ui.label("页码：");
-            ui.add(egui::DragValue::new(&mut app.pdf_page).range(1..=app.pdf_pages.max(1)));
-            ui.label(format!("/ {}", app.pdf_pages));
-        });
-        ui.checkbox(&mut app.pdf_1to1, "按原始尺寸 1:1 导入");
-        ui.add_enabled(
-            !app.pdf_1to1,
-            egui::Slider::new(&mut app.img_target_h, 30.0..=250.0).text("目标高度(mm)"),
+    ui.add_space(6.0);
+    section(ui, "工程");
+    theme::card(ui, &p, |ui| {
+        ui.label(
+            RichText::new("完整工程保存页面内容、图片、文本块与全部参数；字库和设备连接不写入文件。")
+                .size(10.0)
+                .color(p.muted),
         );
-        if ui
-            .button(format!("导入第 {} 页", app.pdf_page))
-            .on_hover_text(
-                "矢量图形直接描边；文字按原位置用当前手写字体重排；嵌入图片走影线/轮廓描边",
-            )
-            .clicked()
-        {
-            let path = std::path::PathBuf::from(&app.pdf_path);
-            let page = app.pdf_page.max(1);
-            match app.import_pdf_page(&path, page) {
-                Ok((n_vec, n_img)) => {
-                    let mut msg = format!("已导入 PDF 第 {} 页", page);
-                    if n_img > 0 {
-                        msg.push_str(&format!("：{} 张图片", n_img));
-                    }
-                    if n_vec > 0 {
-                        msg.push_str(&format!("、{} 条矢量/文字笔迹", n_vec));
-                    }
-                    if n_img == 0 && n_vec == 0 {
-                        msg.push_str("，但这一页没有可绘制内容（可能是纯空白页）");
-                    } else {
-                        msg.push_str("。到「图片」页调整，并勾选「并入当前页面」才会输出。");
-                    }
-                    app.status = msg;
-                }
-                Err(e) => app.status = format!("PDF 导入失败：{e}"),
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(theme::soft_button(&p, "新建")).clicked() {
+                app.new_project();
+                app.project_path = None;
+                app.status = "已新建空白工程".into();
             }
+            if ui.add(theme::soft_button(&p, "打开工程…")).clicked() {
+                act_open_project(app);
+            }
+            if ui.add(theme::primary_button(&p, "保存工程")).clicked() {
+                act_save_project(app);
+            }
+            if ui.add(theme::soft_button(&p, "另存为…")).clicked() {
+                act_save_project_as(app);
+            }
+        });
+        if let Some(path) = &app.project_path {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("当前工程：{}", path.display()))
+                        .size(9.5)
+                        .color(p.muted),
+                )
+                .wrap(),
+            );
         }
-        ui.weak("导入结果会放进「图片」页，默认不并入输出，需要时再勾选。");
-    }
+    });
 
-    // 字库管理
-    section(ui, "字库管理");
-    ui.label(RichText::new(format!("当前 {} 个 .gfont 字库", app.fonts.fonts.len())).size(11.0));
-    if ui.button("导入字库文件(.gfont)").clicked() {
-        if let Some(p) = app.pick_file("字库", &["gfont"]) {
-            match wrobot_core::font::GfontFile::open(&p) {
-                Ok(f) => {
-                    let n = f.name().to_string();
-                    app.fonts.fonts.push(f);
-                    app.status = format!("已导入字库：{}", n);
+    ui.add_space(6.0);
+    section(ui, "导入");
+    theme::card(ui, &p, |ui| {
+        // PDF
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(theme::soft_button(&p, "选择 PDF…")).clicked() {
+                if let Some(path) = app.pick_file("PDF", &["pdf"]) {
+                    match app.load_pdf_info(&path) {
+                        Ok(n) => {
+                            app.status = format!("已读取 {} 页，选好页码后导入", n);
+                        }
+                        Err(e) => app.status = format!("读取 PDF 失败：{e}"),
+                    }
                 }
-                Err(e) => app.status = format!("字库导入失败：{e}"),
+            }
+            if app.pdf_pages > 0 {
+                theme::pill(
+                    ui,
+                    &format!("{} 页", app.pdf_pages),
+                    p.accent,
+                    p.card_hover,
+                );
+            }
+        });
+        if app.pdf_pages > 0 {
+            ui.add(
+                egui::Label::new(RichText::new(&app.pdf_path).size(9.5).color(p.muted)).wrap(),
+            );
+            ui.horizontal(|ui| {
+                ui.label("页码");
+                ui.add(egui::DragValue::new(&mut app.pdf_page).range(1..=app.pdf_pages.max(1)));
+                ui.label(format!("/ {}", app.pdf_pages));
+                ui.checkbox(&mut app.pdf_1to1, "1:1 原始尺寸");
+            });
+            ui.add_enabled(
+                !app.pdf_1to1,
+                egui::Slider::new(&mut app.img_target_h, 30.0..=250.0).text("目标高度(mm)"),
+            );
+            if ui
+                .add(theme::soft_button(&p, &format!("导入第 {} 页", app.pdf_page)))
+                .on_hover_text("矢量描边；文字按原位置重排；嵌入图片走描边提取")
+                .clicked()
+            {
+                let path = std::path::PathBuf::from(&app.pdf_path);
+                let page = app.pdf_page.max(1);
+                match app.import_pdf_page(&path, page) {
+                    Ok((n_vec, n_img)) => {
+                        let mut msg = format!("已导入 PDF 第 {} 页", page);
+                        if n_img > 0 {
+                            msg.push_str(&format!("：{} 张图片", n_img));
+                        }
+                        if n_vec > 0 {
+                            msg.push_str(&format!("、{} 条矢量/文字笔迹", n_vec));
+                        }
+                        if n_img == 0 && n_vec == 0 {
+                            msg.push_str("，但这一页没有可绘制内容");
+                        } else {
+                            msg.push_str("。到「图片」页调整，并在左侧勾选「图片」输出。");
+                        }
+                        app.status = msg;
+                    }
+                    Err(e) => app.status = format!("PDF 导入失败：{e}"),
+                }
             }
         }
-    }
-    if ui.button("重新扫描字库目录").clicked() {
-        let reloaded = crate::fontmgr::FontManager::load(std::path::Path::new(&app.font_dir));
-        let n = reloaded.fonts.len();
-        app.fonts = reloaded;
-        app.status = format!("已重新扫描：{} 个字库", n);
-    }
+
+        theme::divider(ui, &p);
+
+        // 字库
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("单线字库").size(12.0).strong().color(p.text));
+            theme::pill(
+                ui,
+                &format!("{} 个", app.fonts.fonts.len()),
+                if app.fonts.is_empty() { p.danger } else { p.success },
+                p.card_hover,
+            );
+        });
+        ui.add(egui::Label::new(RichText::new(&app.font_dir).size(9.5).color(p.muted)).wrap());
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(theme::soft_button(&p, "导入 .gfont…")).clicked() {
+                act_import_font(app);
+            }
+            if ui.add(theme::soft_button(&p, "重新扫描")).clicked() {
+                let reloaded =
+                    crate::fontmgr::FontManager::load(std::path::Path::new(&app.font_dir));
+                let n = reloaded.fonts.len();
+                app.fonts = reloaded;
+                app.status = format!("已重新扫描：{} 个字库", n);
+            }
+        });
+    });
+
+    ui.add_space(6.0);
+    section(ui, "生成设置");
+    theme::card(ui, &p, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("固件").size(11.0).color(p.muted));
+            ui.selectable_value(&mut app.firmware_sel, 0, "GRBL");
+            ui.selectable_value(&mut app.firmware_sel, 1, "Marlin");
+            ui.selectable_value(&mut app.firmware_sel, 2, "EBB");
+        });
+        if app.firmware_sel != 2 {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("笔控").size(11.0).color(p.muted));
+                ui.selectable_value(&mut app.pen_mode_sel, 0, "Z 轴");
+                ui.selectable_value(&mut app.pen_mode_sel, 1, "舵机");
+            });
+        }
+        ui.add(egui::Slider::new(&mut app.feed_rate, 500.0..=30000.0).text("进给(mm/min)"));
+        ui.add(egui::Slider::new(&mut app.z_speed, 100.0..=30000.0).text("Z 轴速度(mm/min)"));
+        if app.firmware_sel != 1 {
+            ui.add(egui::Slider::new(&mut app.pen_up, -20.0..=40.0).text("抬笔 Z"));
+            ui.add(egui::Slider::new(&mut app.pen_down, -20.0..=40.0).text("落笔 Z"));
+        }
+        ui.checkbox(&mut app.bounds_check, "开始前检查机器幅面（超界先确认）");
+        ui.checkbox(&mut app.auto_sleep, "完成后自动休眠");
+        ui.add(egui::Slider::new(&mut app.tool_on_delay, 0.0..=2.0).text("落笔后暂停(s)"));
+        ui.add(egui::Slider::new(&mut app.tool_off_delay, 0.0..=2.0).text("抬笔前暂停(s)"));
+
+        egui::CollapsingHeader::new("坐标系与幅面")
+            .id_salt("gen_coords")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("原点角");
+                    for (i, nm) in ORIGINS.iter().enumerate() {
+                        ui.selectable_value(&mut app.origin_corner, i, *nm);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut app.reverse_x, "反转 X");
+                    ui.checkbox(&mut app.reverse_y, "反转 Y");
+                    ui.checkbox(&mut app.swap_xy, "对调 XY");
+                });
+                // 真实原点读数：两个设置都能镜像，叠加后才是结果，必须算出来给人看
+                let (ox, oy) = app.origin_page_point();
+                let at = match (ox > app.page_w_mm * 0.5, oy > app.page_h_mm * 0.5) {
+                    (false, false) => "左上",
+                    (true, false) => "右上",
+                    (false, true) => "左下",
+                    (true, true) => "右下",
+                };
+                let ok = at == "左下";
+                ui.colored_label(
+                    if ok {
+                        p.muted
+                    } else {
+                        egui::Color32::from_rgb(200, 120, 40)
+                    },
+                    format!(
+                        "0,0 实际落在纸面{at}（{:.0}, {:.0}）{}",
+                        ox,
+                        oy,
+                        if ok { "" } else { "  ← 不是左下，正稿会整体偏移/翻转" }
+                    ),
+                );
+                if !ok
+                    && ui
+                        .add(theme::soft_button(&p, "设为左下原点"))
+                        .on_hover_text(
+                            "把原点角设成左下、并清掉反转 X/Y。四角定位与正文都以这个点为基准。",
+                        )
+                        .clicked()
+                {
+                    app.origin_corner = 2;
+                    app.reverse_x = false;
+                    app.reverse_y = false;
+                    app.status = "原点已设为纸面左下角 (0,0)".into();
+                }
+                ui.add(egui::Slider::new(&mut app.machine_w_mm, 50.0..=600.0).text("机器宽(mm)"));
+                ui.add(egui::Slider::new(&mut app.machine_h_mm, 50.0..=800.0).text("机器高(mm)"));
+                ui.add(egui::Slider::new(&mut app.jog_speed, 100.0..=30000.0).text("点动速度(mm/min)"));
+                ui.weak("幅面只用于越界提示，不会改变绘制坐标。");
+            });
+
+        egui::CollapsingHeader::new("抬落笔细节")
+            .id_salt("gen_pen")
+            .show(ui, |ui| {
+                if app.firmware_sel == 1 {
+                    if app.pen_mode_sel == 1 {
+                        ui.add(egui::Slider::new(&mut app.marlin_servo_down, 0.0..=180.0).text("落笔角度"));
+                        ui.add(egui::Slider::new(&mut app.marlin_servo_up, 0.0..=180.0).text("抬笔角度"));
+                    } else {
+                        ui.add(egui::Slider::new(&mut app.marlin_pen_down, -20.0..=40.0).text("落笔 Z(mm)"));
+                        ui.add(egui::Slider::new(&mut app.marlin_pen_up, -20.0..=40.0).text("抬笔 Z(mm)"));
+                    }
+                    ui.add(egui::Slider::new(&mut app.marlin_z_speed, 100.0..=30000.0).text("Z 轴速度"));
+                } else if app.firmware_sel == 2 {
+                    ui.add(egui::Slider::new(&mut app.mm_to_steps, 1.0..=1000.0).text("毫米→步数"));
+                    ui.add(egui::Slider::new(&mut app.ebb_servo_speed, 0.0..=32767.0).text("舵机速度"));
+                    ui.add(egui::Slider::new(&mut app.ebb_max_pen, 0.0..=65535.0).text("最大舵机值"));
+                    ui.add(egui::Slider::new(&mut app.max_pen_speed, 1000.0..=32767.0).text("最大抬落笔速度"));
+                } else {
+                    ui.weak("GRBL 使用上方的抬笔 / 落笔 Z 值。");
+                }
+                ui.checkbox(&mut app.laser_on, "激光模式（M3/M5 代替落笔）");
+                ui.add_enabled(
+                    app.laser_on,
+                    egui::Slider::new(&mut app.laser_power, 0.0..=1000.0).text("激光功率 S"),
+                );
+            });
+
+        egui::CollapsingHeader::new("自定义 G-code")
+            .id_salt("gen_custom")
+            .show(ui, |ui| {
+                ui.label("起始代码（多条用 ; 分隔）");
+                ui.add(TextEdit::multiline(&mut app.custom_start).desired_rows(2));
+                ui.label("结束代码");
+                ui.add(TextEdit::multiline(&mut app.custom_end).desired_rows(2));
+            });
+
+        ui.add(
+            egui::Slider::new(&mut app.min_step_mm, 0.1..=1.0)
+                .text("G-code 最小步进(mm)"),
+        );
+        ui.weak("越小越贴近原字（G-code 更长），默认 0.2mm。");
+    });
+
+    ui.add_space(6.0);
+    section(ui, "导出");
+    theme::card(ui, &p, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(theme::primary_button(&p, "生成并预览 G-code")).clicked() {
+                app.gcode_text = app.generate_gcode();
+                app.status = "已生成 G-code".into();
+            }
+            if ui.add(theme::soft_button(&p, "导出 .nc")).clicked() {
+                act_export(app, Export::Nc);
+            }
+            if ui.add(theme::soft_button(&p, "导出 SVG")).clicked() {
+                act_export(app, Export::Svg);
+            }
+            if ui.add(theme::soft_button(&p, "导出 PDF")).clicked() {
+                act_export(app, Export::Pdf);
+            }
+            if ui.add(theme::soft_button(&p, "导出 PNG")).clicked() {
+                act_export(app, Export::Png);
+            }
+        });
+        if !app.gcode_text.is_empty() {
+            ui.horizontal(|ui| {
+                theme::pill(
+                    ui,
+                    &format!("{} 行", app.gcode_text.lines().count()),
+                    p.accent,
+                    p.card_hover,
+                );
+                if app.bounds_check {
+                    if let Some(msg) = app.bounds_warning(&app.gcode_text) {
+                        theme::pill(ui, "超出幅面", p.danger, p.card_hover);
+                        let _ = msg;
+                    } else {
+                        theme::pill(ui, "幅面正常", p.success, p.card_hover);
+                    }
+                }
+            });
+            egui::CollapsingHeader::new("G-code 预览（前 60 行）")
+                .id_salt("gcode_preview")
+                .default_open(true)
+                .show(ui, |ui| {
+                    let mut head: String =
+                        app.gcode_text.lines().take(60).collect::<Vec<_>>().join("\n");
+                    ui.add(
+                        TextEdit::multiline(&mut head)
+                            .desired_rows(10)
+                            .interactive(false)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+        } else {
+            ui.weak("点击「生成并预览 G-code」查看实际下发的代码。");
+        }
+    });
 }
 
 /// 图片页：导入（前景可打印 / 背景参考）、多选、删除/清空（二次确认）、
 /// 缩放 / 移动 / 居中 / 适应页面等完整变换。
 fn panel_images(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "⑥ 图片");
+    const ANGLES: [&str; 4] = ["横向 →", "对角 45° ↘", "纵向 ↓", "对角 135° ↗"];
+    const ORDERS: [&str; 4] = ["默认", "最优路径", "按扫描顺序", "分块蛇形"];
+    let p = pal(ui);
+    // 窄面板下所有行都必须能换行，否则内容会撑破右侧栏并被裁切。
+    // 下拉框本身也要按行宽收窄，避免标签 + 190pt 下拉框刚好顶出栏外。
+    let combo_w = (ui.available_width() - 100.0).clamp(140.0, 250.0);
+    section(ui, "图片");
     ui.label("导入图片：");
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.button("导入前景图片（可打印）").clicked() {
             if let Some(p) = app.pick_file("图片", &["png", "jpg", "jpeg", "gif", "bmp"]) {
                 match app.import_image_file(&p, false) {
@@ -2277,17 +2974,20 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
     });
     ui.weak("画布操作：点击选图 · 按住拖动移动 · 滚轮缩放当前选中图片");
 
-    // 输出开关：模块级 + 每张图各自一个。两张都开才会写进 G-code。
-    ui.separator();
-    ui.checkbox(&mut app.images_on, "并入当前页面（写入 G-code）");
-    if !app.images_on {
-        ui.colored_label(
-            egui::Color32::from_rgb(200, 120, 40),
-            "默认不并入：上面的开关不开，任何图片都不会写进 G-code（画布上仍可编辑）。",
+    // 模块级输出开关统一放在左侧栏「输出图层」，避免两个地方各有一个开关。
+    ui.horizontal_wrapped(|ui| {
+        theme::pill(
+            ui,
+            if app.images_on { "图片图层：输出" } else { "图片图层：仅参考" },
+            if app.images_on { p.success } else { p.muted },
+            p.card_hover,
         );
-    } else {
-        ui.weak("已开启：只有下面勾了「输出」的那几张才会真正输出。");
-    }
+        ui.label(
+            RichText::new("总开关在左侧栏「输出图层 → 图片」")
+                .size(9.5)
+                .color(p.muted),
+        );
+    });
 
     // 图片列表（支持多张重叠）
     ui.separator();
@@ -2345,6 +3045,68 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
         }
     }
 
+    // 大纸张分页：图片大于单页幅面时切成多页，逐页定位绘制。
+    ui.separator();
+    section(ui, "大纸张分页绘制");
+    ui.add_enabled_ui(!app.images.is_empty(), |ui| {
+        ui.checkbox(&mut app.tile_on, "启用分页（大图分多页绘制）")
+            .on_hover_text("按单页可绘制幅面切分前景图片，一次只画一页；页面按角标拼接");
+    });
+    if app.tile_on {
+        if let Some(layout) = app.tile_layout() {
+            let count = layout.count();
+            let cur = app.tile_page.min(count.saturating_sub(1));
+            app.tile_page = cur;
+            let (min_x, min_y, max_x, max_y) = app
+                .output_image_bounds()
+                .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            ui.label(
+                RichText::new(format!(
+                    "图片范围 {:.0}×{:.0}mm · 单页 {:.0}×{:.0}mm · {} 列 × {} 行 · 共 {} 页",
+                    max_x - min_x,
+                    max_y - min_y,
+                    layout.width_mm,
+                    layout.height_mm,
+                    layout.cols,
+                    layout.rows,
+                    count
+                ))
+                .size(10.0)
+                .color(p.muted),
+            );
+            ui.checkbox(&mut app.tile_marks, "每页绘制 1cm 四角定位标记")
+                .on_hover_text("四个页角各画一个 L 形，尖端朝页角、开口朝内；画完回到原点");
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(cur > 0, egui::Button::new("◀ 上一页"))
+                    .clicked()
+                {
+                    app.tile_page = cur - 1;
+                }
+                ui.label(
+                    RichText::new(format!("第 {} / {} 页", cur + 1, count))
+                        .strong()
+                        .color(p.text),
+                );
+                if ui
+                    .add_enabled(cur + 1 < count, egui::Button::new("下一页 ▶"))
+                    .clicked()
+                {
+                    app.tile_page = cur + 1;
+                }
+            });
+            ui.weak(
+                "把笔移到本页左上角后点「开始绘制」；本页画完自动回原点，换纸后再画下一页。",
+            );
+        } else {
+            ui.colored_label(
+                p.warning,
+                "还没有可输出的图片：请勾选左侧「输出图层 → 图片」，并给图片勾上「输出」。",
+            );
+        }
+        ui.weak("分页模式只输出图片；文字/表格等模块请在关闭分页后单独绘制。");
+    }
+
     // 选中图片的变换与描边参数
     let sel = app.sel_image;
     if sel < app.images.len() {
@@ -2354,13 +3116,15 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
         // —— 缩放 ——
         ui.label(RichText::new("缩放").strong());
         let cur_scale = app.images[sel].scale;
-        ui.add(egui::Slider::new(&mut app.images[sel].scale, 0.05..=8.0).text("缩放(×)"));
+        // 范围要和 `scale_image` 的 0.05..=20 一致：否则滚轮放大到 8 以上，
+        // 滑块每帧会把值夹回 8，图片就「怎么滚都不再变大」。
+        ui.add(egui::Slider::new(&mut app.images[sel].scale, 0.05..=20.0).text("缩放(×)"));
         // 滑块直接改 scale 会让左上角锚点漂移，这里换算回「中心不动」
         let sc = app.images[sel].scale;
         if (sc - cur_scale).abs() > 1e-9 {
             app.set_image_scale(sel, sc);
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("− 缩小").clicked() {
                 app.scale_image(sel, 1.0 / 1.1);
             }
@@ -2380,15 +3144,40 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
         // —— 位置 ——
         ui.separator();
         ui.label(RichText::new("位置（左上角，毫米）").strong());
-        let (mut px, mut py) = {
+        // 不要再用固定 ±几百的滑块：页面最大可设到 2000mm，分页大图的位置也会
+        // 远超 400/500。滑块每帧都会把越界值夹回范围，画布上就会出现「拖到一半
+        // 被吸回去、永远拖不到正确位置」。用 DragValue 按页面尺寸给足范围，并且
+        // 只在用户真正改动时写回。
+        let (im_x, im_y) = {
             let im = &app.images[sel];
             (im.x, im.y)
         };
-        ui.add(egui::Slider::new(&mut px, -200.0..=400.0).text("X(mm)"));
-        ui.add(egui::Slider::new(&mut py, -200.0..=500.0).text("Y(mm)"));
-        app.set_image_pos(sel, px, py);
+        let mut px = im_x;
+        let mut py = im_y;
+        let span = (app.page_w_mm.max(app.page_h_mm) * 2.0).max(600.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut px)
+                    .range(-span..=span)
+                    .clamp_existing_to_range(false)
+                    .speed(0.5)
+                    .prefix("X ")
+                    .suffix(" mm"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut py)
+                    .range(-span..=span)
+                    .clamp_existing_to_range(false)
+                    .speed(0.5)
+                    .prefix("Y ")
+                    .suffix(" mm"),
+            );
+        });
+        if (px - im_x).abs() > 1e-9 || (py - im_y).abs() > 1e-9 {
+            app.set_image_pos(sel, px, py);
+        }
         let step = if ui.input(|i| i.modifiers.shift) { 10.0 } else { 1.0 };
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("←").clicked() {
                 app.nudge_image(sel, -step, 0.0);
             }
@@ -2411,17 +3200,17 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
         // —— 旋转 / 镜像 ——
         ui.separator();
         ui.add(egui::Slider::new(&mut app.images[sel].rotation, -180.0..=180.0).text("旋转(度)"));
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut app.images[sel].flip_h, "水平翻转");
             ui.checkbox(&mut app.images[sel].flip_v, "垂直翻转");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut app.images[sel].background, "作为背景参考（只临摹不打印）");
             if !app.images[sel].background {
                 ui.checkbox(&mut app.images[sel].out, "并入输出");
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("顺时针 90°").clicked() {
                 app.images[sel].rotation += 90.0;
             }
@@ -2435,37 +3224,285 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
         ui.separator();
         ui.label(RichText::new("描边提取参数").strong());
         let mut dt = app.images[sel].draw as usize;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("绘制类型:");
-            for (i, name) in ImgDraw::names().iter().enumerate() {
-                ui.selectable_value(&mut dt, i, *name);
-            }
+            ComboBox::from_id_salt("img_draw_sel")
+                .selected_text(ImgDraw::from_usize(dt).name())
+                .width(combo_w)
+                .show_ui(ui, |ui| {
+                    for (i, name) in ImgDraw::names().iter().enumerate() {
+                        ui.selectable_value(&mut dt, i, *name);
+                    }
+                });
         });
         app.images[sel].draw = ImgDraw::from_usize(dt);
-        ui.add(egui::Slider::new(&mut app.images[sel].step_px, 1..=12).text("影线间隔(px)"));
-        ui.add(egui::Slider::new(&mut app.images[sel].threshold, 0.1..=0.95).text("暗部阈值(素描)"));
-        ui.add(egui::Slider::new(&mut app.images[sel].edge_threshold, 0.05..=0.9).text("边缘阈值(线框)"));
+        ui.weak(app.images[sel].draw.hint());
+        let mode = app.images[sel].draw;
+        let uses_step = matches!(
+            mode,
+            ImgDraw::Wire
+                | ImgDraw::Sketch
+                | ImgDraw::Continuous
+                | ImgDraw::CrossHatch
+                | ImgDraw::Halftone
+                | ImgDraw::SketchHatch
+        );
+        if mode == ImgDraw::SketchHatch {
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].step_px, 2..=24)
+                    .text("排线间距(px)"),
+            );
+        } else {
+            ui.add_enabled(
+                uses_step,
+                egui::Slider::new(&mut app.images[sel].step_px, 1..=12)
+                    .text(if mode == ImgDraw::Halftone { "网点间隔(px)" } else { "影线间隔(px)" }),
+            );
+        }
+        ui.add_enabled(
+            mode != ImgDraw::Wire,
+            egui::Slider::new(&mut app.images[sel].threshold, 0.1..=0.95)
+                // 同一个 `threshold` 字段在不同画法里含义不同。素描原稿这条路上
+                // 它是「响应最强的百分之多少算线」，即识别到多浅的铅笔线为止，
+                // 叫「暗部阈值」会让人以为在调明暗——这里换名字。
+                .text(match mode {
+                    ImgDraw::SketchOriginal => "识别密度",
+                    ImgDraw::SketchHatch
+                    | ImgDraw::RegionRedraw
+                    | ImgDraw::StrokeSketch => "明暗对比",
+                    _ => "暗部阈值",
+                }),
+        );
+        ui.add_enabled(
+            matches!(
+                mode,
+                ImgDraw::Wire
+                    | ImgDraw::SketchHatch
+                    | ImgDraw::RegionRedraw
+                    | ImgDraw::StrokeSketch
+            ),
+            egui::Slider::new(&mut app.images[sel].edge_threshold, 0.05..=0.9)
+                .text(if matches!(
+                    mode,
+                    ImgDraw::SketchHatch | ImgDraw::RegionRedraw | ImgDraw::StrokeSketch
+                ) {
+                    "轮廓阈值"
+                } else {
+                    "边缘阈值(线框)"
+                }),
+        );
         ui.checkbox(&mut app.images[sel].invert, "反相（黑变白）");
+        if mode == ImgDraw::SketchOriginal {
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
+                    .text("手抖幅度(mm)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
+                    .text("画笔线宽(mm)"),
+            );
+            ui.weak(
+                "把原稿上真实画出来的铅笔线一根根描出来——发丝、眼线、唇线、衬衫的排线，位置与走向都由原稿决定，不是照明暗另排一套。识别密度决定描到多浅的线：调高鼻子、嘴角的浅结构会出来，但再高纸纹也会被当成线；调低只剩五官和重轮廓。画笔线宽要填你实际用的笔（0.5 ≈ 中性笔），它既决定两根线最近能靠多近，也决定识别的细度——比笔细十倍的线画不出来，找出来只会糊成一团。",
+            );
+        } else if mode == ImgDraw::SketchHatch {
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].hatch_levels, 3..=8)
+                    .text("明暗层数"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].hatch_angle, 0.0..=180.0)
+                    .text("排线基准角(°)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
+                    .text("手抖幅度(mm)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
+                    .text("画笔线宽(mm)"),
+            );
+            ui.weak(
+                "单色笔没有灰阶：亮部一根不画，中间调铺一层稀排线，越暗叠越多层交叉排线（只交错两组方向，避免织成乱网）。头发、衣褶这类方向明确的暗部会改沿原稿走向排线，像顺着发丝画；连成一片的浅灰背景自动留白。轮廓另用「局部细节 − 大尺度调子」提一遍线，五官不散。明暗层数决定最多叠几层（4 层以下容易断层，6 层左右最自然）；排线间距是纸面上两根线的最近距离，小于 2.4 个笔宽会糊成黑块；明暗对比调高，浅灰会更早让给纸白，画面更像铅笔速写。",
+            );
+            ui.separator();
+            ui.checkbox(
+                &mut app.images[sel].multi_pen,
+                "多笔分层（换笔绘制 HB → 2B → 4B → 8B）",
+            )
+            .on_hover_text(
+                "把明暗带按每支笔能压出的最深色分配：浅笔铺中间调，深笔压暗部，轮廓用最深笔。\
+                 绘制时会一支一支提示换笔，每支笔的 G-code 都重新以当前位置为零点。",
+            );
+            if app.images[sel].multi_pen {
+                let n = app.active_pens().len();
+                if n < 2 {
+                    ui.colored_label(
+                        p.warning,
+                        "多笔分层至少需要两支启用中的笔：请在下方「多笔分层 · 笔组」里勾选。",
+                    );
+                } else {
+                    ui.weak(format!(
+                        "当前 {n} 支笔参与分层（亮 → 暗）；铅笔越深压得越黑，不再让一支笔靠密度硬撑。"
+                    ));
+                }
+            }
+        } else if mode == ImgDraw::StrokeSketch {
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].hatch_levels, 2..=6)
+                    .text("叠加遍数"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].stroke_len_mm, 1.5..=8.0)
+                    .text("笔触长度(mm)"),
+            );
+            const FOLLOW_NAMES: [&str; 3] = ["跟随轮廓", "跟随原稿", "混合（轮廓+交叉）"];
+            ui.horizontal_wrapped(|ui| {
+                ui.label("走向参考:");
+                egui::ComboBox::from_id_salt("img_stroke_follow")
+                    .selected_text(
+                        FOLLOW_NAMES[usize::from(app.images[sel].stroke_follow).min(2)],
+                    )
+                    .width(combo_w)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in FOLLOW_NAMES.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut app.images[sel].stroke_follow,
+                                i as u8,
+                                *name,
+                            );
+                        }
+                    });
+            });
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].hatch_angle, 0.0..=180.0)
+                    .text("无方向时基准角(°)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
+                    .text("手抖幅度(mm)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
+                    .text("画笔线宽(mm)"),
+            );
+            ui.weak(
+                "按真实素描的工序铺线：先量出每一小块「还差多少墨」，再用短直线段去补——差得多就排得密，差得少就留得疏，线距由明暗反算，不再全图一个间距。笔触是 1.5~8mm 的直线段（不是顺着方向场画到底的曲线），轮廓和细节处会自动收短。走向参考决定这些短段朝哪边：跟随轮廓沿等照度线（圆球、脸颊会顺着形体转），跟随原稿沿原稿真实的铅笔笔触，混合则先跟原稿、暗部再叠 38° 交叉层。叠加遍数越多，暗部交叉越充分；亮部没有那么多墨要补，自然只落很少几笔。",
+            );
+            ui.separator();
+            ui.checkbox(
+                &mut app.images[sel].multi_pen,
+                "多笔分层（换笔绘制 HB → 2B → 4B → 8B）",
+            )
+            .on_hover_text(
+                "把「还差多少墨」按每支笔能压出的最深色分带：浅笔先补浅的一档，深笔接着补剩下的。\
+                 笔越深，同一处需要的交叉遍数越少；绘制时仍会逐支提示换笔。",
+            );
+            if app.images[sel].multi_pen {
+                let n = app.active_pens().len();
+                if n < 2 {
+                    ui.colored_label(
+                        p.warning,
+                        "多笔分层至少需要两支启用中的笔：请在下方「多笔分层 · 笔组」里勾选。",
+                    );
+                } else {
+                    ui.weak(format!(
+                        "当前 {n} 支笔参与明暗分带（亮 → 暗）；浅笔负责浅灰，深笔负责剩下的黑场。"
+                    ));
+                }
+            }
+        } else if mode == ImgDraw::RegionRedraw {
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].hatch_levels, 3..=8)
+                    .text("深度层数"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].region_block_mm, 1.5..=10.0)
+                    .text("分块粒度(mm)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].hatch_angle, 0.0..=180.0)
+                    .text("排线基准角(°)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
+                    .text("手抖幅度(mm)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
+                    .text("画笔线宽(mm)"),
+            );
+            ui.weak(
+                "先把画面量成逐像素的深度层（越黑层号越大），再切成细块，每块单独看原稿的笔触走向重新排线：浅层用浅铅笔先铺，深层用深铅笔一层层压上去，最后用最深笔压轮廓。和「素描调子」的区别是排线方向不再整片一致，而是跟着鼻梁、眼窝、发丝各走各的——分层时用的是每个像素的深浅，所以只有一两毫米的深色也不会被块平均抹掉。分块粒度是方向采样的边长：调小更贴局部走向，但太小会抖；深度层数决定最多叠几层，5 层左右层次最稳。",
+            );
+            ui.separator();
+            ui.checkbox(
+                &mut app.images[sel].multi_pen,
+                "多笔分层（换笔绘制 HB → 2B → 4B → 8B）",
+            )
+            .on_hover_text(
+                "每个深度层绑定一支笔：最浅的层用 HB，越深换越黑的笔；关掉时全部用同一支笔，\
+                 只靠层数和疏密表现灰阶。绘制时会一支一支提示换笔。",
+            );
+            if app.images[sel].multi_pen {
+                let n = app.active_pens().len();
+                if n < 2 {
+                    ui.colored_label(
+                        p.warning,
+                        "多笔分层至少需要两支启用中的笔：请在下方「多笔分层 · 笔组」里勾选。",
+                    );
+                } else {
+                    ui.weak(format!("当前 {n} 支笔参与深度分层（亮 → 暗）。"));
+                }
+            }
+        }
 
         // —— 绘画方式（顺序 / 方向 / 连笔）——
         ui.separator();
         ui.label(RichText::new("绘画方式").strong());
-        ui.horizontal(|ui| {
-            ui.label("扫描方向:");
-            const ANGLES: [&str; 4] = ["横向 →", "对角 45° ↘", "纵向 ↓", "对角 135° ↗"];
-            for (i, name) in ANGLES.iter().enumerate() {
-                ui.selectable_value(&mut app.images[sel].scan_angle, i as u8, *name);
-            }
+        let uses_scan = matches!(
+            mode,
+            ImgDraw::Wire
+                | ImgDraw::Sketch
+                | ImgDraw::Continuous
+                | ImgDraw::CrossHatch
+                | ImgDraw::SketchHatch
+                | ImgDraw::RegionRedraw
+                | ImgDraw::StrokeSketch
+        );
+        ui.add_enabled_ui(uses_scan, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("扫描方向:");
+                ComboBox::from_id_salt("img_scan_angle")
+                    .selected_text(ANGLES[usize::from(app.images[sel].scan_angle).min(3)])
+                    .width(combo_w)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in ANGLES.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut app.images[sel].scan_angle,
+                                i as u8,
+                                *name,
+                            );
+                        }
+                    });
+            });
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("笔画顺序:");
-            const ORDERS: [&str; 4] = ["默认", "最优路径", "按扫描顺序", "分块蛇形"];
-            for (i, name) in ORDERS.iter().enumerate() {
-                ui.selectable_value(&mut app.images[sel].order_mode, i as u8, *name);
-            }
+            ComboBox::from_id_salt("img_order_mode")
+                .selected_text(ORDERS[usize::from(app.images[sel].order_mode).min(3)])
+                .width(combo_w)
+                .show_ui(ui, |ui| {
+                    for (i, name) in ORDERS.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut app.images[sel].order_mode,
+                            i as u8,
+                            *name,
+                        );
+                    }
+                });
         });
         ui.add_enabled(
-            dt == 2,
+            mode == ImgDraw::Continuous,
             egui::Slider::new(&mut app.images[sel].merge_gap_px, 0..=40)
                 .text("连笔跨行容差(px)"),
         );
@@ -2473,16 +3510,63 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
             app.images[sel].order_mode == 3,
             egui::Slider::new(&mut app.images[sel].block_px, 16..=120).text("分块边长(px)"),
         );
-        match app.images[sel].order_mode {
-            1 => ui.weak("最优路径：最近邻 + 2-opt 重排并允许笔画反向，空移最短。"),
-            2 => ui.weak("按扫描顺序：保持从上到下（或当前扫描方向）的原始顺序。"),
-            3 => ui.weak("分块蛇形：切成方格逐块「犁地」，块内最优、块间蛇形，路线规整。"),
-            _ => ui.weak("默认：素描/线框按扫描顺序，高效连续笔画自动做最优路径。"),
+        if mode == ImgDraw::SketchOriginal {
+            match app.images[sel].order_mode {
+                1 => ui.weak("最优路径：全部笔迹按最近邻 + 2-opt 串联，空移最少，但会打乱分层。"),
+                2 => ui.weak("按笔迹起点的上下位置依次绘制：最接近原稿扫描顺序，空移较多。"),
+                3 => ui.weak("分块蛇形：块内最优、块间来回「犁地」，适合大幅面分批绘制。"),
+                _ => ui.weak(
+                    "分层手绘：起稿轻线 → 主体 → 暗部；每层长线先走，短线按方向成组排线。空移比最优路径多，但更像人的作画步骤。",
+                ),
+            }
+        } else if mode == ImgDraw::SketchHatch {
+            match app.images[sel].order_mode {
+                1 => ui.weak("每层内就近串联：空移少，但始终先画完亮部再画暗部。"),
+                2 => ui.weak("按排线扫描顺序：同一方向成排推进，最接近人手排线。"),
+                3 => ui.weak("分块蛇形：块内就近、块间来回，适合大幅面分批绘制。"),
+                _ => ui.weak(
+                    "分层手绘：亮部单层 → 中间调 → 暗部交叉叠线，每层内就近串联。空移略多，但层次不会被走笔顺序打乱。",
+                ),
+            }
+        } else if mode == ImgDraw::RegionRedraw {
+            match app.images[sel].order_mode {
+                1 => ui.weak("每层内就近串联：空移少；但必须整层画完才换笔，换笔次数不变。"),
+                2 => ui.weak("按排线成排推进：同一小块内一路排下去，最像人手铺调子。"),
+                3 => ui.weak("分块蛇形：块内就近、块间来回，适合大幅面分批绘制。"),
+                _ => ui.weak(
+                    "按深度分层：浅层先铺、深层后叠，每一层内就近串联。整层画完再换下一支笔，叠出来的暗部才匀。",
+                ),
+            }
+        } else if mode == ImgDraw::StrokeSketch {
+            match app.images[sel].order_mode {
+                1 => ui.weak("全部笔触就近串联：空移最少，但打乱「先浅后深、先铺后压」的层次。"),
+                2 => ui.weak("按扫描顺序成排推进：同一片区域一路画过去，最接近人手排线。"),
+                3 => ui.weak("分块蛇形：块内就近、块间来回，适合大幅面分批绘制。"),
+                _ => ui.weak(
+                    "按明暗分带逐层画：浅笔先铺、深笔后压，每一遍内就近串联；暗部补不够的墨会在下一次交叉层里继续补。",
+                ),
+            }
+        } else {
+            match app.images[sel].order_mode {
+                1 => ui.weak("最优路径：最近邻 + 2-opt 重排并允许笔画反向，空移最短。"),
+                2 => ui.weak("按扫描顺序：保持从上到下（或当前扫描方向）的原始顺序。"),
+                3 => ui.weak("分块蛇形：切成方格逐块「犁地」，块内最优、块间蛇形，路线规整。"),
+                _ => ui.weak("默认：素描/线框按扫描顺序，高效连续笔画自动做最优路径。"),
+            }
         };
+        if !uses_scan {
+            ui.weak("中心线 / 描边 / 网点 / 素描原稿不使用扫描方向；线条走向由原稿决定。");
+        } else if mode == ImgDraw::SketchHatch {
+            ui.weak("扫描方向只叠加在排线基准角上：横向/纵向适合大面积平涂，45° 最像手绘斜排线。");
+        } else if mode == ImgDraw::RegionRedraw {
+            ui.weak("扫描方向是基准角：原稿有明确笔触的块会沿用原稿走向，其余块按这个角度错开排线。");
+        } else if mode == ImgDraw::StrokeSketch {
+            ui.weak("扫描方向叠加到「无明确走向」区域的基准角上；有轮廓/原稿走向的地方优先跟随画面。");
+        }
 
         // —— 裁剪 ——
         ui.separator();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("裁剪").strong());
             if ui.button("重置裁剪").clicked() {
                 app.images[sel].crop = (0.0, 0.0, 1.0, 1.0);
@@ -2515,59 +3599,216 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
             "位置 ({:.1},{:.1}) · 输出尺寸 {:.1}×{:.1} mm · {} 条笔迹",
             ix, iy, nw, nh, strokes
         ));
+        if app.img_regen_at.is_some() {
+            // 防抖期间给出明确反馈，否则用户会觉得「调了没反应」
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 140, 40),
+                "参数已改，松开后重新计算笔迹…",
+            );
+        }
+    }
+
+    // —— 多笔分层：真实的笔组 ——
+    // 笔宽不是「限制」而是参数：0.25mm 针管笔铺浅灰，1.0mm 8B 压暗部。
+    ui.separator();
+    section(ui, "多笔分层 · 笔组");
+    ui.weak(
+        "按「亮 → 暗」排列。每支笔的线宽决定一根线盖多宽，深度决定它满覆盖时能压多黑；\
+         多笔排线按深度把明暗带分给各笔，所以 HB 不用硬排到死黑，黑场交给 8B。",
+    );
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("铅笔组 HB/2B/4B/8B").clicked() {
+            app.pens = crate::state::default_pens();
+            app.main_pen = 1;
+            app.status = "已套用铅笔笔组".into();
+        }
+        if ui.button("针管笔 0.25–1.0").clicked() {
+            app.pens = crate::state::needle_pens();
+            app.main_pen = 1;
+            app.status = "已套用针管笔笔组".into();
+        }
+    });
+    let active_names: Vec<String> = app.active_pens().iter().map(|p| p.name.clone()).collect();
+    ui.horizontal_wrapped(|ui| {
+        ui.label("文字 / 边框 / 四角标记用笔:");
+        egui::ComboBox::from_id_salt("main_pen_sel")
+            .selected_text(
+                active_names
+                    .get(app.main_pen_idx())
+                    .cloned()
+                    .unwrap_or_else(|| "—".to_string()),
+            )
+            .width((combo_w - 40.0).max(100.0))
+            .show_ui(ui, |ui| {
+                for (i, n) in active_names.iter().enumerate() {
+                    ui.selectable_value(&mut app.main_pen, i, n);
+                }
+            });
+    });
+    if !active_names.is_empty() && app.main_pen >= active_names.len() {
+        app.main_pen = active_names.len() - 1;
+    }
+    let n_pens = app.pens.len();
+    let mut remove_pen: Option<usize> = None;
+    for i in 0..n_pens {
+        let pen = &mut app.pens[i];
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut pen.on, "")
+                .on_hover_text("取消勾选后，这支笔的明暗带会分给其他笔");
+            ui.color_edit_button_srgb(&mut pen.color)
+                .on_hover_text("预览与分笔标签用的笔色");
+            ui.add(
+                egui::TextEdit::singleline(&mut pen.name)
+                    .desired_width(78.0)
+                    .hint_text("笔名"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut pen.width_mm)
+                    .range(0.15..=1.6)
+                    .speed(0.05)
+                    .suffix("mm"),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Slider::new(&mut pen.darkness, 0.2..=1.0).text("深度"));
+            ui.add(
+                egui::DragValue::new(&mut pen.offset_mm[0])
+                    .range(-5.0..=5.0)
+                    .speed(0.05)
+                    .prefix("X ")
+                    .suffix("mm"),
+            )
+            .on_hover_text("换笔后的套准偏移：这一层整体平移，补偿笔尖位置差");
+            ui.add(
+                egui::DragValue::new(&mut pen.offset_mm[1])
+                    .range(-5.0..=5.0)
+                    .speed(0.05)
+                    .prefix("Y ")
+                    .suffix("mm"),
+            );
+            if n_pens > 1 && ui.small_button("✕").on_hover_text("移除这支笔").clicked() {
+                remove_pen = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove_pen {
+        app.pens.remove(i);
+        app.status = "已移除一支笔".into();
+    }
+    if app.pens.len() < 4 && ui.button("+ 添加一支笔").clicked() {
+        let w = app.pens.last().map(|p| p.width_mm).unwrap_or(0.5) + 0.15;
+        let d = app.pens.last().map(|p| p.darkness).unwrap_or(0.6) + 0.1;
+        app.pens.push(crate::state::PenSpec {
+            name: format!("笔 {}", app.pens.len() + 1),
+            width_mm: w.clamp(0.15, 1.6),
+            darkness: d.clamp(0.2, 1.0),
+            color: [40, 40, 40],
+            offset_mm: [0.0, 0.0],
+            on: true,
+        });
+    }
+    if app.multi_pen_active() {
+        let mut seen = [false; 4];
+        for &t in &app.preview_pens {
+            if t != crate::state::NON_PEN && (t as usize) < 4 {
+                seen[t as usize] = true;
+            }
+        }
+        let used = seen.iter().filter(|b| **b).count().max(1);
+        ui.colored_label(
+            p.accent,
+            format!("★ 当前会分 {used} 支笔绘制（点「开始绘制」后逐支提示换笔）"),
+        );
+        if app.pen_running {
+            ui.weak(format!(
+                "队列进行中：第 {}/{} 支",
+                (app.pen_job_idx + 1).min(app.pen_jobs.len().max(1)),
+                app.pen_jobs.len().max(1)
+            ));
+        }
+    }
+    // 笔宽 / 深度 / 启用状态变了要重算多笔明暗带（函数内部有防抖与指纹判断）。
+    if sel < app.images.len() {
+        app.regenerate_image(sel);
     }
 
     // 默认导入参数（作用于后续导入）
     ui.separator();
     section(ui, "默认导入参数");
     ui.add(egui::Slider::new(&mut app.img_target_h, 30.0..=250.0).text("目标高度(mm)"));
-    ui.add(egui::Slider::new(&mut app.img_step, 1..=12).text("影线间隔(px)"));
-    ui.add(egui::Slider::new(&mut app.img_thr, 0.1..=0.95).text("暗部阈值(素描)"));
+    ui.add(egui::Slider::new(&mut app.img_step, 1..=12).text("影线/网点间隔(px)"));
+    ui.add(egui::Slider::new(&mut app.img_thr, 0.1..=0.95).text("暗部阈值"));
     ui.add(egui::Slider::new(&mut app.img_edge, 0.05..=0.9).text("边缘阈值(线框)"));
     ui.checkbox(&mut app.img_invert, "反相");
     let mut dt = app.img_draw_type;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("默认类型:");
-        for (i, name) in ImgDraw::names().iter().enumerate() {
-            ui.selectable_value(&mut dt, i, *name);
-        }
+        ComboBox::from_id_salt("img_default_draw")
+            .selected_text(ImgDraw::from_usize(dt).name())
+            .width(combo_w)
+            .show_ui(ui, |ui| {
+                for (i, name) in ImgDraw::names().iter().enumerate() {
+                    ui.selectable_value(&mut dt, i, *name);
+                }
+            });
     });
-        app.img_draw_type = dt;
-        if dt == 2 {
-            ui.weak("连续笔画：把相邻影线串起来画，抬笔次数最少、绘制最快；行间距建议大于 XY 最小步进。");
-        }
-        ui.horizontal(|ui| {
-            ui.label("默认扫描方向:");
-            const ANGLES: [&str; 4] = ["横向 →", "对角 45° ↘", "纵向 ↓", "对角 135° ↗"];
-            for (i, name) in ANGLES.iter().enumerate() {
-                ui.selectable_value(&mut app.img_scan_angle, i as u8, *name);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("默认笔画顺序:");
-            const ORDERS: [&str; 4] = ["默认", "最优路径", "按扫描顺序", "分块蛇形"];
-            for (i, name) in ORDERS.iter().enumerate() {
-                ui.selectable_value(&mut app.img_order_mode, i as u8, *name);
-            }
-        });
-        ui.add(egui::Slider::new(&mut app.img_merge_gap, 0..=40).text("连笔跨行容差(px)"));
-        ui.add(egui::Slider::new(&mut app.img_block_px, 16..=120).text("分块边长(px)"));
-        ui.weak("以上为默认值；单张图片可在上方单独覆盖");
+    app.img_draw_type = dt;
+    ui.weak(ImgDraw::from_usize(dt).hint());
+    ui.horizontal_wrapped(|ui| {
+        ui.label("默认扫描方向:");
+        ComboBox::from_id_salt("img_default_scan")
+            .selected_text(ANGLES[usize::from(app.img_scan_angle).min(3)])
+            .width(combo_w)
+            .show_ui(ui, |ui| {
+                for (i, name) in ANGLES.iter().enumerate() {
+                    ui.selectable_value(&mut app.img_scan_angle, i as u8, *name);
+                }
+            });
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("默认笔画顺序:");
+        ComboBox::from_id_salt("img_default_order")
+            .selected_text(ORDERS[usize::from(app.img_order_mode).min(3)])
+            .width(combo_w)
+            .show_ui(ui, |ui| {
+                for (i, name) in ORDERS.iter().enumerate() {
+                    ui.selectable_value(&mut app.img_order_mode, i as u8, *name);
+                }
+            });
+    });
+    ui.add(egui::Slider::new(&mut app.img_merge_gap, 0..=40).text("连笔跨行容差(px)"));
+    ui.add(egui::Slider::new(&mut app.img_block_px, 16..=120).text("分块边长(px)"));
+    // 原稿通的这个字段在新笔触提取里已无作用（见 `tonal_strokes` 的 `_pressure`），
+    // 不再对外暴露，免得用户以为是「调深」的旋钮——提取出来的线不加深浅。
+    ui.add(egui::Slider::new(&mut app.img_sketch_jitter, 0.0..=0.8).text("原稿手抖幅度(mm)"));
+    ui.add(egui::Slider::new(&mut app.img_sketch_pen, 0.2..=1.2).text("原稿画笔线宽(mm)"));
+    ui.add(egui::Slider::new(&mut app.img_hatch_levels, 3..=8).text("调子明暗层数"));
+    ui.add(egui::Slider::new(&mut app.img_hatch_angle, 0.0..=180.0).text("调子排线基准角(°)"));
+    ui.add(egui::Slider::new(&mut app.img_region_block_mm, 1.5..=10.0).text("分区重绘分块(mm)"));
+    ui.add(egui::Slider::new(&mut app.img_stroke_len_mm, 1.5..=8.0).text("素描笔触长度(mm)"));
+    ui.weak("以上为默认值；单张图片可在上方单独覆盖");
 }
 
 /// 运行中页：实时进度（当前行/总行、已用/剩余时间、进度页）与控制。
 fn panel_running(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "⑩ 运行中");
+    let p = pal(ui);
+    section(ui, "运行详情");
     let snap = app.device.snapshot();
 
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(if app.dev_connected { "● 已连接" } else { "○ 未连接" })
-                .color(if app.dev_connected {
-                    egui::Color32::from_rgb(60, 170, 90)
-                } else {
-                    egui::Color32::from_gray(150)
-                }),
+    if !snap.running {
+        theme::notice(
+            ui,
+            &p,
+            "当前空闲：点底部操作条的「开始绘制」下发任务；运行中可自由切换到其它页继续编辑。",
+            p.accent,
+        );
+    }
+
+    theme::card(ui, &p, |ui| {
+        theme::status_dot(
+            ui,
+            if app.dev_connected { p.success } else { p.muted },
+            if app.dev_connected { "设备已连接" } else { "设备未连接（可在设备页连接或切模拟）" },
         );
         let state = if snap.running {
             if snap.paused {
@@ -2578,72 +3819,72 @@ fn panel_running(app: &mut AppState, ui: &mut Ui) {
         } else {
             "空闲"
         };
-        ui.label(format!("状态：{state}"));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("状态").size(11.0).color(p.muted));
+            ui.label(RichText::new(state).size(13.0).strong().color(p.text));
+        });
+        let frac = if snap.total_lines > 0 {
+            snap.done_lines as f64 / snap.total_lines as f64
+        } else {
+            0.0
+        };
+        ui.add(
+            egui::ProgressBar::new(frac as f32)
+                .desired_width(f32::INFINITY)
+                .text(format!("{:.0}%  ·  {} / {} 行", frac * 100.0, snap.done_lines, snap.total_lines)),
+        );
+        let elapsed = snap.elapsed_ms as f64 / 1000.0;
+        let remain = if snap.total_lines > 0 && snap.done_lines > 0 && snap.running {
+            elapsed / snap.done_lines as f64 * (snap.total_lines - snap.done_lines) as f64
+        } else {
+            app.estimated_seconds()
+        };
+        ui.horizontal(|ui| {
+            theme::stat(ui, &p, "已用", &fmt_duration(elapsed), p.text);
+            theme::stat(ui, &p, "预计剩余", &fmt_duration(remain), p.accent);
+            theme::stat(ui, &p, "笔迹", &format!("{}", app.stats.strokes), p.text);
+        });
     });
-    ui.label(format!(
-        "G-code 进度：第 {} / {} 行",
-        snap.done_lines, snap.total_lines
-    ));
 
-    let elapsed = snap.elapsed_ms as f64 / 1000.0;
-    let remain = if snap.total_lines > 0 && snap.done_lines > 0 && snap.running {
-        elapsed / snap.done_lines as f64 * (snap.total_lines - snap.done_lines) as f64
-    } else {
-        0.0
-    };
-    ui.label(format!("已用时间：{:.1}s", elapsed));
-    ui.label(format!("预计剩余：{:.1}s", remain));
-
-    let frac = if snap.total_lines > 0 {
-        snap.done_lines as f64 / snap.total_lines as f64
-    } else {
-        0.0
-    };
-    ui.add(egui::ProgressBar::new(frac as f32).text(format!("{:.0}%", frac * 100.0)));
-
-    ui.separator();
-    ui.horizontal(|ui| {
-        if ui.button("开始运行").clicked() {
-            act_start_draw(app);
-        }
-        if snap.running && !snap.paused {
-            if ui.button("暂停").clicked() {
-                app.pause_run();
-            }
-        } else if snap.paused {
-            if ui.button("继续").clicked() {
-                app.resume_run();
-            }
-        }
-        if ui.button("停止").clicked() {
-            app.stop_run();
-        }
-        ui.checkbox(&mut app.bounds_check, "超界检测");
-        ui.weak(format!("机器幅面 {:.0}×{:.0}mm", app.machine_w_mm, app.machine_h_mm));
+    ui.add_space(6.0);
+    section(ui, "任务统计");
+    theme::card(ui, &p, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            theme::stat(ui, &p, "墨线长度", &format!("{:.2} m", app.stats.ink_mm / 1000.0), p.text);
+            theme::stat(ui, &p, "空移行程", &format!("{:.1} m", app.stats.travel_mm / 1000.0), p.warning);
+            theme::stat(ui, &p, "总点数", &format!("{}", app.stats.points), p.muted);
+            theme::stat(ui, &p, "预计耗时", &fmt_duration(app.estimated_seconds()), p.accent);
+        });
+        ui.weak("估算按当前进给速度 + 抬落笔延时计算，未计入加减速。");
     });
-    ui.weak("运行中可切换到其他页继续编辑，绘制进度互不干扰");
 
-    ui.separator();
-    ui.label("当前 G-code（运行位置附近）：");
-    if app.gcode_text.is_empty() {
-        ui.weak("（点击「开始运行」后显示）");
-    } else {
-        let lines: Vec<&str> = app.gcode_text.lines().collect();
-        let cur = snap.done_lines.min(lines.len());
-        let start = cur.saturating_sub(8);
-        let end = (cur + 8).min(lines.len());
-        let mut view = String::new();
-        for (i, l) in lines.iter().enumerate().take(end).skip(start) {
-            let mark = if i + 1 == cur { "▶ " } else { "  " };
-            view.push_str(&format!("{}{:>4}: {}\n", mark, i + 1, l));
+    ui.add_space(6.0);
+    section(ui, "G-code 跟踪");
+    theme::card(ui, &p, |ui| {
+        if app.gcode_text.is_empty() {
+            ui.weak("尚未生成 G-code：先点底部「开始绘制」，或到「项目与输出」页生成预览。");
+        } else {
+            let lines: Vec<&str> = app.gcode_text.lines().collect();
+            let cur = snap.done_lines.min(lines.len());
+            let start = cur.saturating_sub(10);
+            let end = (cur + 12).min(lines.len());
+            let mut view = String::new();
+            for (i, l) in lines.iter().enumerate().take(end).skip(start) {
+                let mark = if i + 1 == cur { "▶ " } else { "  " };
+                view.push_str(&format!("{}{:>4}: {}\n", mark, i + 1, l));
+            }
+            ui.add(
+                TextEdit::multiline(&mut view)
+                    .desired_rows(12)
+                    .interactive(false)
+                    .font(egui::TextStyle::Monospace),
+            );
         }
-        ui.add(TextEdit::multiline(&mut view).desired_rows(9).interactive(false));
-    }
+    });
 }
 
-/// 页面边框（对应源程序 edge 模块）。
+/// 页面边框（对应源程序 edge 模块）；外层已有「页面边框」折叠标题，这里不再重复。
 fn panel_border(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "页面边框");
     ui.checkbox(&mut app.border_on, "绘制边框");
     ui.add_enabled(
         app.border_on,
@@ -2657,76 +3898,124 @@ fn panel_border(app: &mut AppState, ui: &mut Ui) {
     });
 }
 
-fn panel_export(app: &mut AppState, ui: &mut Ui) {
-    section(ui, "固件 / 生成");
-    ui.horizontal(|ui| {
-        ui.label("固件:");
-        ui.selectable_value(&mut app.firmware_sel, 0, "GRBL");
-        ui.selectable_value(&mut app.firmware_sel, 1, "Marlin");
-        ui.selectable_value(&mut app.firmware_sel, 2, "EBB");
-    });
-    ui.horizontal(|ui| {
-        ui.label("笔控:");
-        ui.selectable_value(&mut app.pen_mode_sel, 0, "Z轴");
-        ui.selectable_value(&mut app.pen_mode_sel, 1, "舵机");
-    });
-    ui.add(egui::Slider::new(&mut app.feed_rate, 500.0..=30000.0).text("进给(mm/min)"));
-    ui.add(egui::Slider::new(&mut app.z_speed, 100.0..=30000.0).text("Z轴速度"));
-    ui.add(egui::Slider::new(&mut app.pen_up, -10.0..=20.0).text("抬笔"));
-    ui.add(egui::Slider::new(&mut app.pen_down, -10.0..=20.0).text("落笔"));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ImageObject;
 
-    // 不常用设置已移到「设置」对话框（激光/休眠/延时/坐标系/自定义 G-code/逼真化等）
-    ui.horizontal(|ui| {
-        if ui.button("⚙ 更多设置").clicked() {
-            app.settings_open = true;
-        }
-        ui.weak("（激光、坐标系、自定义 G-code 等）");
-    });
+    fn app_with_image() -> AppState {
+        // 空字库也能构造 AppState：这里只测布局，不生成真实笔迹。
+        let mut app = AppState::new(crate::fontmgr::FontManager { fonts: vec![] }, String::new());
+        app.tab = 5;
+        // 分页打开时会多出整页导航与提示行，一并纳入窄栏回归。
+        app.tile_on = true;
+        app.images.push(ImageObject {
+            path: "layout.png".into(),
+            bytes: Vec::new(),
+            x: 30.0,
+            y: 30.0,
+            scale: 1.0,
+            rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
+            draw: ImgDraw::SketchHatch,
+            step_px: 3,
+            threshold: 0.55,
+            edge_threshold: 0.25,
+            invert: false,
+            crop: (0.0, 0.0, 1.0, 1.0),
+            scan_angle: 0,
+            merge_gap_px: 8,
+            order_mode: 0,
+            block_px: 40,
+            sketch_pressure: 3,
+            sketch_jitter: 0.12,
+            sketch_pen: 0.5,
+            hatch_levels: 6,
+            hatch_angle: 35.0,
+            region_block_mm: 2.5,
+            stroke_len_mm: 3.2,
+            stroke_follow: 2,
+            multi_pen: true,
+            background: false,
+            out: true,
+            base: vec![Polyline::new(vec![(0.0, 0.0), (40.0, 40.0)])],
+            base_pens: vec![0],
+            natural_w: 40.0,
+            natural_h: 40.0,
+            gen_key: 0,
+        });
+        app
+    }
 
-    if ui.button("生成 G-code").clicked() {
-        app.gcode_text = app.generate_gcode();
-        app.status = "已生成 G-code".into();
+    /// 在指定宽度的“参数栏”里渲染一次图片页，返回绘制结果。
+    fn render_image_panel(app: &mut AppState, width: f32) -> egui::FullOutput {
+        use egui::{pos2, vec2, Rect};
+
+        let ctx = egui::Context::default();
+        crate::setup_fonts(&ctx);
+        crate::theme::apply(&ctx, false);
+        let panel = Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 2000.0));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 2000.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_width(width);
+                ui.set_clip_rect(panel);
+                fit_params_width(ui);
+                panel_images(app, ui);
+            },
+        );
+        // 测试里没有渲染后端，纹理增量必须手动清掉，否则 Drop 时会 panic。
+        output.textures_delta.clear();
+        output
     }
-    ui.separator();
-    ui.label(RichText::new("导出（可自选位置与文件名）").strong());
-    if ui.button("导出 .nc (G-code)").clicked() {
-        if let Some(p) = app.save_file_as("G-code", &["nc", "gcode"], "output.nc") {
-            match io::export_gcode(app, &p) {
-                Ok(()) => app.status = format!("G-code 已导出：{}", p.display()),
-                Err(e) => app.status = format!("导出失败：{e}"),
+
+    /// 右侧参数栏最窄时（300pt 减去内边距与滚动条），图片页的文字不能越过
+    /// 栏边界——越过就会被栏位裁掉。回归：多笔笔组和长标签滑块曾把内容顶出
+    /// 右侧栏，用户看到的就是「显示不完整」。
+    #[test]
+    fn image_panel_fits_narrow_sidebar() {
+        let mut app = app_with_image();
+        let width = 262.0;
+        let output = render_image_panel(&mut app, width);
+
+        let mut worst = 0.0_f32;
+        for cs in &output.shapes {
+            let r = cs.shape.visual_bounding_rect();
+            if r.max.x > width + 2.0 {
+                worst = worst.max(r.max.x);
             }
         }
+        assert!(
+            worst <= width + 2.0,
+            "图片参数栏有内容被裁到栏外，最右到 {worst:.1}pt（栏宽 {width:.1}pt）"
+        );
     }
-    if ui.button("导出 SVG").clicked() {
-        if let Some(p) = app.save_file_as("SVG", &["svg"], "output.svg") {
-            match io::export_svg(app, &p) {
-                Ok(()) => app.status = format!("SVG 已导出：{}", p.display()),
-                Err(e) => app.status = format!("导出失败：{e}"),
-            }
-        }
-    }
-    if ui.button("导出 PDF（矢量）").clicked() {
-        if let Some(p) = app.save_file_as("PDF", &["pdf"], "output.pdf") {
-            match io::export_pdf(app, &p) {
-                Ok(()) => app.status = format!("PDF 已导出：{}", p.display()),
-                Err(e) => app.status = format!("导出失败：{e}"),
-            }
-        }
-    }
-    if ui.button("导出 PNG").clicked() {
-        if let Some(p) = app.save_file_as("PNG", &["png"], "output.png") {
-            match io::export_png(app, &p) {
-                Ok(()) => app.status = format!("PNG 已导出：{}", p.display()),
-                Err(e) => app.status = format!("导出失败：{e}"),
-            }
-        }
-    }
-    ui.separator();
-    ui.label("G-code 预览（前 30 行）：");
-    if app.gcode_text.is_empty() {
-        ui.label(RichText::new("（点击「生成 G-code」）").color(muted()));
-    } else {
-        let mut head: String = app.gcode_text.lines().take(30).collect::<Vec<_>>().join("\n");
-        ui.add(TextEdit::multiline(&mut head).desired_rows(8).interactive(false));
+
+    /// 位置不能被右侧栏「夹回去」：大页面上把图拖到 x>400 / y>500 后，
+    /// 参数栏每帧重绘不能把坐标写回旧范围，否则画布上永远拖不到目标位置。
+    #[test]
+    fn image_position_is_not_clamped_by_sidebar() {
+        let mut app = app_with_image();
+        app.page_w_mm = 1000.0;
+        app.page_h_mm = 1000.0;
+        app.images[0].x = 850.0;
+        app.images[0].y = -120.0;
+
+        let _ = render_image_panel(&mut app, 340.0);
+
+        assert!(
+            (app.images[0].x - 850.0).abs() < 1e-9,
+            "x 被参数栏夹回：{:.1}",
+            app.images[0].x
+        );
+        assert!(
+            (app.images[0].y + 120.0).abs() < 1e-9,
+            "y 被参数栏夹回：{:.1}",
+            app.images[0].y
+        );
     }
 }
