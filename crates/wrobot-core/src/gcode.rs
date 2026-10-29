@@ -3,7 +3,7 @@
 //! 落笔 = 沿折线走刀（G1），抬笔 = 快速移动到下一条笔画起点（G0）。
 
 use crate::config::{Firmware, MachineConfig, PenMode};
-use crate::render::Polyline;
+use crate::render::{order_paths, path_travel, total_length, PathOrder, Polyline};
 
 /// G-code 输出参数。
 #[derive(Debug, Clone)]
@@ -71,6 +71,17 @@ pub struct GcodeOptions {
     /// 关掉的话坐标就是**机器绝对坐标**（`G90` 直接相对机械原点解析），
     /// 页面尺寸一旦逼近/超过机器行程就会软限位报警——即「移动超出限制」。
     pub use_current_origin: bool,
+    /// **路径优化方式**：只改笔迹顺序与起笔端，不改墨迹。
+    pub path_order: PathOrder,
+    /// 快速移动（G0 / 空移）速度（mm/min），用于耗时估算。
+    pub rapid_rate: f64,
+    /// 加速度（mm/s²），用于耗时估算的加减速模型。
+    pub accel_mm_s2: f64,
+    /// 单条指令的串口/固件处理开销（毫秒），用于耗时估算。
+    ///
+    /// 115200 波特率下一行 20 字节约 1.7ms，再叠加固件解析；
+    /// 短笔触的耗时几乎完全由这个吞吐决定。
+    pub line_ms: f64,
 }
 
 impl Default for GcodeOptions {
@@ -106,6 +117,10 @@ impl Default for GcodeOptions {
             ebb_max_pen: 30000.0,
             min_step: 0.2,
             use_current_origin: true,
+            path_order: PathOrder::Keep,
+            rapid_rate: 6000.0,
+            accel_mm_s2: 500.0,
+            line_ms: 2.0,
         }
     }
 }
@@ -306,8 +321,57 @@ pub fn decimate_polylines(paths: &[Polyline], min_step: f64) -> Vec<Polyline> {
         .collect()
 }
 
-/// 生成完整 G-code。
+/// 一次「开始绘制」的完整方案：G-code + 统计数据 + 预计耗时。
+#[derive(Debug, Clone)]
+pub struct GcodePlan {
+    pub gcode: String,
+    /// 排序后的笔迹（未抽稀，供运行进度页显示）。
+    pub paths: Vec<Polyline>,
+    /// 实际落笔的笔画数（抽稀后）。
+    pub strokes: usize,
+    /// 墨线总长（毫米，抽稀后）。
+    pub ink_mm: f64,
+    /// 笔画之间的空移总长（毫米）。
+    pub travel_mm: f64,
+    /// G-code 行数（含注释与设置指令）。
+    pub lines: usize,
+    /// G-code 字节数。
+    pub bytes: usize,
+    /// 预计运行耗时（秒）。
+    pub seconds: f64,
+}
+
+/// 生成一份可执行的绘制方案：先按 [`PathOrder`] 重排，再抽稀、出 G-code、估时。
+///
+/// **耗时只在调用这一处算**：界面上改内容只重建预览，不会生成 G-code。
+pub fn plan(paths: Vec<Polyline>, opts: &GcodeOptions) -> GcodePlan {
+    let ordered = order_paths(paths, opts.path_order, opts.page_w, opts.page_h);
+    let paths_dec = decimate_polylines(&ordered, opts.min_step);
+    let ink_mm = total_length(&paths_dec);
+    let route = path_travel(&paths_dec, (0.0, 0.0));
+    let gcode = write_gcode(&paths_dec, opts);
+    let seconds = estimate_seconds(&gcode, opts);
+    let lines = gcode.lines().filter(|l| !l.trim().is_empty()).count();
+    let bytes = gcode.len();
+    GcodePlan {
+        gcode,
+        paths: ordered,
+        strokes: paths_dec.len(),
+        ink_mm,
+        travel_mm: (route - ink_mm).max(0.0),
+        lines,
+        bytes,
+        seconds,
+    }
+}
+
+/// 生成完整 G-code（保留原接口；内部走 [`plan`]）。
 pub fn generate(paths: &[Polyline], opts: &GcodeOptions) -> String {
+    plan(paths.to_vec(), opts).gcode
+}
+
+/// 把已经排好序、抽稀好的笔迹写成 G-code 文本。
+fn write_gcode(paths: &[Polyline], opts: &GcodeOptions) -> String {
     let mut o = String::new();
     o.push_str("; WritingRobot (Rust rewrite) - 单线仿手写\n");
     o.push_str(&format!("; firmware: {}\n", opts.firmware.as_str()));
@@ -333,9 +397,7 @@ pub fn generate(paths: &[Polyline], opts: &GcodeOptions) -> String {
     o.push('\n');
 
     let mut pen_down = false;
-    // 先按 XY 最小步进抽稀：密集的微移动指令是「G-code 又长、绘制又慢」的主因
-    let paths = decimate_polylines(paths, opts.min_step);
-    for p in &paths {
+    for p in paths {
         if p.pts.len() < 2 {
             continue;
         }
@@ -379,6 +441,133 @@ pub fn generate(paths: &[Polyline], opts: &GcodeOptions) -> String {
         }
     }
     o
+}
+
+/// 一段连续运动的耗时（秒）：梯形/三角速度曲线。
+///
+/// `d >= v²/a` 时能跑到匀速（加速 + 匀速 + 减速），否则只加速到峰值就减速。
+pub fn move_seconds(d: f64, rate_mm_min: f64, accel_mm_s2: f64) -> f64 {
+    let d = d.abs();
+    if d < 1e-9 {
+        return 0.0;
+    }
+    let v = rate_mm_min.max(1.0) / 60.0;
+    let a = accel_mm_s2.max(1.0);
+    if d >= v * v / a {
+        d / v + v / a
+    } else {
+        2.0 * (d / a).sqrt()
+    }
+}
+
+/// 按 G-code 文本估算运行耗时（秒）。
+///
+/// 比「总行程 ÷ 进给速度」准得多的地方：
+/// - **空移用快速速度**，不是落笔速度；
+/// - **加减速**：短笔触跑不到设定速度，时间由 2√(d/a) 主导；
+/// - **指令吞吐**：每行至少 `line_ms`，密集短线段不会再被当成 0 成本；
+/// - **抬落笔**：舵机/抬笔动作、`G4 P` 暂停都计入。
+pub fn estimate_seconds(gcode: &str, opts: &GcodeOptions) -> f64 {
+    let up = opts.pen_up_cmd();
+    let down = opts.pen_down_cmd();
+    let line_s = opts.line_ms.max(0.0) / 1000.0;
+    let accel = opts.accel_mm_s2.max(1.0);
+    let pen_action = match (opts.firmware, opts.pen_mode) {
+        (Firmware::Ebb, _) => 0.12,
+        (_, PenMode::Servo) => 0.18,
+        _ => 0.03, // Z 轴抬落笔本身由 G0 Z / G1 Z 行计时
+    };
+    let mut t = 0.0f64;
+    let mut cur = (0.0f64, 0.0f64);
+    let mut pen_down = false;
+    let mut run_len = 0.0f64;
+    let mut run_lines = 0usize;
+    let flush = |t: &mut f64, run_len: f64, run_lines: usize| {
+        if run_lines == 0 || run_len <= 0.0 {
+            return;
+        }
+        let motion = move_seconds(run_len, opts.feed_rate, accel);
+        *t += motion.max(run_lines as f64 * line_s);
+    };
+    for raw in gcode.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == up {
+            flush(&mut t, run_len, run_lines);
+            run_len = 0.0;
+            run_lines = 0;
+            pen_down = false;
+            t += pen_action;
+            continue;
+        }
+        if line == down {
+            flush(&mut t, run_len, run_lines);
+            run_len = 0.0;
+            run_lines = 0;
+            pen_down = true;
+            t += pen_action;
+            continue;
+        }
+        // EBB：一条 SM 就是一次完整移动，时长由固件参数直接给出。
+        if let Some(rest) = line.strip_prefix("SM,") {
+            let mut it = rest.split(',');
+            if let Some(ms) = it.next().and_then(|v| v.trim().parse::<f64>().ok()) {
+                t += (ms / 1000.0).max(line_s);
+            }
+            continue;
+        }
+        let head = line.split_whitespace().next().unwrap_or("");
+        if head == "G4" {
+            if let Some(p) = axis_val(line, 'P') {
+                t += p.max(0.0);
+            }
+            continue;
+        }
+        if head == "G92" {
+            cur = (0.0, 0.0);
+            continue;
+        }
+        if !(head == "G0" || head == "G1" || head == "G00" || head == "G01") {
+            continue;
+        }
+        let x = axis_val(line, 'X');
+        let y = axis_val(line, 'Y');
+        let z = axis_val(line, 'Z');
+        let next = (x.unwrap_or(cur.0), y.unwrap_or(cur.1));
+        let xy_move = x.is_some() || y.is_some();
+        let dz = z.map(|z| (z - 0.0).abs()).unwrap_or(0.0);
+        let draw = head.starts_with("G1") && pen_down && xy_move;
+        let d = dist(cur, next);
+        cur = next;
+        if draw {
+            run_len += d;
+            run_lines += 1;
+        } else if xy_move {
+            // 空移 / 未落笔的移动：单独一段。
+            flush(&mut t, run_len, run_lines);
+            run_len = 0.0;
+            run_lines = 0;
+            let rate = if head.starts_with("G1") {
+                opts.feed_rate
+            } else {
+                opts.rapid_rate
+            };
+            t += move_seconds(d, rate, accel).max(line_s);
+        } else if z.is_some() {
+            flush(&mut t, run_len, run_lines);
+            run_len = 0.0;
+            run_lines = 0;
+            t += move_seconds(dz, opts.z_speed, accel).max(line_s);
+        }
+    }
+    flush(&mut t, run_len, run_lines);
+    t
+}
+
+fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
+    ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt()
 }
 
 /// 输出「抬笔前暂停 + 抬笔指令」。
@@ -763,5 +952,88 @@ mod tests {
     fn gcode_xy_bounds_none_without_motion() {
         assert!(gcode_xy_bounds("; 仅注释\nG21\nG90\nM2\n").is_none());
         assert!(gcode_xy_bounds("").is_none());
+    }
+
+    /// 加减速模型：长距离能跑到匀速，短距离只加速到峰值就减速。
+    #[test]
+    fn move_seconds_matches_trapezoid() {
+        let v = 10000.0 / 60.0;
+        let a = 500.0;
+        assert!((move_seconds(1000.0, 10000.0, a) - (1000.0 / v + v / a)).abs() < 1e-9);
+        assert!((move_seconds(1.0, 10000.0, a) - 2.0 * (1.0f64 / a).sqrt()).abs() < 1e-9);
+        assert_eq!(move_seconds(0.0, 10000.0, a), 0.0);
+    }
+
+    /// 估时必须按「实际 G0/G1 行」计时：空移走快速速度，落笔走进给速度。
+    #[test]
+    fn estimate_uses_rapid_for_travel() {
+        let mut o = GcodeOptions::default();
+        o.feed_rate = 600.0; // 10mm/s
+        o.rapid_rate = 6000.0; // 100mm/s
+        o.accel_mm_s2 = 1000.0;
+        o.line_ms = 0.0;
+        o.page_w = 40.0;
+        o.page_h = 20.0;
+        o.min_step = 0.0;
+        let paths = vec![
+            Polyline::new(vec![(0.0, 0.0), (10.0, 0.0)]),
+            Polyline::new(vec![(0.0, 5.0), (10.0, 5.0)]),
+        ];
+        let t = estimate_seconds(&generate(&paths, &o), &o);
+        // 两段 10mm 落笔 ≈1s 多，5mm 空移走 100mm/s 只占很小一部分
+        assert!(t > 1.5 && t < 3.5, "估算 {t}s 不合理");
+        // 进给减半 → 落笔变慢，总时间必须明显变大
+        o.feed_rate = 300.0;
+        let slower = estimate_seconds(&generate(&paths, &o), &o);
+        assert!(slower > t + 0.5, "进给减半后应更慢：{slower} vs {t}");
+    }
+
+    /// 每行指令都有吞吐成本：同样的墨迹拆成更多短段会更慢。
+    #[test]
+    fn estimate_charges_per_line_overhead() {
+        let mut o = GcodeOptions::default();
+        o.feed_rate = 10000.0;
+        o.accel_mm_s2 = 1e6;
+        o.auto_sleep = false;
+        o.min_step = 0.0;
+        o.line_ms = 3.0;
+        let one = vec![Polyline::new(vec![(0.0, 0.0), (10.0, 0.0)])];
+        let many = {
+            let pts: Vec<(f64, f64)> = (0..=100).map(|i| (i as f64 * 0.1, 0.0)).collect();
+            vec![Polyline::new(pts)]
+        };
+        let t1 = estimate_seconds(&generate(&one, &o), &o);
+        let t100 = estimate_seconds(&generate(&many, &o), &o);
+        assert!(t100 > t1 + 0.2, "100 段应比 1 段慢：{t100} vs {t1}");
+    }
+
+    /// plan：排序后空移显著变短，统计字段自洽，且方案里带着排好序的笔迹。
+    #[test]
+    fn plan_reports_shorter_travel_when_ordered() {
+        let mut paths = Vec::new();
+        for y in 0..20 {
+            paths.push(Polyline::new(vec![(0.0, y as f64), (30.0, y as f64)]));
+        }
+        let mut o = GcodeOptions::default();
+        o.page_w = 40.0;
+        o.page_h = 30.0;
+        let keep = plan(paths.clone(), &o);
+        o.path_order = PathOrder::Serpentine;
+        let ordered = plan(paths, &o);
+        assert!(
+            ordered.travel_mm * 5.0 < keep.travel_mm,
+            "排序后空移应大幅缩短：{} vs {}",
+            ordered.travel_mm,
+            keep.travel_mm
+        );
+        assert!(
+            (ordered.ink_mm - keep.ink_mm).abs() < 1e-6,
+            "墨迹长度必须不变"
+        );
+        assert_eq!(ordered.strokes, 20);
+        assert!(ordered.lines > 0);
+        assert_eq!(ordered.bytes, ordered.gcode.len());
+        assert!(ordered.seconds > 0.0);
+        assert_eq!(ordered.paths.len(), 20, "方案要带排好序的笔迹");
     }
 }

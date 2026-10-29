@@ -164,6 +164,14 @@ pub struct ImageGenOpts {
     pub stroke_len_mm: f64,
     /// **素描笔触模式**：走向参考。0 = 跟随轮廓，1 = 跟随原稿笔触，2 = 混合。
     pub stroke_follow: u8,
+    /// **素描笔触模式**：落笔风格。0 = 交叉排线基底（等距平行线 + 分档笔），
+    /// 1 = 随形短笔触（逐遍补残留墨，方向跟随轮廓/墨脊；0.23 及更早的流水线）。
+    pub sketch_style: u8,
+    /// **工作分辨率上限**（长边像素，0 = 按原图不缩放）。
+    ///
+    /// 只决定算法在多少像素上找墨/走线，不改变成品毫米尺寸。导入时由
+    /// 「精细度」选项给出，避免像以前那样一律静默压到固定值。
+    pub max_side_px: u32,
     /// **多笔分层**：把明暗带分给笔组里的不同笔，而不是一支笔硬排到底。
     pub multi_pen: bool,
     /// 参与多笔分层的笔（最多 4 支，按亮 → 暗排列）。
@@ -189,11 +197,13 @@ impl Default for ImageGenOpts {
             sketch_pressure: 3,
             sketch_jitter: 0.12,
             sketch_pen: 0.5,
-            hatch_levels: 6,
+            hatch_levels: 8,
             hatch_angle: 35.0,
             region_block_mm: 2.5,
             stroke_len_mm: 3.2,
             stroke_follow: 2,
+            sketch_style: 0,
+            max_side_px: 3600,
             multi_pen: false,
             pens: NO_PENS,
             pen_count: 0,
@@ -240,8 +250,7 @@ pub struct ImageGenResult {
 /// - `draw_type == 4`（描边）：marching squares 等值轮廓；
 /// - `draw_type == 5`（交叉排线）：主方向影线 + 暗部垂直排线；
 /// - `draw_type == 6`（网点）：按灰度生成半调网点；
-/// - `draw_type == 7`（素描原稿）：逐笔识别骨架、按切线接回交叉点，
-///   分层还原成手绘笔迹（见 [`crate::sketch`]）。
+/// - `draw_type == 10`（素描笔触）：残差驱动的短直排线，多笔分层（见 [`crate::sketch`]）。
 /// 反相会把黑/白对调。返回的折线尺寸为 `target_h_mm` 高、按图片宽高比计算宽。
 pub fn image_to_polylines(data: &[u8], opts: &ImageGenOpts) -> anyhow::Result<ImageGenResult> {
     let img = image::load_from_memory(data)?;
@@ -291,6 +300,15 @@ pub(crate) fn stretch_levels(gray: &mut image::GrayImage) {
         }
     }
     if best == 0 || paper < 170 {
+        return;
+    }
+    // 亮端众数不等于「纸白」：这张素描的画纸是白的，但背景用铅笔铺了一层
+    // 灰调（直方图在 205 附近有个大峰）。把灰背景当成纸，整幅画会被拉亮
+    // 一档，脸和额头这些本来就接近纸白的中浅调被直接截断成纯白——浅调
+    // 人像因此只剩头发和五官，中间调全丢。图里本来就有成片的真白（>246）
+    // 时说明纸色已经是白的，不需要再拉。
+    let true_white = hist[246..=255].iter().map(|&c| c as u64).sum::<u64>();
+    if true_white * 50 >= n as u64 {
         return;
     }
     // 黑场：最暗的 1%
@@ -351,13 +369,25 @@ pub fn gray_to_polylines(gray: &image::GrayImage, opts: &ImageGenOpts) -> ImageG
     } else {
         gray
     };
-    // 骨架细化是迭代算法、等值轮廓会生成大量小线段：大图先缩到长边 1600px，
-    // 既避免界面卡死，也保证绘图精度（再高的分辨率对写字机没有意义）。
+    // 骨架细化是迭代算法、等值轮廓会生成大量小线段：中心线/描边先缩到
+    // 长边 1600px，避免界面卡死。
+    //
+    // 骨架细化是迭代算法，像素一多就成倍变慢，中心线/描边始终封顶 1600px。
+    // 其余画法按导入时选择的「精细度」走：`max_side_px == 0` 表示原图不缩放。
+    let max_side = match opts.draw_type {
+        3 | 4 => {
+            if opts.max_side_px == 0 {
+                1600
+            } else {
+                opts.max_side_px.min(1600)
+            }
+        }
+        _ => opts.max_side_px,
+    };
     let down;
-    let gray: &image::GrayImage = if matches!(opts.draw_type, 3 | 4 | 7 | 8 | 9 | 10)
-        && base.width().max(base.height()) > 1600
+    let gray: &image::GrayImage = if max_side > 0 && base.width().max(base.height()) > max_side
     {
-        let k = 1600.0 / base.width().max(base.height()) as f64;
+        let k = max_side as f64 / base.width().max(base.height()) as f64;
         let nw = ((base.width() as f64 * k).round() as u32).max(1);
         let nh = ((base.height() as f64 * k).round() as u32).max(1);
         down = image::imageops::thumbnail(base, nw, nh);
@@ -470,121 +500,55 @@ pub fn gray_to_polylines(gray: &image::GrayImage, opts: &ImageGenOpts) -> ImageG
                 h_mm,
             };
         }
-        // 素描原稿（实验）：逐笔识别 + 分层手绘还原。
-        7 => {
-            let polylines = crate::sketch::sketch_polylines(
-                gray,
-                w,
-                h,
-                scale,
-                opts.threshold,
-                opts.invert,
-                opts.sketch_pressure,
-                opts.sketch_jitter,
-                opts.sketch_pen,
-                opts.order_mode,
-                opts.block_px,
-            );
-            return ImageGenResult {
-                pens: vec![0; polylines.len()],
-                polylines,
-                w_mm,
-                h_mm,
-            };
-        }
-        // 素描调子（实验）：灰度 → 多层排线 + 轮廓重线。
-        8 => {
-            let base_deg = match opts.scan_angle {
-                1 => 45.0,
-                2 => 90.0,
-                3 => 135.0,
-                _ => 0.0,
-            };
-            let hatch = crate::sketch::hatch_polylines(
-                gray,
-                w,
-                h,
-                scale,
-                opts.threshold,
-                opts.invert,
-                opts.hatch_levels,
-                opts.sketch_jitter,
-                opts.sketch_pen,
-                opts.order_mode,
-                opts.block_px,
-                opts.hatch_angle + base_deg,
-                opts.step_px,
-                opts.edge_threshold,
-                &opts.pens[..usize::from(opts.pen_count).min(opts.pens.len())],
-                opts.multi_pen,
-            );
-            return ImageGenResult {
-                polylines: hatch.polylines,
-                pens: hatch.pens,
-                w_mm,
-                h_mm,
-            };
-        }
-        // 分区重绘（实验）：量出逐像素深度层 → 细块定方向 → 分层用不同铅笔压暗。
-        9 => {
-            let base_deg = match opts.scan_angle {
-                1 => 45.0,
-                2 => 90.0,
-                3 => 135.0,
-                _ => 0.0,
-            };
-            let region = crate::sketch::region_polylines(
-                gray,
-                w,
-                h,
-                scale,
-                opts.threshold,
-                opts.invert,
-                opts.hatch_levels,
-                opts.region_block_mm,
-                opts.sketch_jitter,
-                opts.sketch_pen,
-                opts.order_mode,
-                opts.block_px,
-                opts.hatch_angle + base_deg,
-                opts.edge_threshold,
-                &opts.pens[..usize::from(opts.pen_count).min(opts.pens.len())],
-                opts.multi_pen,
-            );
-            return ImageGenResult {
-                polylines: region.polylines,
-                pens: region.pens,
-                w_mm,
-                h_mm,
-            };
-        }
         // 素描笔触（融合）：残差决定密度，短直线决定质感，方向沿轮廓/原稿。
-        10 => {
+        // 旧序号 7/8/9 是已下线的三种分层画法，读回旧工程时统一走这条新通路。
+        7..=10 => {
             let base_deg = match opts.scan_angle {
                 1 => 45.0,
                 2 => 90.0,
                 3 => 135.0,
                 _ => 0.0,
             };
-            let sketched = crate::sketch::stroke_polylines(
-                gray,
-                w,
-                h,
-                scale,
-                opts.threshold,
-                opts.invert,
-                opts.hatch_levels,
-                opts.stroke_len_mm,
-                opts.stroke_follow,
-                opts.sketch_jitter,
-                opts.sketch_pen,
-                opts.order_mode,
-                opts.block_px,
-                opts.hatch_angle + base_deg,
-                opts.edge_threshold,
-                &opts.pens[..usize::from(opts.pen_count).min(opts.pens.len())],
-                opts.multi_pen,
-            );
+            let sketched = if opts.sketch_style == 1 {
+                crate::sketch_legacy::stroke_polylines(
+                    gray,
+                    w,
+                    h,
+                    scale,
+                    opts.threshold,
+                    opts.invert,
+                    opts.hatch_levels,
+                    opts.stroke_len_mm,
+                    opts.stroke_follow,
+                    opts.sketch_jitter,
+                    opts.sketch_pen,
+                    opts.order_mode,
+                    opts.block_px,
+                    opts.hatch_angle + base_deg,
+                    opts.edge_threshold,
+                    &opts.pens[..usize::from(opts.pen_count).min(opts.pens.len())],
+                    opts.multi_pen,
+                )
+            } else {
+                crate::sketch::stroke_polylines(
+                    gray,
+                    w,
+                    h,
+                    scale,
+                    opts.threshold,
+                    opts.invert,
+                    opts.hatch_levels,
+                    opts.stroke_len_mm,
+                    opts.stroke_follow,
+                    opts.sketch_jitter,
+                    opts.sketch_pen,
+                    opts.order_mode,
+                    opts.block_px,
+                    opts.hatch_angle + base_deg,
+                    &opts.pens[..usize::from(opts.pen_count).min(opts.pens.len())],
+                    opts.multi_pen,
+                )
+            };
             return ImageGenResult {
                 polylines: sketched.polylines,
                 pens: sketched.pens,
@@ -599,6 +563,44 @@ pub fn gray_to_polylines(gray: &image::GrayImage, opts: &ImageGenOpts) -> ImageG
     let mut out = Vec::new();
     let lines = scan_lines(w, h, step, opts.scan_angle);
     runs_as_polylines(&ink, &lines, w, scale, &mut out);
+    if opts.draw_type == 5 && opts.multi_pen && usize::from(opts.pen_count) >= 2 {
+        // 交叉排线 + 明暗分层：越暗的区域叠越多方向的排线，每层交给更深的笔。
+        // 第 0 层（所有墨）→ 最浅的笔；之后每层阈值 ×0.72，方向依次旋转，
+        // 浅笔先把大面铺出来，深笔只在暗部补线，避免深色糊成一片。
+        let layers = usize::from(opts.pen_count).min(4);
+        let mut tagged: Vec<(Polyline, u8)> = Vec::new();
+        let base = order_strokes(out, opts.order_mode, false, opts.block_px, w, scale);
+        tagged.extend(base.into_iter().map(|p| (p, 0u8)));
+        for l in 1..layers {
+            let th = (opts.threshold * 0.72f64.powi(l as i32) * 255.0).clamp(0.0, 255.0);
+            let mut core = vec![false; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    let lum = gray.get_pixel(x, y).0[0] as f64;
+                    let on = lum < th;
+                    core[(y * w + x) as usize] = if opts.invert { !on } else { on };
+                }
+            }
+            let angle = match l {
+                1 => perpendicular_angle(opts.scan_angle),
+                2 => (opts.scan_angle + 1) % 4,
+                _ => (opts.scan_angle + 3) % 4,
+            };
+            let cross = scan_lines(w, h, step, angle);
+            let mut v = Vec::new();
+            runs_as_polylines(&core, &cross, w, scale, &mut v);
+            let v = order_strokes(v, opts.order_mode, false, opts.block_px, w, scale);
+            tagged.extend(v.into_iter().map(|p| (p, l as u8)));
+        }
+        let pens = tagged.iter().map(|(_, t)| *t).collect();
+        let polylines = tagged.into_iter().map(|(p, _)| p).collect();
+        return ImageGenResult {
+            polylines,
+            pens,
+            w_mm,
+            h_mm,
+        };
+    }
     if opts.draw_type == 5 {
         // 交叉排线：更暗的区域再叠一层垂直方向的影线。
         let thr2 = (opts.threshold * 0.72 * 255.0).clamp(0.0, 255.0);
@@ -1515,6 +1517,11 @@ pub fn load_project_full(app: &mut AppState, path: &Path) -> anyhow::Result<()> 
     loaded.status = "工程已载入".into();
     loaded.img_drag = None;
     loaded.freehand = Vec::new();
+    // 旧工程的「素描原稿 / 素描调子 / 分区重绘」统一并入素描笔触。
+    for im in &mut loaded.images {
+        im.draw = im.draw.normalized();
+    }
+    loaded.img_draw_type = crate::state::ImgDraw::from_usize(loaded.img_draw_type) as usize;
     *app = loaded;
     app.rebuild_preview();
     Ok(())

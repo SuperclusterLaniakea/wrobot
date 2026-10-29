@@ -44,7 +44,8 @@ pub use config::{MachineConfig, Firmware, PenMode};
 pub use error::{Result, WError};
 pub use font::{BuiltinFont, FontStack, StrokeFont};
 pub use gcode::{
-    decimate, decimate_polylines, generate, gcode_xy_bounds, GcodeOptions, DEFAULT_MIN_STEP,
+    decimate, decimate_polylines, estimate_seconds, generate, gcode_xy_bounds, move_seconds, plan,
+    GcodeOptions, GcodePlan, DEFAULT_MIN_STEP,
 };
 pub use pdf::to_pdf;
 pub use pdfimport::{
@@ -54,7 +55,7 @@ pub use pdfimport::{
 pub use layout::{layout_document, layout_item, LayoutOptions, Placement};
 pub use render::{
     bounds_all, cross_grid, fit_to_page, grid, optimize_path_order, optimize_path_order_from,
-    path_travel, rect, segment, total_length, Polyline,
+    order_paths, path_travel, rect, segment, total_length, PathOrder, Polyline,
 };
 pub use svg::to_svg;
 pub use dxf::{import_dxf, DxfError};

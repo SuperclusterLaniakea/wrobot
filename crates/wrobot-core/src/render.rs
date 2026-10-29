@@ -3,6 +3,7 @@
 use crate::font::FontStack;
 use crate::layout::Placement;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 
 /// 一条连续笔迹（落笔→抬笔之间）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -442,6 +443,325 @@ pub fn optimize_path_order_from(paths: Vec<Polyline>, start: (f64, f64)) -> Vec<
     orient_sequence(&strokes, &order, start)
 }
 
+/// G-code 路径优化方式（只改顺序与起笔端，不增删笔迹）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathOrder {
+    /// 保持生成顺序。
+    #[default]
+    Keep,
+    /// 蛇形扫描：按笔迹的主要走向分成条带，条带间来回走。
+    Serpentine,
+    /// 全局最近邻（网格加速，适合几千到十几万条笔迹）。
+    Nearest,
+    /// 同向聚类：先把角度相近的笔迹分到一组，再在组内顺序排布。
+    Direction,
+    /// 分区最近邻：先按网格分块，块间最近邻，块内再最近邻。
+    Block,
+}
+
+impl PathOrder {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Serpentine,
+            2 => Self::Nearest,
+            3 => Self::Direction,
+            4 => Self::Block,
+            _ => Self::Keep,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Keep => "保持生成顺序",
+            Self::Serpentine => "蛇形扫描（横/纵自动）",
+            Self::Nearest => "最近邻（全局）",
+            Self::Direction => "同向聚类（按笔向分组）",
+            Self::Block => "分区最近邻（网格）",
+        }
+    }
+}
+
+fn cell_of(p: (f64, f64), cell: f64) -> (i32, i32) {
+    ((p.0 / cell).floor() as i32, (p.1 / cell).floor() as i32)
+}
+
+fn mid_of(s: &Stroke) -> (f64, f64) {
+    ((s.a.0 + s.b.0) * 0.5, (s.a.1 + s.b.1) * 0.5)
+}
+
+/// 端点网格索引：一条笔迹的起点和终点都登记进去，找最近的下一笔时
+/// 从当前笔尖所在格向外一圈圈找，避免 O(n²) 全表扫描。
+struct EndGrid {
+    cell: f64,
+    map: HashMap<(i32, i32), Vec<usize>>,
+}
+
+impl EndGrid {
+    fn new(strokes: &[Stroke], subset: &[usize], cell: f64) -> Self {
+        let mut map: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for &i in subset {
+            let s = &strokes[i];
+            map.entry(cell_of(s.a, cell)).or_default().push(i);
+            let cb = cell_of(s.b, cell);
+            let ca = cell_of(s.a, cell);
+            if cb != ca {
+                map.entry(cb).or_default().push(i);
+            }
+        }
+        EndGrid { cell, map }
+    }
+
+    /// 返回 `(笔迹下标, 是否反向)`。
+    fn nearest(&self, strokes: &[Stroke], used: &[bool], cur: (f64, f64)) -> Option<(usize, bool)> {
+        let (cx, cy) = cell_of(cur, self.cell);
+        let mut best: Option<(usize, bool, f64)> = None;
+        let mut found_ring = usize::MAX;
+        for r in 0..=240usize {
+            for dx in -(r as i32)..=(r as i32) {
+                for dy in -(r as i32)..=(r as i32) {
+                    if dx.abs().max(dy.abs()) != r as i32 {
+                        continue;
+                    }
+                    let Some(list) = self.map.get(&(cx + dx, cy + dy)) else {
+                        continue;
+                    };
+                    for &i in list {
+                        if used[i] {
+                            continue;
+                        }
+                        let s = &strokes[i];
+                        let da = dist_pt(cur, s.a);
+                        let db = dist_pt(cur, s.b);
+                        let (d, rev) = if da <= db { (da, false) } else { (db, true) };
+                        if best.map_or(true, |(_, _, bd)| d < bd) {
+                            best = Some((i, rev, d));
+                        }
+                    }
+                }
+            }
+            if best.is_some() {
+                if found_ring == usize::MAX {
+                    found_ring = r;
+                }
+                // 多扫一圈，避免「第一个非空格里的最远点」输给隔壁格的近点。
+                if r >= found_ring + 1 {
+                    break;
+                }
+            }
+        }
+        best.map(|(i, rev, _)| (i, rev))
+    }
+}
+
+/// 最近邻顺序；返回访问顺序和最终笔尖位置。
+fn nearest_sequence(
+    strokes: &[Stroke],
+    subset: &[usize],
+    start: (f64, f64),
+) -> (Vec<usize>, (f64, f64)) {
+    let mut used = vec![false; strokes.len()];
+    let grid = EndGrid::new(strokes, subset, 8.0);
+    let mut order = Vec::with_capacity(subset.len());
+    let mut cur = start;
+    for _ in 0..subset.len() {
+        let Some((i, rev)) = grid.nearest(strokes, &used, cur) else {
+            break;
+        };
+        used[i] = true;
+        order.push(i);
+        cur = if rev { strokes[i].a } else { strokes[i].b };
+    }
+    (order, cur)
+}
+
+/// 蛇形扫描：按笔迹主走向切成约 20 条带，带内沿长边排序，带间交替方向。
+fn serpentine_sequence(strokes: &[Stroke], subset: &[usize]) -> Vec<usize> {
+    let (mut sx, mut sy) = (0.0f64, 0.0f64);
+    for &i in subset {
+        let s = &strokes[i];
+        sx += (s.b.0 - s.a.0).abs() * s.len.max(1e-6);
+        sy += (s.b.1 - s.a.1).abs() * s.len.max(1e-6);
+    }
+    // 横线多 → 按行（y）分带、带内按 x 走；竖线多则反过来。
+    let rows = sx >= sy;
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &i in subset {
+        let m = mid_of(&strokes[i]);
+        let p = if rows { m.1 } else { m.0 };
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    let band = ((hi - lo).max(1.0) / 20.0).clamp(5.0, 40.0);
+    let mut groups: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    for &i in subset {
+        let m = mid_of(&strokes[i]);
+        let p = if rows { m.1 } else { m.0 };
+        let key = (((p - lo) / band).floor() as i32).min(i32::MAX - 1);
+        groups.entry(key).or_default().push(i);
+    }
+    let mut out = Vec::with_capacity(subset.len());
+    for (k, (_, mut list)) in groups.into_iter().enumerate() {
+        list.sort_by(|&i, &j| {
+            let a = mid_of(&strokes[i]);
+            let b = mid_of(&strokes[j]);
+            let (pa, pb) = if rows { (a.0, b.0) } else { (a.1, b.1) };
+            pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if k % 2 == 1 {
+            list.reverse();
+        }
+        out.extend(list);
+    }
+    out
+}
+
+fn angle_of(s: &Stroke) -> f64 {
+    let a = (s.b.1 - s.a.1).atan2(s.b.0 - s.a.0);
+    if a < 0.0 {
+        a + std::f64::consts::PI
+    } else {
+        a
+    }
+}
+
+/// 同向聚类：按 15° 分桶，桶按离笔尖远近依次处理，桶内沿方向投影排序。
+fn direction_sequence(strokes: &[Stroke], subset: &[usize], start: (f64, f64)) -> Vec<usize> {
+    const BINS: usize = 12;
+    let mut bins: Vec<Vec<usize>> = vec![Vec::new(); BINS];
+    for &i in subset {
+        let b = ((angle_of(&strokes[i]) / std::f64::consts::PI * BINS as f64) as usize).min(BINS - 1);
+        bins[b].push(i);
+    }
+    let mut remaining: Vec<usize> = (0..BINS).filter(|&b| !bins[b].is_empty()).collect();
+    let mut out = Vec::with_capacity(subset.len());
+    let mut cur = start;
+    while !remaining.is_empty() {
+        let centroid = |b: usize| -> (f64, f64) {
+            let list = &bins[b];
+            let mut sx = 0.0;
+            let mut sy = 0.0;
+            for &i in list {
+                let m = mid_of(&strokes[i]);
+                sx += m.0;
+                sy += m.1;
+            }
+            (sx / list.len() as f64, sy / list.len() as f64)
+        };
+        let pick = *remaining
+            .iter()
+            .min_by(|&&a, &&b| {
+                dist_pt(cur, centroid(a))
+                    .partial_cmp(&dist_pt(cur, centroid(b)))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap();
+        remaining.retain(|&b| b != pick);
+        let angle = (pick as f64 + 0.5) / BINS as f64 * std::f64::consts::PI;
+        let dir = (angle.cos(), angle.sin());
+        let mut list = std::mem::take(&mut bins[pick]);
+        let proj = |i: usize| {
+            let m = mid_of(&strokes[i]);
+            m.0 * dir.0 + m.1 * dir.1
+        };
+        list.sort_by(|&i, &j| {
+            proj(i)
+                .partial_cmp(&proj(j))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let first = mid_of(&strokes[list[0]]);
+        let last = mid_of(&strokes[*list.last().unwrap()]);
+        if dist_pt(cur, last) < dist_pt(cur, first) {
+            list.reverse();
+        }
+        cur = mid_of(&strokes[*list.last().unwrap()]);
+        out.extend(list);
+    }
+    out
+}
+
+/// 分区最近邻：50mm 网格分块，块间最近邻，块内再最近邻。
+fn block_sequence(
+    strokes: &[Stroke],
+    subset: &[usize],
+    start: (f64, f64),
+    page_w: f64,
+    page_h: f64,
+) -> Vec<usize> {
+    let cell = (page_w.max(page_h) / 8.0).clamp(25.0, 60.0);
+    let mut groups: BTreeMap<(i32, i32), Vec<usize>> = BTreeMap::new();
+    for &i in subset {
+        let m = mid_of(&strokes[i]);
+        groups.entry(cell_of(m, cell)).or_default().push(i);
+    }
+    let mut remaining: Vec<((i32, i32), Vec<usize>)> = groups.into_iter().collect();
+    let mut out = Vec::with_capacity(subset.len());
+    let mut cur = start;
+    while !remaining.is_empty() {
+        let center = |list: &[usize]| -> (f64, f64) {
+            let mut sx = 0.0;
+            let mut sy = 0.0;
+            for &i in list {
+                let m = mid_of(&strokes[i]);
+                sx += m.0;
+                sy += m.1;
+            }
+            (sx / list.len() as f64, sy / list.len() as f64)
+        };
+        let pick = remaining
+            .iter()
+            .enumerate()
+            .min_by(|(_, (_, a)), (_, (_, b))| {
+                dist_pt(cur, center(a))
+                    .partial_cmp(&dist_pt(cur, center(b)))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(k, _)| k)
+            .unwrap();
+        let (_, list) = remaining.swap_remove(pick);
+        let (seq, end) = nearest_sequence(strokes, &list, cur);
+        out.extend(seq);
+        cur = end;
+    }
+    out
+}
+
+/// 按指定方式重排笔迹（并就近决定起笔端），让空移尽量短。
+///
+/// 只调整**顺序与方向**：笔迹数量、点数、墨线长度都不变。
+pub fn order_paths(
+    paths: Vec<Polyline>,
+    order: PathOrder,
+    page_w: f64,
+    page_h: f64,
+) -> Vec<Polyline> {
+    if order == PathOrder::Keep {
+        return paths;
+    }
+    let strokes: Vec<Stroke> = paths
+        .into_iter()
+        .filter(|p| p.len() >= 2)
+        .map(|poly| {
+            let a = poly.pts[0];
+            let b = *poly.pts.last().unwrap();
+            let len = poly.length();
+            Stroke { poly, a, b, len }
+        })
+        .collect();
+    let n = strokes.len();
+    if n < 2 {
+        return strokes.into_iter().map(|s| s.poly).collect();
+    }
+    let subset: Vec<usize> = (0..n).collect();
+    let seq = match order {
+        PathOrder::Keep => subset,
+        PathOrder::Serpentine => serpentine_sequence(&strokes, &subset),
+        PathOrder::Nearest => nearest_sequence(&strokes, &subset, (0.0, 0.0)).0,
+        PathOrder::Direction => direction_sequence(&strokes, &subset, (0.0, 0.0)),
+        PathOrder::Block => block_sequence(&strokes, &subset, (0.0, 0.0), page_w, page_h),
+    };
+    orient_sequence(&strokes, &seq, (0.0, 0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +843,51 @@ mod tests {
         assert_eq!(out.len(), 20);
         // 逐行跳回首端 ≈ 19×30=570mm 空移；蛇形后 ≈ 19mm —— 差一个数量级以上
         assert!(t1 * 5.0 < t0, "空移应数量级下降：before={t0} after={t1}");
+    }
+
+    /// 四种可扩展排序（供「开始绘制」时选择）都必须守恒笔迹，并把空移压下来。
+    #[test]
+    fn scalable_orders_preserve_and_shorten() {
+        // 20 行 × 6 段短横线：模拟图片排线的真实量级与形态。
+        let mut paths = Vec::new();
+        for y in 0..20 {
+            for k in 0..6 {
+                let x = k as f64 * 5.0;
+                paths.push(Polyline::new(vec![(x, y as f64), (x + 3.0, y as f64)]));
+            }
+        }
+        let total = total_length(&paths);
+        let idle = |p: &[Polyline]| path_travel(p, (0.0, 0.0)) - total_length(p);
+        let base = idle(&paths);
+        for order in [
+            PathOrder::Serpentine,
+            PathOrder::Nearest,
+            PathOrder::Direction,
+            PathOrder::Block,
+        ] {
+            let out = order_paths(paths.clone(), order, 40.0, 30.0);
+            assert_eq!(out.len(), paths.len(), "{order:?} 丢了笔迹");
+            assert!(
+                (total_length(&out) - total).abs() < 1e-6,
+                "{order:?} 改了墨迹长度"
+            );
+            assert!(
+                idle(&out) < base * 0.6,
+                "{order:?} 空移没降下来：{} vs {base}",
+                idle(&out)
+            );
+        }
+    }
+
+    /// Keep 必须原样返回（连笔迹对象一起），避免无意改动生成顺序。
+    #[test]
+    fn keep_order_is_identity() {
+        let input = vec![
+            Polyline::new(vec![(5.0, 5.0), (6.0, 5.0)]),
+            Polyline::new(vec![(0.0, 0.0), (0.0, 1.0)]),
+        ];
+        let out = order_paths(input.clone(), PathOrder::Keep, 10.0, 10.0);
+        assert_eq!(out[0].pts, input[0].pts);
+        assert_eq!(out[1].pts, input[1].pts);
     }
 }

@@ -6,7 +6,7 @@ use std::path::Path;
 use wrobot_core::doc::{ContentFormat, Document, Item, PageInfo};
 use wrobot_core::font::{BuiltinFont, StrokeFont};
 use wrobot_core::render::{dashed_rect, rect, Polyline};
-use wrobot_core::{Firmware, GcodeOptions, LayoutOptions, PenMode};
+use wrobot_core::{Firmware, GcodeOptions, LayoutOptions, PathOrder, PenMode};
 
 use crate::device::DeviceController;
 use crate::fontmgr::FontManager;
@@ -140,35 +140,44 @@ pub enum ImgDraw {
     CrossHatch = 5,
     /// 网点：按灰度疏密生成半调网点
     Halftone = 6,
-    /// 素描原稿：沿原稿每一笔的墨脊逐笔追踪，穿过交叉点不串线，按明暗分层落笔
+    /// 旧存档兼容：这三种分层画法已并入「素描笔触」，不再出现在下拉框里。
+    /// 保留判别值是为了能读回旧工程，加载后由 [`ImgDraw::normalized`] 归一。
     SketchOriginal = 7,
-    /// 素描调子：把明暗量化成多层，亮部留白，暗部叠交叉排线，轮廓单独加重
     SketchHatch = 8,
-    /// 分区重绘：按深度分层、细分块定方向，浅层先铺、深层后叠，逐层压暗
     RegionRedraw = 9,
     /// 素描笔触：残差驱动短直线，暗部自动加密，方向沿轮廓或原稿笔触
     StrokeSketch = 10,
 }
 
 impl ImgDraw {
-    pub fn names() -> &'static [&'static str] {
+    /// 下拉框里可选的画法（按绘制序号排列）。
+    pub fn active() -> &'static [ImgDraw] {
         &[
-            "线框（边缘影线）",
-            "素描（影线）",
-            "高效（连续笔画）",
-            "中心线（骨架）",
-            "描边（等值轮廓）",
-            "交叉排线（明暗）",
-            "网点（半调）",
-            "素描原稿",
-            "素描调子（分层排线）",
-            "分区重绘（深度分层）",
-            "素描笔触（融合布线）",
+            ImgDraw::Wire,
+            ImgDraw::Sketch,
+            ImgDraw::Continuous,
+            ImgDraw::Centerline,
+            ImgDraw::Contour,
+            ImgDraw::CrossHatch,
+            ImgDraw::Halftone,
+            ImgDraw::StrokeSketch,
         ]
     }
 
     pub fn name(self) -> &'static str {
-        Self::names()[self as usize]
+        match self {
+            ImgDraw::Wire => "线框（边缘影线）",
+            ImgDraw::Sketch => "素描（影线）",
+            ImgDraw::Continuous => "高效（连续笔画）",
+            ImgDraw::Centerline => "中心线（骨架）",
+            ImgDraw::Contour => "描边（等值轮廓）",
+            ImgDraw::CrossHatch => "交叉排线（明暗）",
+            ImgDraw::Halftone => "网点（半调）",
+            ImgDraw::SketchOriginal | ImgDraw::SketchHatch | ImgDraw::RegionRedraw => {
+                ImgDraw::StrokeSketch.name()
+            }
+            ImgDraw::StrokeSketch => "素描笔触（融合布线）",
+        }
     }
 
     /// 当前模式的一句话说明（面板上直接显示，避免用户猜参数含义）。
@@ -181,20 +190,8 @@ impl ImgDraw {
             ImgDraw::Contour => "只画明暗交界的等值轮廓线，画面最干净，适合简笔画。",
             ImgDraw::CrossHatch => "主方向影线打底，暗部再叠一层垂直排线，明暗层次更丰富。",
             ImgDraw::Halftone => "按灰度生成大小不一的网点，适合照片/版画风格；网点越多越慢。",
-            ImgDraw::SketchOriginal => {
-                "逐笔还原原稿，但按**明暗**取舍：亮部留白、中间调稀疏、暗部排满，\
-                 轮廓/结构线自动加重。素描的明暗是靠线条疏密表现的，不是把原稿每根线\
-                 都描一遍。适合铅笔素描/速写草稿。"
-            }
-            ImgDraw::SketchHatch => {
-                "把明暗翻译成排线：亮部留白，中间调一层单向稀排线，越暗叠越多层\
-                 交叉排线；轮廓再用梯度单独提一遍重线。同一支笔靠疏密表现灰阶，\
-                 适合照片、铅笔素描和成片暗部。"
-            }
-            ImgDraw::RegionRedraw => {
-                "先量出画面里每一小片的深度层（约 5 层），再把每层切成细块单独定\
-                 排线方向：浅层用浅铅笔先铺，深层用深铅笔逐层叠加，最后压轮廓。\
-                 比调子模式更贴原稿的局部走向，适合铅笔素描、人像。"
+            ImgDraw::SketchOriginal | ImgDraw::SketchHatch | ImgDraw::RegionRedraw => {
+                ImgDraw::StrokeSketch.hint()
             }
             ImgDraw::StrokeSketch => {
                 "按真实素描的工序走：先量每一小块还差多少墨，再用**短直线段**去补。\
@@ -204,7 +201,17 @@ impl ImgDraw {
         }
     }
 
-    /// 由下拉序号构造；越界时退回「素描」（保留旧存档兼容）。
+    /// 旧工程里的三种分层排线已并入「素描笔触」。
+    pub fn normalized(self) -> Self {
+        match self {
+            ImgDraw::SketchOriginal | ImgDraw::SketchHatch | ImgDraw::RegionRedraw => {
+                ImgDraw::StrokeSketch
+            }
+            other => other,
+        }
+    }
+
+    /// 由下拉序号构造；7/8/9 归一为素描笔触，越界退回「素描」。
     pub fn from_usize(i: usize) -> Self {
         match i {
             0 => ImgDraw::Wire,
@@ -214,10 +221,7 @@ impl ImgDraw {
             4 => ImgDraw::Contour,
             5 => ImgDraw::CrossHatch,
             6 => ImgDraw::Halftone,
-            7 => ImgDraw::SketchOriginal,
-            8 => ImgDraw::SketchHatch,
-            9 => ImgDraw::RegionRedraw,
-            10 => ImgDraw::StrokeSketch,
+            7..=10 => ImgDraw::StrokeSketch,
             _ => ImgDraw::Sketch,
         }
     }
@@ -228,7 +232,7 @@ impl ImgDraw {
 /// 写字机没有笔压，但可以换笔。HB、2B、4B、8B 或 0.25/0.5/1.0mm 的针管笔
 /// 能压出的最深处不同——把明暗带按这个值分给不同的笔，黑色才真正黑得下去；
 /// 只让一支 HB 靠排线密度硬撑，暗部永远是一层灰。
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PenSpec {
     /// 界面显示名（如「2B 0.5」）
     pub name: String,
@@ -256,51 +260,101 @@ impl PenSpec {
     }
 }
 
-/// 默认四支笔：从浅到深。
+/// 随形短笔触（0.20 版）的默认四支笔：从浅到深。
 ///
-/// 真实铅笔换的是软硬（石墨浓度），不是笔尖粗细：一支削好的 8B 照样能画出
-/// 0.3mm 的线。原稿实测的发丝、睫毛都只有 0.2~0.4mm，上一版 0.7mm 的 8B
-/// 落在纸上仍是一根根粗黑杠。现在线宽收到 0.20~0.40mm：原稿的浅排线只有
-/// 1px（300mm 高时约 0.13mm），0.28mm 的 HB 叠上相邻几根就糊成一条粗带，
-/// 和「细而密」正好相反。明暗仍交给石墨浓度，密度交给更细的排线间距。
+/// 这组线宽/浓度是 0.20 版实拍调出来的：0.28mm 的 HB 铺浅调，0.38/0.46/0.56
+/// 依次收中调、暗调、发芯。随形笔触按「缺口处落 1~8mm 短段」反复补墨，
+/// 每支笔的覆盖率直接决定下一遍还差多少；换成更细的笔（0.20~0.40）时，
+/// 浅笔要补的缺口永远补不满，几乎全部笔迹都堆到 HB 上，脸就糊成一片。
 pub fn default_pens() -> Vec<PenSpec> {
     vec![
         PenSpec {
-            name: "HB 0.20".to_string(),
-            width_mm: 0.20,
-            darkness: 0.42,
-            color: [150, 150, 150],
+            name: "HB 0.28".to_string(),
+            width_mm: 0.28,
+            darkness: 0.45,
+            color: [172, 172, 172],
             offset_mm: [0.0, 0.0],
             on: true,
         },
         PenSpec {
-            name: "2B 0.26".to_string(),
-            width_mm: 0.26,
-            darkness: 0.62,
-            color: [105, 105, 105],
+            name: "2B 0.38".to_string(),
+            width_mm: 0.38,
+            darkness: 0.65,
+            color: [118, 118, 118],
             offset_mm: [0.0, 0.0],
             on: true,
         },
         PenSpec {
-            name: "4B 0.32".to_string(),
-            width_mm: 0.32,
-            darkness: 0.80,
-            color: [62, 62, 62],
+            name: "4B 0.46".to_string(),
+            width_mm: 0.46,
+            darkness: 0.82,
+            color: [70, 70, 70],
             offset_mm: [0.0, 0.0],
             on: true,
         },
         PenSpec {
-            name: "8B 0.40".to_string(),
-            width_mm: 0.40,
-            darkness: 0.93,
-            color: [25, 25, 25],
+            name: "8B 0.56".to_string(),
+            width_mm: 0.56,
+            darkness: 0.95,
+            color: [30, 30, 30],
             offset_mm: [0.0, 0.0],
             on: true,
         },
     ]
 }
 
-/// 多笔绘制里「文字 / 边框」默认用第二支笔（2B 0.5）——比 HB 更清楚，
+/// 交叉排线基底（0.25 版）的默认笔组：更细、更浅。
+///
+/// 排线按调子算间距，一支笔的线越细，同一块调子要排的根数越多、看起来越像
+/// 铅笔的细密排线；0.28~0.56 的粗笔在交叉排线里会直接变成硬朗的马克笔。
+/// 所以两档笔触风格各带自己的默认笔组，切换风格时只在笔组仍是默认值时才换。
+pub fn crosshatch_pens() -> Vec<PenSpec> {
+    vec![
+        PenSpec {
+            name: "HB 0.20".to_string(),
+            width_mm: 0.20,
+            darkness: 0.30,
+            color: [172, 172, 172],
+            offset_mm: [0.0, 0.0],
+            on: true,
+        },
+        PenSpec {
+            name: "2B 0.26".to_string(),
+            width_mm: 0.26,
+            darkness: 0.50,
+            color: [118, 118, 118],
+            offset_mm: [0.0, 0.0],
+            on: true,
+        },
+        PenSpec {
+            name: "4B 0.32".to_string(),
+            width_mm: 0.32,
+            darkness: 0.72,
+            color: [70, 70, 70],
+            offset_mm: [0.0, 0.0],
+            on: true,
+        },
+        PenSpec {
+            name: "8B 0.40".to_string(),
+            width_mm: 0.40,
+            darkness: 0.90,
+            color: [30, 30, 30],
+            offset_mm: [0.0, 0.0],
+            on: true,
+        },
+    ]
+}
+
+/// 切换笔触风格时要用的默认笔组。
+pub fn default_pens_for_style(style: u8) -> Vec<PenSpec> {
+    if style == 1 {
+        default_pens()
+    } else {
+        crosshatch_pens()
+    }
+}
+
+/// 多笔绘制里「文字 / 边框」默认用第二支笔（2B）——比 HB 更清楚，
 /// 又不至于像 8B 那样把字压得发糊。
 fn default_main_pen() -> usize {
     1
@@ -398,6 +452,12 @@ pub struct ImageObject {
     /// **素描笔触模式**：走向参考（0 轮廓 / 1 原稿 / 2 混合）。
     #[serde(default = "default_stroke_follow")]
     pub stroke_follow: u8,
+    /// **素描笔触模式**：落笔风格（0 交叉排线基底 / 1 随形短笔触）。
+    #[serde(default)]
+    pub sketch_style: u8,
+    /// **素描笔触模式**：工作分辨率上限（长边像素，0 = 原图不缩放）。
+    #[serde(default = "default_img_max_side")]
+    pub max_side_px: u32,
     /// **多笔分层**：把明暗带分给不同的笔（HB/2B/4B/8B），分别出图、换笔绘制。
     #[serde(default)]
     pub multi_pen: bool,
@@ -452,6 +512,8 @@ impl ImageObject {
             self.region_block_mm,
             self.stroke_len_mm,
             self.stroke_follow as f64,
+            self.sketch_style as f64,
+            self.max_side_px as f64,
         ] {
             h = h.wrapping_mul(31).wrapping_add((v * 1000.0) as u64);
         }
@@ -773,9 +835,10 @@ fn default_sketch_pen() -> f64 {
     0.5
 }
 
-/// 素描调子默认 6 层：4 层以下暗部层次会明显断层，8 层以上同一支笔画不出更细的灰。
+/// 排线默认 8 层：四支笔各两个方向。少于 6 层 4B/8B 落不下去，暗部会断层；
+/// 再多的层只会在同一族线上重复加密，边际收益很低。
 fn default_hatch_levels() -> u32 {
-    6
+    8
 }
 
 /// 素描调子默认 35°：最接近人手自然的斜向排线，又能和 90° 的轮廓区分开。
@@ -798,6 +861,79 @@ fn default_stroke_len_mm() -> f64 {
 /// 默认「混合」：先沿原稿笔触/轮廓，暗部再叠交叉层，兼顾形与调子。
 fn default_stroke_follow() -> u8 {
     2
+}
+
+/// 默认落笔风格「随形短笔触」：逐遍补残留墨，线条跟着形体走，
+/// 最接近手绘原稿的质感（0.20 的流水线）。交叉排线基底保留为可选项。
+fn default_sketch_style() -> u8 {
+    1
+}
+
+/// 默认工作分辨率上限（长边像素）。0 = 按原图，不缩放。
+///
+/// 3600 能完整容纳常见的 2400×3600 扫描稿；再大的照片交给导入时的
+/// 「精细度」选择，由用户决定是压到 3600 还是保留原分辨率。
+fn default_img_max_side() -> u32 {
+    3600
+}
+
+/// 导入图片的默认参数（界面与无头验收工具共用的唯一来源）。
+///
+/// `AppState::new` 的 `img_*` 字段和 `dump_sketch_preview` 都从这里取值，
+/// 保证「测试出的图」和「程序导入的图」用的是同一套默认阈值、层数、笔组。
+pub fn default_import_opts(draw_type: usize) -> crate::io::ImageGenOpts {
+    let pens = default_pens();
+    let draw = ImgDraw::from_usize(draw_type);
+    let mut opts = crate::io::ImageGenOpts {
+        // 200×300 纸面留 10mm 边的 3:4 竖图高度。成品越大，笔宽相对越细，
+        // 0.20 版的短笔触质感正是在这个尺度上定下来的（120mm 会粗一倍）。
+        target_h_mm: 240.0,
+        step_px: 3,
+        threshold: 0.55,
+        edge_threshold: 0.25,
+        invert: false,
+        draw_type,
+        crop: (0.0, 0.0, 1.0, 1.0),
+        scan_angle: 0,
+        merge_gap_px: 8,
+        order_mode: 0,
+        block_px: 40,
+        sketch_pressure: 3,
+        sketch_jitter: 0.12,
+        sketch_pen: 0.5,
+        hatch_levels: default_hatch_levels(),
+        hatch_angle: 35.0,
+        region_block_mm: 2.5,
+        stroke_len_mm: 3.2,
+        stroke_follow: 2,
+        sketch_style: default_sketch_style(),
+        max_side_px: default_img_max_side(),
+        multi_pen: draw == ImgDraw::StrokeSketch,
+        pens: crate::io::NO_PENS,
+        pen_count: pens.len().min(4) as u8,
+    };
+    for (i, p) in pens.iter().take(4).enumerate() {
+        opts.pens[i] = p.to_hatch();
+    }
+    opts
+}
+
+/// 导入图片前的「尺寸 / 精细度」确认。
+///
+/// 以前导入即按默认高度静默缩放，用户拿到的是被简化过的结果，
+/// 还要回头再调一遍。现在先把原图尺寸、目标尺寸和实际工作分辨率
+/// 摆出来，由用户确认后再生成。
+#[derive(Clone)]
+pub struct PendingImageImport {
+    pub path: std::path::PathBuf,
+    pub background: bool,
+    /// 目标高度（毫米）
+    pub target_h: f64,
+    /// 工作分辨率上限（长边像素，0 = 原图）
+    pub max_side: u32,
+    /// 原图像素尺寸
+    pub src_w: u32,
+    pub src_h: u32,
 }
 
 /// 四角定位框默认宽度（毫米）。
@@ -877,6 +1013,21 @@ fn default_min_step() -> f64 {
     wrobot_core::DEFAULT_MIN_STEP
 }
 
+/// 空移快速速度默认 6000mm/min（常见写字机 G0 速度）。
+fn default_rapid_rate() -> f64 {
+    6000.0
+}
+
+/// 加速度默认 500mm/s²（皮带机常见量级，用于加减速估时）。
+fn default_accel() -> f64 {
+    500.0
+}
+
+/// 单行指令吞吐默认 2ms（115200 波特率下一个短指令 + 固件解析）。
+fn default_line_ms() -> f64 {
+    2.0
+}
+
 /// 写字机蓝牙模块的默认广播名（奎享雕刻出厂名）。
 fn default_bt_name() -> String {
     "BtWriter".to_string()
@@ -910,6 +1061,40 @@ pub struct PenJob {
     pub name: String,
     pub gcode: String,
     pub paths: Vec<Polyline>,
+}
+
+/// 后台线程计算一份方案时的一组输入（单笔 = 一组；多笔 = 每支笔一组）。
+struct PlanGroupIn {
+    /// `(笔下标, 笔名)`；`None` 表示单笔内容。
+    pen: Option<(usize, String)>,
+    /// 写在 G-code 前面的注释（分页/多笔信息）。
+    header: String,
+    paths: Vec<Polyline>,
+    opts: GcodeOptions,
+}
+
+/// 「开始绘制」前的一次完整计算（排序 + 抽稀 + G-code + 代码量 + 预估耗时）。
+///
+/// **只有用户点「开始绘制」才会计算**：改内容只重建预览，不会实时生成 G-code。
+#[derive(Clone)]
+pub struct RunPlan {
+    /// 单笔内容为完整 G-code；多笔内容为各支笔 G-code 拼接（用于预览与边界检查）。
+    pub gcode: String,
+    /// 排序后的笔迹（供运行进度页显示）。
+    pub paths: Vec<Polyline>,
+    /// 多笔内容的分笔任务（单笔时为空）。
+    pub pen_jobs: Vec<PenJob>,
+    /// 分页绘制时的页码。
+    pub tile_page: Option<usize>,
+    pub strokes: usize,
+    pub points: usize,
+    pub lines: usize,
+    pub bytes: usize,
+    pub ink_mm: f64,
+    pub travel_mm: f64,
+    pub seconds: f64,
+    /// 计算时的参数指纹：与当前参数不一致即说明方案已过期。
+    pub sig: u64,
 }
 
 /// 「不属于任何一支笔」的笔迹（文字、边框、四角标记、单笔图片）。
@@ -1139,6 +1324,12 @@ pub struct AppState {
     /// 默认素描笔触走向参考（0 轮廓 / 1 原稿 / 2 混合）
     #[serde(default = "default_stroke_follow")]
     pub img_stroke_follow: u8,
+    /// 默认素描笔触落笔风格（0 交叉排线基底 / 1 随形短笔触）
+    #[serde(default = "default_sketch_style")]
+    pub img_sketch_style: u8,
+    /// 默认导入工作分辨率上限（长边像素，0 = 原图）
+    #[serde(default = "default_img_max_side")]
+    pub img_max_side: u32,
 
     // —— 多笔分层 ——
     /// 当前机器上的笔组（亮 → 暗）。换笔绘制时按这个顺序一支一支画。
@@ -1204,6 +1395,20 @@ pub struct AppState {
     #[serde(default = "default_min_step")]
     pub min_step_mm: f64,
 
+    /// **默认路径优化方式**（见 [`PathOrder`]）：0 保持原序 / 1 蛇形 / 2 最近邻 /
+    /// 3 同向聚类 / 4 分区。开始绘制前可在计算窗口里临时改选并记住。
+    #[serde(default)]
+    pub path_order_sel: u8,
+    /// 空移（G0）快速速度（mm/min），用于耗时估算。
+    #[serde(default = "default_rapid_rate")]
+    pub rapid_rate: f64,
+    /// 加速度（mm/s²）：短笔触跑不到设定速度，估时必须计入加减速。
+    #[serde(default = "default_accel")]
+    pub accel_mm_s2: f64,
+    /// 单行 G-code 的串口/固件处理开销（毫秒），用于耗时估算。
+    #[serde(default = "default_line_ms")]
+    pub line_ms: f64,
+
     /// 画布上是否画出 **XY 方向箭头**（蓝=X，绿=Y）。
     #[serde(default = "default_true")]
     pub axes_on: bool,
@@ -1214,6 +1419,12 @@ pub struct AppState {
     /// 页面外侧**标尺**（顶部 + 左侧毫米刻度），帮助把内容放到精确位置。
     #[serde(default = "default_ruler_on")]
     pub ruler_on: bool,
+    /// 是否显示左侧导航/输出图层栏（视图菜单可隐藏，扩大画布）。
+    #[serde(default = "default_true")]
+    pub show_left: bool,
+    /// 是否显示右侧参数栏（视图菜单可隐藏，扩大画布）。
+    #[serde(default = "default_true")]
+    pub show_right: bool,
     /// **页面网格开关**：关闭时预览（编辑页/进度页）不画任何网格线；
     /// 打开后显示 10mm 基准网格，并按下方行/列数叠加浅色等分参考线。
     #[serde(default = "default_grid_overlay")]
@@ -1230,6 +1441,9 @@ pub struct AppState {
     /// 就得定时问一句。关掉可以省链路带宽。
     #[serde(default)]
     pub status_poll_ms: u64,
+    /// 待确认的图片导入（尺寸 / 精细度窗口），确认后才真正生成笔迹。
+    #[serde(skip)]
+    pub pending_import: Option<PendingImageImport>,
     /// 鼠标在页面上的位置（毫米），画布每帧写入，左栏坐标区显示用。
     #[serde(skip)]
     pub cursor_mm: Option<(f64, f64)>,
@@ -1410,6 +1624,24 @@ pub struct AppState {
     pub pen_dispatched_at: Option<std::time::Instant>,
     #[serde(skip)]
     pub gcode_text: String,
+    /// 「绘制前计算」窗口是否打开。
+    #[serde(skip)]
+    pub show_run_plan: bool,
+    /// 窗口里当前选中的路径优化方式（与 `path_order_sel` 同步）。
+    #[serde(skip)]
+    pub run_plan_order: u8,
+    /// 后台是否正在计算方案。
+    #[serde(skip)]
+    pub run_plan_busy: bool,
+    /// 后台计算的接收端（有值说明线程还在跑）。
+    #[serde(skip)]
+    pub run_plan_rx: Option<std::sync::mpsc::Receiver<RunPlan>>,
+    /// 最近一次算好的方案（关闭窗口即丢弃）。
+    #[serde(skip)]
+    pub run_plan: Option<RunPlan>,
+    /// 边界确认窗口里待执行的、已排好序的笔迹。
+    #[serde(skip)]
+    pub pending_run_paths: Option<Vec<Polyline>>,
     #[serde(skip)]
     pub status: String,
 }
@@ -1434,6 +1666,7 @@ impl AppState {
         let default_font = fonts
             .first_name()
             .unwrap_or_else(|| BuiltinFont::new().name().to_string());
+        let d = default_import_opts(0);
         let mut s = AppState {
             fonts,
             font_dir,
@@ -1519,25 +1752,27 @@ impl AppState {
             pdf_pages: 0,
             pdf_page: 1,
             pdf_1to1: true,
-            img_target_h: 120.0,
-            img_step: 3,
-            img_thr: 0.55,
-            img_edge: 0.25,
-            img_invert: false,
-            img_draw_type: 0,
-            img_scan_angle: 0,
-            img_merge_gap: 8,
-            img_order_mode: 0,
-            img_block_px: 40,
-            img_sketch_pressure: 3,
-            img_sketch_jitter: 0.12,
-            img_sketch_pen: 0.5,
-            img_hatch_levels: 6,
-            img_hatch_angle: 35.0,
-            img_region_block_mm: 2.5,
-            img_stroke_len_mm: 3.2,
-            img_stroke_follow: 2,
-            pens: default_pens(),
+            img_target_h: d.target_h_mm,
+            img_step: d.step_px,
+            img_thr: d.threshold,
+            img_edge: d.edge_threshold,
+            img_invert: d.invert,
+            img_draw_type: d.draw_type,
+            img_scan_angle: d.scan_angle,
+            img_merge_gap: d.merge_gap_px,
+            img_order_mode: d.order_mode,
+            img_block_px: d.block_px,
+            img_sketch_pressure: d.sketch_pressure,
+            img_sketch_jitter: d.sketch_jitter,
+            img_sketch_pen: d.sketch_pen,
+            img_hatch_levels: d.hatch_levels,
+            img_hatch_angle: d.hatch_angle,
+            img_region_block_mm: d.region_block_mm,
+            img_stroke_len_mm: d.stroke_len_mm,
+            img_stroke_follow: d.stroke_follow,
+            img_sketch_style: d.sketch_style,
+            img_max_side: d.max_side_px,
+            pens: default_pens_for_style(d.sketch_style),
             main_pen: default_main_pen(),
             preview_pen_mm: 0.5,
             bounds_check: true,
@@ -1564,13 +1799,20 @@ impl AppState {
             ebb_servo_speed: 750.0,
             ebb_max_pen: 30000.0,
             min_step_mm: default_min_step(),
+            path_order_sel: 0,
+            rapid_rate: default_rapid_rate(),
+            accel_mm_s2: default_accel(),
+            line_ms: default_line_ms(),
             axes_on: true,
             text_frame_on: true,
             ruler_on: true,
+            show_left: true,
+            show_right: true,
             grid_overlay: false,
             grid_overlay_cols: 10,
             grid_overlay_rows: 14,
             status_poll_ms: 0,
+            pending_import: None,
             cursor_mm: None,
             status_poll_key: (0, usize::MAX),
             jog_speed: default_jog_speed(),
@@ -1639,6 +1881,12 @@ impl AppState {
             pen_seen_running: false,
             pen_dispatched_at: None,
             gcode_text: String::new(),
+            show_run_plan: false,
+            run_plan_order: 0,
+            run_plan_busy: false,
+            run_plan_rx: None,
+            run_plan: None,
+            pending_run_paths: None,
             status: "就绪".to_string(),
             tab: 0,
         };
@@ -2873,6 +3121,8 @@ impl AppState {
     ///
     /// 只有多笔内容、且真的分成了两支以上时才返回 `true`；
     /// 其余情况返回 `false`，调用方照旧走单笔流程。
+    /// 现在界面统一走「绘制前计算 → begin_run_plan」，这个入口保留给回归测试。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_pen_jobs(&mut self) -> bool {
         let jobs = self.build_pen_jobs();
         if jobs.len() < 2 {
@@ -2995,7 +3245,7 @@ impl AppState {
             threshold: img.threshold,
             edge_threshold: img.edge_threshold,
             invert: img.invert,
-            draw_type: img.draw as usize,
+            draw_type: img.draw.normalized() as usize,
             crop: img.crop,
             scan_angle: img.scan_angle,
             merge_gap_px: img.merge_gap_px,
@@ -3009,6 +3259,8 @@ impl AppState {
             region_block_mm: img.region_block_mm,
             stroke_len_mm: img.stroke_len_mm,
             stroke_follow: img.stroke_follow,
+            sketch_style: img.sketch_style,
+            max_side_px: img.max_side_px,
             multi_pen: img.multi_pen && pen_count >= 2,
             pens,
             pen_count,
@@ -3085,23 +3337,60 @@ impl AppState {
         }
     }
 
-    /// 导入一张图片为图片对象（foreground 或 background）。
-    pub fn import_image_file(&mut self, path: &Path, background: bool) -> anyhow::Result<usize> {
-        let data = std::fs::read(path)?;
+    /// 打开「尺寸 / 精细度」确认窗口（只读原图尺寸，不生成笔迹）。
+    pub fn begin_import(&mut self, path: &Path, background: bool) {
+        let dims = std::fs::read(path)
+            .ok()
+            .and_then(|b| {
+                image::ImageReader::new(std::io::Cursor::new(b))
+                    .with_guessed_format()
+                    .ok()?
+                    .into_dimensions()
+                    .ok()
+            });
+        match dims {
+            Some((w, h)) if w > 0 && h > 0 => {
+                self.pending_import = Some(PendingImageImport {
+                    path: path.to_path_buf(),
+                    background,
+                    target_h: self.img_target_h,
+                    max_side: self.img_max_side,
+                    src_w: w,
+                    src_h: h,
+                });
+            }
+            _ => self.status = format!("无法读取图片：{}", path.display()),
+        }
+    }
+
+    /// 按确认窗口里的尺寸 / 精细度导入。
+    pub fn confirm_import(&mut self) -> anyhow::Result<usize> {
+        let p = self
+            .pending_import
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("没有待导入的图片"))?;
+        self.img_target_h = p.target_h;
+        self.img_max_side = p.max_side;
+        self.import_image_file(&p.path, p.background, p.target_h, p.max_side)
+    }
+
+    /// 用当前「默认导入参数」构造生成选项。
+    ///
+    /// 界面导入和无头验收工具都从这里取参数，保证「测试出来的图」和
+    /// 「程序导入的图」走的是同一套默认值，而不是各写一份。
+    pub fn default_import_opts(&self, draw_type: usize) -> crate::io::ImageGenOpts {
         let (pens, pen_count) = self.hatch_pens();
-        let draw = ImgDraw::from_usize(self.img_draw_type);
-        // 素描调子 / 分区重绘 / 素描笔触默认走多笔：这正是导入用户最常要的效果；其他模式仍单笔。
-        let multi_pen = matches!(
-            draw,
-            ImgDraw::SketchHatch | ImgDraw::RegionRedraw | ImgDraw::StrokeSketch
-        ) && pen_count >= 2;
-        let opts = crate::io::ImageGenOpts {
+        let draw = ImgDraw::from_usize(draw_type);
+        // 素描笔触默认走多笔：这正是导入用户最常要的效果；其他模式仍单笔。
+        let multi_pen = draw == ImgDraw::StrokeSketch && pen_count >= 2;
+        crate::io::ImageGenOpts {
             target_h_mm: self.img_target_h,
+            max_side_px: self.img_max_side,
             step_px: self.img_step,
             threshold: self.img_thr,
             edge_threshold: self.img_edge,
             invert: self.img_invert,
-            draw_type: self.img_draw_type,
+            draw_type,
             crop: (0.0, 0.0, 1.0, 1.0),
             scan_angle: self.img_scan_angle,
             merge_gap_px: self.img_merge_gap,
@@ -3115,11 +3404,44 @@ impl AppState {
             region_block_mm: self.img_region_block_mm,
             stroke_len_mm: self.img_stroke_len_mm,
             stroke_follow: self.img_stroke_follow,
+            sketch_style: self.img_sketch_style,
             multi_pen,
             pens,
             pen_count,
-            ..Default::default()
-        };
+        }
+    }
+
+    /// 切换默认笔触风格。笔组还是旧风格的默认值时跟着换；用户自己调过就保留，
+    /// 否则切一下风格就会把手调好的笔组冲掉。
+    ///
+    /// 已经有图片对象时不再换笔组：那会把已导入的图整体重算一遍（笔组是所有
+    /// 图片共用的），用户只是改「下一次导入」的默认风格，不该动现有画面。
+    pub fn set_sketch_style(&mut self, style: u8) {
+        let style = style.min(1);
+        if style == self.img_sketch_style {
+            return;
+        }
+        let old = self.img_sketch_style;
+        self.img_sketch_style = style;
+        if self.pens == default_pens_for_style(old) && self.images.is_empty() {
+            self.pens = default_pens_for_style(style);
+        }
+    }
+
+    /// 导入一张图片为图片对象（foreground 或 background）。
+    pub fn import_image_file(
+        &mut self,
+        path: &Path,
+        background: bool,
+        target_h: f64,
+        max_side: u32,
+    ) -> anyhow::Result<usize> {
+        let data = std::fs::read(path)?;
+        let mut opts = self.default_import_opts(self.img_draw_type);
+        opts.target_h_mm = target_h;
+        opts.max_side_px = max_side;
+        let draw = ImgDraw::from_usize(opts.draw_type);
+        let multi_pen = opts.multi_pen;
         let r = crate::io::image_to_polylines(&data, &opts)?;
         let n = r.polylines.len();
         // 默认放在页面左上角附近，避免与文字完全重叠
@@ -3151,6 +3473,8 @@ impl AppState {
             region_block_mm: self.img_region_block_mm,
             stroke_len_mm: self.img_stroke_len_mm,
             stroke_follow: self.img_stroke_follow,
+            sketch_style: self.img_sketch_style,
+            max_side_px: max_side,
             multi_pen,
             background,
             out: true,
@@ -3239,7 +3563,7 @@ impl AppState {
             self.img_thr,
             self.img_edge,
             self.img_invert,
-            self.img_draw_type,
+            ImgDraw::from_usize(self.img_draw_type) as usize,
         );
         let (scan_angle, merge_gap, order_mode, block_px) = (
             self.img_scan_angle,
@@ -3256,11 +3580,10 @@ impl AppState {
             self.img_region_block_mm,
         );
         let (stroke_len_mm, stroke_follow) = (self.img_stroke_len_mm, self.img_stroke_follow);
+        let sketch_style = self.img_sketch_style;
+        let max_side_px = self.img_max_side;
         let (pens, pen_count) = self.hatch_pens();
-        let multi_pen = matches!(
-            ImgDraw::from_usize(draw_type),
-            ImgDraw::SketchHatch | ImgDraw::RegionRedraw | ImgDraw::StrokeSketch
-        ) && pen_count >= 2;
+        let multi_pen = ImgDraw::from_usize(draw_type) == ImgDraw::StrokeSketch && pen_count >= 2;
         let tag = path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -3289,6 +3612,8 @@ impl AppState {
                 region_block_mm,
                 stroke_len_mm,
                 stroke_follow,
+                sketch_style,
+                max_side_px,
                 multi_pen,
                 pens,
                 pen_count,
@@ -3325,6 +3650,8 @@ impl AppState {
                 region_block_mm,
                 stroke_len_mm,
                 stroke_follow,
+                sketch_style,
+                max_side_px,
                 multi_pen,
                 background: false,
                 out: true,
@@ -3380,6 +3707,8 @@ impl AppState {
                 region_block_mm,
                 stroke_len_mm,
                 stroke_follow,
+                sketch_style,
+                max_side_px,
                 multi_pen: false,
                 background: false,
                 out: true,
@@ -3630,16 +3959,30 @@ impl AppState {
         };
     }
 
-    /// 按当前速度与抬落笔延迟估算运行耗时（秒）。
+    /// 按当前速度、加速度与抬落笔延迟估算运行耗时（秒）。
     ///
-    /// 用空移 + 墨线总行程除以进给速度，再加上每笔的落笔 / 抬笔等待；
-    /// 没有把加减速算进去，实际会略慢一些，用来说明数量级足够。
+    /// 模型与 [`wrobot_core::estimate_seconds`] 一致：空移走快速速度、落笔走进给
+    /// 速度，**按笔迹平均长度计入加减速**（短笔触跑不到设定速度），再加每笔的
+    /// 抬落笔动作和每行指令的吞吐开销。点击「开始绘制」后窗口里给出的是按实际
+    /// G-code 逐行计算的精确值，这里只用于状态栏的即时估算。
     pub fn estimated_seconds(&self) -> f64 {
-        let f = self.feed_rate.max(1.0); // mm/min
-        let motion = self.stats.travel_mm / f * 60.0;
-        let pens = self.stats.strokes as f64;
-        let delays = pens * (self.tool_on_delay + self.tool_off_delay);
-        motion + delays
+        let accel = self.accel_mm_s2.max(1.0);
+        let strokes = self.stats.strokes;
+        let ink = self.stats.ink_mm;
+        let travel = (self.stats.travel_mm - ink).max(0.0);
+        let mut t = wrobot_core::move_seconds(travel, self.rapid_rate, accel);
+        if strokes > 0 {
+            let per_stroke = ink / strokes as f64;
+            t += strokes as f64 * wrobot_core::move_seconds(per_stroke, self.feed_rate, accel);
+        }
+        let pen_action = match self.firmware_sel {
+            2 => 0.12,                              // EBB 舵机
+            _ if self.pen_mode_sel == 1 => 0.18,    // 舵机抬落笔
+            _ => 0.03,                              // Z 轴抬落笔
+        };
+        t += strokes as f64 * (2.0 * pen_action + self.tool_on_delay + self.tool_off_delay);
+        let lines = self.stats.points.saturating_sub(strokes);
+        t + lines as f64 * self.line_ms.max(0.0) / 1000.0
     }
 
     /// 按倍率缩放画布视图（围绕整页适应，1.0~6.0）。
@@ -3678,6 +4021,270 @@ impl AppState {
         let all = self.collect_polylines(self.use_random);
         let gopts = self.gcode_options();
         wrobot_core::generate(&all, &gopts)
+    }
+
+    // ── 绘制前计算（排序 + 代码量 + 预估耗时）────────────────────
+
+    /// 当前参数的指纹：方案算好后再改任何影响 G-code 的参数，这个值就会变，
+    /// 窗口据此提示「方案已过期」。
+    pub fn plan_sig(&self) -> u64 {
+        let mut h = self.path_order_sel as u64;
+        for v in [
+            self.stats.strokes as u64,
+            self.stats.points as u64,
+            (self.stats.ink_mm * 1000.0) as u64,
+            (self.stats.travel_mm * 1000.0) as u64,
+            self.feed_rate as u64,
+            (self.min_step_mm * 1000.0) as u64,
+            self.firmware_sel as u64,
+            self.pen_mode_sel as u64,
+            (self.rapid_rate * 10.0) as u64,
+            (self.accel_mm_s2 * 10.0) as u64,
+            (self.line_ms * 100.0) as u64,
+            self.tile_on as u64,
+            self.tile_page as u64,
+            self.use_random as u64,
+            self.rand_seed,
+            self.multi_pen_active() as u64,
+        ] {
+            h = h.wrapping_mul(1_000_003).wrapping_add(v);
+        }
+        h
+    }
+
+    /// 组装后台计算所需的输入：分页 / 多笔各成一组，单笔内容就是一组。
+    fn plan_groups(&self) -> Vec<PlanGroupIn> {
+        let opts = self.gcode_options();
+        if let Some(layout) = self.tile_on.then(|| self.tile_layout()).flatten() {
+            let page = self.tile_page_clamped();
+            let mut o = opts.clone();
+            o.page_w = layout.width_mm;
+            o.page_h = layout.height_mm;
+            o.use_current_origin = true;
+            let header = format!(
+                "; 大纸张分页：第 {}/{} 页（{} 列 × {} 行，单页 {:.0}×{:.0}mm）\n",
+                page + 1,
+                layout.count(),
+                layout.cols,
+                layout.rows,
+                layout.width_mm,
+                layout.height_mm
+            );
+            let tagged = self.tiled_page_tagged_polylines(page);
+            if tagged.is_empty() {
+                return Vec::new();
+            }
+            if self.multi_pen_active() && self.active_pens().len() >= 2 {
+                return self.split_pens(tagged, o, Some(&header));
+            }
+            let paths = tagged.into_iter().map(|(p, _)| p).collect();
+            return vec![PlanGroupIn {
+                pen: None,
+                header,
+                paths,
+                opts: o,
+            }];
+        }
+        if self.preview.is_empty() {
+            return Vec::new();
+        }
+        if self.multi_pen_active() && self.active_pens().len() >= 2 {
+            let tagged: Vec<(Polyline, u8)> = self
+                .preview
+                .iter()
+                .cloned()
+                .zip(self.preview_pens.iter().copied())
+                .collect();
+            return self.split_pens(tagged, opts, None);
+        }
+        vec![PlanGroupIn {
+            pen: None,
+            header: String::new(),
+            paths: self.preview.clone(),
+            opts,
+        }]
+    }
+
+    /// 按笔分组（与预览里的笔标签一致）。
+    fn split_pens(
+        &self,
+        tagged: Vec<(Polyline, u8)>,
+        opts: GcodeOptions,
+        extra: Option<&str>,
+    ) -> Vec<PlanGroupIn> {
+        let specs = self.active_pens();
+        let main = self.main_pen_idx() as u8;
+        let last = (specs.len() - 1) as u8;
+        let mut groups: std::collections::BTreeMap<u8, Vec<Polyline>> =
+            std::collections::BTreeMap::new();
+        for (pl, tag) in tagged {
+            let pen = if tag == NON_PEN { main } else { tag.min(last) };
+            groups.entry(pen).or_default().push(pl);
+        }
+        let total = groups.len();
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(k, (pen, paths))| {
+                let spec = &specs[pen as usize];
+                let mut header = format!(
+                    "; 多笔绘制 {}/{} · 第 {} 支笔「{}」· 线宽 {:.2}mm · 深度 {:.0}%\n",
+                    k + 1,
+                    total,
+                    pen as usize + 1,
+                    spec.name,
+                    spec.width_mm,
+                    spec.darkness * 100.0
+                );
+                if let Some(h) = extra {
+                    header.push_str(h);
+                }
+                PlanGroupIn {
+                    pen: Some((pen as usize, spec.name.clone())),
+                    header,
+                    paths,
+                    opts: opts.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// 打开「绘制前计算」窗口，并在后台线程算一份方案。
+    ///
+    /// 排序、抽稀、出 G-code、逐行估时都在后台跑：几万条笔迹也不会卡住界面。
+    pub fn start_run_plan(&mut self) {
+        self.show_run_plan = true;
+        self.run_plan_order = self.path_order_sel;
+        self.run_plan = None;
+        self.run_plan_busy = true;
+        self.run_plan_rx = None;
+        let groups = self.plan_groups();
+        if groups.is_empty() {
+            self.run_plan_busy = false;
+            self.status = "当前页面没有可绘制的内容".into();
+            return;
+        }
+        let sig = self.plan_sig();
+        let tile_page = self.tile_on.then(|| self.tile_page_clamped());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = RunPlan {
+                gcode: String::new(),
+                paths: Vec::new(),
+                pen_jobs: Vec::new(),
+                tile_page,
+                strokes: 0,
+                points: 0,
+                lines: 0,
+                bytes: 0,
+                ink_mm: 0.0,
+                travel_mm: 0.0,
+                seconds: 0.0,
+                sig,
+            };
+            for g in groups {
+                let p = wrobot_core::plan(g.paths, &g.opts);
+                let gcode = format!("{}{}", g.header, p.gcode);
+                out.strokes += p.strokes;
+                out.points += p.paths.iter().map(|x| x.len()).sum::<usize>();
+                out.ink_mm += p.ink_mm;
+                out.travel_mm += p.travel_mm;
+                out.seconds += p.seconds;
+                if let Some((pen, name)) = g.pen {
+                    out.paths.extend(p.paths.iter().cloned());
+                    out.gcode.push_str(&gcode);
+                    out.gcode.push('\n');
+                    out.pen_jobs.push(PenJob {
+                        pen,
+                        name,
+                        gcode,
+                        paths: p.paths,
+                    });
+                } else {
+                    out.gcode = gcode;
+                    out.paths = p.paths;
+                }
+            }
+            out.lines = out.gcode.lines().filter(|l| !l.trim().is_empty()).count();
+            out.bytes = out.gcode.len();
+            let _ = tx.send(out);
+        });
+        self.run_plan_rx = Some(rx);
+    }
+
+    /// 每帧轮询后台计算结果（非阻塞）。
+    pub fn poll_run_plan(&mut self) {
+        let Some(rx) = self.run_plan_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(p) => {
+                self.run_plan = Some(p);
+                self.run_plan_busy = false;
+                self.run_plan_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.run_plan_busy = false;
+                self.run_plan_rx = None;
+                self.status = "绘制前计算失败：后台线程异常退出".into();
+            }
+        }
+    }
+
+    /// 在窗口里改选优化方式后重算（并记住选择）。
+    pub fn recompute_run_plan(&mut self, order: u8) {
+        self.path_order_sel = order;
+        self.start_run_plan();
+    }
+
+    /// 关闭「绘制前计算」窗口，丢弃未确认的方案。
+    pub fn close_run_plan(&mut self) {
+        self.show_run_plan = false;
+        self.run_plan_busy = false;
+        self.run_plan_rx = None;
+        self.run_plan = None;
+    }
+
+    /// 用户确认方案后真正开始：多笔 → 建队列等装笔；单笔 → 直接下发。
+    pub fn begin_run_plan(&mut self, plan: RunPlan) {
+        let n = plan.lines;
+        if plan.pen_jobs.len() >= 2 {
+            self.gcode_text = plan.gcode;
+            self.pen_jobs = plan.pen_jobs;
+            self.pen_job_idx = 0;
+            self.pen_running = true;
+            self.pen_wait = true;
+            self.pen_active = false;
+            self.pen_seen_running = false;
+            self.pen_dispatched_at = None;
+            let name = self.pen_jobs[0].name.clone();
+            let total = self.pen_jobs.len();
+            self.status =
+                format!("多笔绘制：共 {total} 支笔。装入第 1 支「{name}」后点「开始这支笔」");
+            return;
+        }
+        if let Some(page) = plan.tile_page {
+            if let Some(layout) = self.tile_layout() {
+                let count = layout.count();
+                self.start_run_with_preview(plan.gcode, plan.paths);
+                self.status = format!(
+                    "已开始传输第 {}/{} 页（{} 行 · 预计约 {:.1} 分钟）· 本页画完回到原点后再放下一张纸",
+                    page + 1,
+                    count,
+                    n,
+                    plan.seconds / 60.0
+                );
+                return;
+            }
+        }
+        let secs = plan.seconds;
+        self.start_run_with_preview(plan.gcode, plan.paths);
+        self.status = format!(
+            "已开始传输 {} 行（进度见「运行监控」页）· 预计约 {:.1} 分钟",
+            n,
+            secs / 60.0
+        );
     }
 
     /// **边界自检**：解析 G-code 的 XY 范围并与机器幅面（`machine_w_mm`×`machine_h_mm`）比对。
@@ -3777,6 +4384,10 @@ impl AppState {
             min_step: self.min_step_mm.clamp(0.0, 5.0),
             // 运行前自动设原点 → G-code 自带 `G92 X0 Y0`，坐标相对机器当前位置计算
             use_current_origin: self.auto_set_zero,
+            path_order: PathOrder::from_u8(self.path_order_sel),
+            rapid_rate: self.rapid_rate.max(1.0),
+            accel_mm_s2: self.accel_mm_s2.max(1.0),
+            line_ms: self.line_ms.max(0.0),
             ..Default::default()
         }
     }

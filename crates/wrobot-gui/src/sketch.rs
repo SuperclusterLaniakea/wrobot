@@ -1,54 +1,42 @@
-//! 素描原稿：把图片上真实画出来的铅笔线**一根根提取出来**，而不是照明暗另排一套。
+//! 素描笔触（模式 10）：以**交叉排线为底**的分层排线，再把原稿的细线单独描一遍。
 //!
-//! 两条通路，按原稿性质自动分流（`SKETCH_PATH` 可强制）：
-//! - **线稿**（几乎没有中间调）→ `line_strokes`：沿墨脊逐笔追踪，见该文件内说明；
-//! - **色调稿**（有明暗）→ `tonal_strokes` → `ridge_strokes`：提取笔触，见下。
+//! 交叉排线（模式 5）之所以干净，是因为它是一族**严格平行、间距固定**的直线；
+//! 5 倍放大后依然能读出原稿的细节。素描笔触要在此基础上补两件事：
+//! **不同深浅的表达**（多支铅笔分调子带）和**更细的线**（原稿真实笔触）。
+//! 所以这里不再让每个像素各自决定方向与长短——那正是「排线乱、碎成短杠」的来源。
 //!
-//! # 为什么必须是「提取」而不是「编排」
+//! # 流水线
 //!
-//! 所有「按明暗重新排一套线」的方案都试过并否决了——调子排线、稀疏补白、
-//! 第二轮低门槛追踪，结局一样：画面立刻变成**两层笔迹**，一层跟着形体走、
-//! 一层是等距直梳，怎么调都脏。原因是原稿的每根线都是原作画的，位置、粗细、
-//! 走向都有理由，编不出来。用户反复反馈"不像"，根子在这里：**之前那一版
-//! 根本没在找原稿的线。**
-//!
-//! # 提取的三步
-//!
-//! 1. **多尺度 Hessian 暗脊响应**（`ridge_field`）。判据不是「有梯度」，而是
-//!    Hessian 两个特征值一大一小——法向曲率大、沿脊几乎不变。一块抹开的阴影
-//!    梯度也不小，但它是各向同性的，拿不到响应。所以不需要「画线还是画明暗」
-//!    的开关，明暗永远不会变成线。尺度跟着**笔宽**走，不跟着像素走。
-//! 2. **阈值化 → Zhang–Suen 细化成单像素骨架**。这一步不能省：早先在响应场上
-//!    做非极大值抑制再追线，NMS 沿脊一波动就漏成一串散点，实测每根只能走 4 步,
-//!    输出就是满地碎划痕——这是本版之前反复"不像"的直接原因。
-//! 3. **沿骨架追踪**成折线，平滑、抽稀，再按「暗处密、亮处疏」拉开间距落笔。
+//! 1. **调子场**（`Field::build` + `hatch_tone`）：按绝对墨量归一化（纸白 = 图上
+//!    真白，不是本图最深的一档），得到 `tone`；`bg` 标记纸面/背景，不参与落笔。
+//! 2. **块面调子 → 目标墨量** `target`：调子在 2.2mm 尺度上平均成「这一片该压多黑」，
+//!    目标值上限 0.92。1~2px 的暗线（发丝、睫毛、原稿排线）在这一步被平均掉，
+//!    它们是细节层的活，不该把整片头发拖成 8B。
+//! 3. **细节层**（`source_detail_strokes`）：从墨脊提取原稿真实画出来的线，按原稿
+//!    墨量分到 HB/2B/4B 三档笔；它先落纸，其墨量按调子比例从 `target` 里扣掉，
+//!    排线只补「细节还不够黑」的部分。
+//! 4. **分层排线**：每层 =（笔, 方向），方向只有基准角与基准角+90° 两族；
+//!    行距 = 笔宽 / 覆盖率上限，行内按「还差多少墨 / 这一层能补多少」逐行抖动落笔
+//!    （`scan_layer_runs`），第二方向的密度由「并集 = 目标覆盖率」反解。层与层之间
+//!    是同一族平行线的加密与加深，越暗叠的层越多、笔越深（HB → 2B → 4B → 8B）。
 //!
 //! # 三条写死的物理约束
 //!
-//! - **投影笔只有一个墨色**。深浅只能靠疏密，不能靠「铺几遍」（那只会沿同一
-//!   轨迹反复摩擦，把纸缝填死）。所以 `cover` 必须随调子增大而**减小**。
-//! - **间距硬下限 0.8 笔宽**：0.5mm 的笔，两根线留的缝不到 0.3mm 印出来分不出，
-//!   再密只是把纸涂死，不会更黑。
-//! - **比笔细十倍的线不找**。原稿由 AI 生成时脸上一层细排线只有 1~2px ≈ 0.05mm，
-//!   0.5mm 的笔画不出来；找出来只会加粗成一团黑。所以检测尺度按笔宽定，
-//!   不是按像素定。
+//! - **投影笔只有一个墨色**：深浅靠疏密与换笔，不靠同一轨迹反复摩擦（那只会填死纸缝）。
+//! - **方向整体给定**：任何「按局部走向逐笔定方向」的做法在放大后都会读出杂乱。
+//! - **比笔细得多的线不靠排线描**：原稿的 1~2px 细线交给细节层，排线只负责块面明暗。
 //!
 //! 所有几何都在像素坐标里还原，最后统一乘 `scale` 变成毫米。
+//!
+//! 文件里仍保留一部分逐笔追踪/调子分格的旧工具（`trace_strokes`、`tone_map`、
+//! `field_ticks` 等）：它们只被 `main.rs` 里 `#[cfg(test)]` 的无头调试通路调用，
+//! 正式流水线不使用。
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 thread_local! {
     static LAST_REASON: RefCell<&'static str> = const { RefCell::new("none") };
-    /// 强制走某条通路（0 = 自动，1 = 线稿追踪，2 = 调子排线）。
-    /// 测试用：合成图往往「不像」任何一种，靠这里指定，免得测试写死实现细节。
-    static FORCE_PATH: Cell<u8> = const { Cell::new(0) };
-}
-
-/// 测试用：在本线程强制素描通路（0 自动 / 1 线稿 / 2 调子）。
-#[allow(dead_code)]
-pub(crate) fn force_path(mode: u8) {
-    FORCE_PATH.with(|c| c.set(mode));
 }
 
 fn set_reason(r: &'static str) {
@@ -57,7 +45,7 @@ fn set_reason(r: &'static str) {
 
 use wrobot_core::render::Polyline;
 
-use crate::io::{simplify_path, skeleton_paths, thin_ink};
+use crate::io::simplify_path;
 
 /// 追踪步长（像素）。1px 与细化后的墨脊分辨率同量级。
 const STEP_PX: f64 = 1.0;
@@ -69,27 +57,25 @@ const MAX_WIDTH_PX: f64 = 9.0;
 const GAP_PX: f64 = 4.0;
 /// 短于该长度的笔迹不落笔（毫米）。
 const MIN_STROKE_MM: f64 = 1.6;
-/// 长线（轮廓/起稿）与短线（排线）的分界（毫米）。
-const LONG_STROKE_MM: f64 = 12.0;
-/// 方向分组：6 个 30° 的扇区。
-const DIR_BINS: usize = 6;
 
-/// 墨浓度图 + 「已画掉」的剩余墨。
+/// 归一化后的墨浓度图：0 = 纸白，1 = 这张纸能压出的最深墨。
+///
+/// 追踪期只读墨浓度和「是否已消费」；纸白判定要用原始亮度，
+/// 所以 `lum` / `blank` 单独保留一份。
 struct Ink {
-    /// 归一化墨浓度 0..1（相对本图纸白与最深墨）。
-    tone: Vec<f32>,
-    /// 已被某条笔迹占掉的像素。种子落在这里就不再重复描。
+    /// 已消费的像素，防止同一条墨脊被反复追踪。
     done: Vec<bool>,
+    /// 墨浓度（0..1）。
+    tone: Vec<f32>,
     w: u32,
     h: u32,
-    /// 判定「这是墨」的阈值。
+    /// 判为「墨」的门槛。
     thr: f32,
-    /// 判定「这仍是墨、只是很淡」的阈值（跨断口、收笔回缩用）。
+    /// 弱墨门槛：断口桥接与收笔用。
     weak: f32,
-    /// 原始亮度：用来判断某个点是「纯纸」还是「淡墨」。
-    /// 平滑会把墨渗进相邻的空白像素，只看 tone 会把纯白留白当成断口接上。
+    /// 原始亮度（0..255），只用于 `is_blank`。
     lum: Vec<u8>,
-    /// 空白的亮度基准（普通图是纸白，反相图是底色）。
+    /// 本图的纸白亮度。
     blank: f32,
     invert: bool,
 }
@@ -286,82 +272,9 @@ pub(crate) fn trace_strokes(
     out
 }
 
-/// 主入口：把一张铅笔稿逐笔还原成「像手画出来」的笔迹。
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sketch_polylines(
-    gray: &image::GrayImage,
-    w: u32,
-    h: u32,
-    scale: f64,
-    threshold: f64,
-    invert: bool,
-    pressure: u32,
-    jitter_mm: f64,
-    pen_mm: f64,
-    order_mode: u8,
-    block_px: u32,
-) -> Vec<Polyline> {
-    if w == 0 || h == 0 {
-        return Vec::new();
-    }
-    // 单遍落笔宽度 = 实际画笔的线宽。**不能从原稿反推**：取「原稿最细的线」
-    // 当笔宽会得出 0.1mm，算法就会以为一笔只能盖 0.1mm、每格塞得下四倍线条。
-    // 笔宽是机器的物理属性。
-    let pen_mm = pen_mm.clamp(0.15, 1.6);
 
-    // 先看这是哪种稿子。色调稿（有渐变、成片暗部）走排线渲染；
-    // 线稿（白纸 + 细线）仍走沿墨脊追踪——那正是追踪器擅长的。
-    let field = Field::build(gray, w, h, scale, invert, pen_mm);
-    // 通路选择：测试强制 > 环境变量 > 按图的“味道”自动判断
-    let from_env = match std::env::var("SKETCH_PATH").ok().as_deref() {
-        Some("tone") => 2u8,
-        Some("line") => 1,
-        _ => 0,
-    };
-    let tonal = match FORCE_PATH.with(|c| c.get()).max(from_env) {
-        2 => true,
-        1 => false,
-        _ => field.is_tonal(),
-    };
-
-    let strokes = if tonal {
-        tonal_strokes(&field, pen_mm, threshold, pressure, 0x51ed_2701_b4e9_2f0d)
-    } else {
-        line_strokes(gray, w, h, scale, threshold, invert, pen_mm, field.mid_frac)
-    };
-    if strokes.is_empty() {
-        return Vec::new();
-    }
-    finish(strokes, pressure, jitter_mm, pen_mm, order_mode, block_px, scale)
-}
-
-// ───────────────────────── 素描调子：灰度分层排线 ─────────────────────────
-//
-// 和上面的「逐笔提取」是两条相反的路：
-// - 原稿提取问「这张纸上原来画了哪些线」，适合线稿；
-// - 调子排线问「这块地方有多暗」，再用线条**密度**把它铺出来，适合照片/素描。
-//
-// 单色笔画不出灰，只能靠「留出多少纸」：
-//   亮部 → 一根不画；中间调 → 一层单向稀排线；越暗 → 叠上越多层交叉排线。
-// 轮廓另走一条梯度骨架，最后压重，保证脸型、五官不散。
-
-/// 各层排线的方向：第一层沿基准角，往后按这些角差交叉。
-/// 不用均匀的 180/N —— 层数变化时每层仍要保持明显不同的走向。
-/// 各层方向只交替两个「线族」：真实排线是两组交叉线反复加深，
-/// 每层换一个新角度会织成乱网，暗部像一团毛线。
-const HATCH_DIR_DEG: [f64; 8] = [0.0, 42.0, 0.0, 42.0, 0.0, 42.0, 0.0, 42.0];
-
-/// 强方向区域（头发、衣褶）里各层的角度偏移。
-/// 不能照搬上面的固定交叉角：头发一交叉就织成渔网。这里只偏几度，
-/// 既保持沿发丝的走向，又让各层错开、叠得暗。
-const HATCH_FLOW_DEG: [f64; 8] = [0.0, 9.0, -8.0, 16.0, -14.0, 5.0, 12.0, -10.0];
-
-/// 一支笔的物理能力。
-///
-/// `darkness` 不是「笔的颜色有多深」，而是**满覆盖时纸面能压到多深**：
-/// HB 反复排满也只有 0.45 左右，8B 可以到 0.95。多笔模式靠这个值把
-/// 明暗带分给不同的笔，最后一档黑由最深的笔负责，不再让 HB 用密度硬撑。
-#[derive(Clone, Copy, Debug)]
+/// 一支参与分层的笔：线宽与满覆盖时能压出的最深色。
+#[derive(Clone, Copy)]
 pub struct HatchPen {
     pub width_mm: f64,
     pub darkness: f32,
@@ -373,7 +286,7 @@ pub(crate) struct HatchOut {
     pub pens: Vec<u8>,
 }
 
-/// 排线 / 分区重绘共用的调子场。
+/// 素描笔触共用的调子场。
 struct HatchTone {
     /// 对比度校正后的调子 0..1（0 = 纸白，1 = 全画最深）。
     tone: Vec<f32>,
@@ -381,8 +294,6 @@ struct HatchTone {
     detail: Vec<f32>,
     /// 背景 / 纸白掩码。
     bg: Vec<bool>,
-    /// 明暗对比系数（各层门槛反算时要用同一个值）。
-    contrast: f32,
 }
 
 /// 把原稿归一化成「排线用」的调子场。
@@ -393,13 +304,34 @@ struct HatchTone {
 ///   前者让白、后者加黑，模拟「先铺大调子、再抠亮部与暗部」。
 fn hatch_tone(field: &Field, gray: &image::GrayImage, invert: bool, threshold: f64) -> HatchTone {
     let mut norm = vec![0f32; field.w * field.h];
+    // 调子要按**绝对墨量**归一化：纸白 = 255，不是「本图最深的 6%」。
+    // 否则同一片 0.18 的浅灰，在头发很黑（span 大）的稿子上只剩 0.12，在
+    // 没有深调的稿子上却是 0.3——排线的疏密跟着整张图的对比度漂移。
+    //
+    // 纸白本身有两类：扫描的灰纸（纸色 200~230，整图没有真白）要按纸色
+    // 算，否则满背景都被当成墨；而这批手绘/渲染稿的纸是白的，只是背景
+    // 铺了一层灰调——图里有成片 >246 的真白就是判据，此时纸白取 255。
+    let n_pix = field.w * field.h;
+    let mut whites = 0usize;
+    if !invert {
+        for p in gray.pixels() {
+            if p.0[0] >= 246 {
+                whites += 1;
+            }
+        }
+    }
+    let white = if whites * 50 >= n_pix {
+        255.0
+    } else {
+        field.paper.max(1.0)
+    };
     for (i, p) in gray.pixels().enumerate() {
         let v = if invert {
             255.0 - p.0[0] as f32
         } else {
             p.0[0] as f32
         };
-        norm[i] = ((field.paper - v) / field.span.max(1e-6)).max(0.0);
+        norm[i] = ((white - v) / white).max(0.0);
     }
     let px_mm = field.px_mm.max(1e-9);
     // 1.3mm：保得住头发里「哪几缕是亮的」，又能把单根发丝平均成一块调子。
@@ -412,18 +344,27 @@ fn hatch_tone(field: &Field, gray: &image::GrayImage, invert: bool, threshold: f
     let hi = box_blur(&norm, field.w, field.h, r_hi);
     let mut detail = vec![0f32; field.w * field.h];
     for i in 0..detail.len() {
-        detail[i] = fine[i] - field.tone[i];
+        // 0.4mm 调子 − 1.3mm 调子：两把尺子必须都换成绝对墨量，
+        // 混用 field.tone（旧的 span 归一化）会让「局部比周围暗多少」差一个比例。
+        detail[i] = fine[i] - tone_hatch[i];
     }
-    let contrast = (1.0 + 0.35 * threshold.clamp(0.05, 0.95)).clamp(1.0, 1.35) as f32;
+    let _ = threshold;
     // 漫填的「相邻差」用 0.4mm 平滑图算：原始像素的纸纹起伏超过 2% 阈值，
     // 会把背景切成孤岛，细节提取随后把纸纹描得满纸都是。但「是否背景」
     // 仍看原始调子，且要求它明显高于纸白——1.3mm 平滑会把脸的浅调子
     // 与背景连成缓坡，整张脸被漫填成背景（实测覆盖 76.6%，脸全白）。
-    let bg = background_mask(&norm, &fine, field.w, field.h);
+    // 纹理屏障：脸的高光比背景还亮，单靠调子高低根本拦不住，漫填会穿过
+    // 高光把额头、脸颊一起吞掉（输出脸上出现一大块死白）。纸是平的，
+    // 人脸再亮也有细排线和皮肤纹理——0.8mm 尺度的高频能量能分开两者。
+    let r_tex = ((0.8 / px_mm).round() as usize).clamp(1, 20);
+    let hf: Vec<f32> = (0..field.w * field.h)
+        .map(|i| (norm[i] - fine[i]).abs())
+        .collect();
+    let hf = box_blur(&hf, field.w, field.h, r_tex);
+    let bg = background_mask(&norm, &fine, &hf, field.w, field.h);
     let mut tone = vec![0f32; field.w * field.h];
-    for (i, (((&t0, &d), &is_bg), &hf)) in tone_hatch
+    for (i, ((&t0, &is_bg), &hf)) in tone_hatch
         .iter()
-        .zip(detail.iter())
         .zip(bg.iter())
         .zip(hi.iter())
         .enumerate()
@@ -439,22 +380,29 @@ fn hatch_tone(field: &Field, gray: &image::GrayImage, invert: bool, threshold: f
         // 只在「这块真的亮」时抠白（hf < 0.55）。没有这个绝对门槛，
         // 发丛/衣领的明暗交界处（1.3mm 发黑、0.35mm 跨到亮面）也会被
         // 判成高光，勾出一圈白边，脸和头发像贴了纸边。
-        if t0 > 0.45 && hf + 0.12 < t0 && hf < 0.55 {
+        // 只在**像素本身确实亮**的地方抠高光。发丛的调子高、0.35mm 均值
+        // 也会被深浅发丝拉开，如果只看 `hf < t0`，整片头发都会被当成高光
+        // 抠掉，瞳孔和发芯一起变浅（8B 因此一条线都落不下去）。
+        // 只在**像素本身确实接近纸白**时才回收高光。旧门槛 norm<0.55 会把
+        // 深色五官旁边 0.3~0.5 的浅肤色也当成高光抹掉，于是鼻侧、眼下、
+        // 唇边出现一圈只剩纸白的白晕——放大看像贴了纸边。
+        // 现在按像素自身的亮度做渐变：norm 0.12 以下全量回收（发丝亮边、
+        // 瞳孔 catchlight），0.12~0.30 线性减弱，0.30 以上只留一点点。
+        let bright_fac = ((0.30 - norm[i]) / 0.18).clamp(0.0, 1.0);
+        if t0 > 0.45 && hf + 0.12 < t0 && hf < 0.55 && bright_fac > 0.0 {
             let k = ((t0 - hf - 0.12) / 0.30).clamp(0.0, 1.0);
-            t *= 1.0 - 0.65 * k;
+            // 亮斑要直接留白，而不是只减三成：高光如果还剩 30% 调子，
+            // 5 遍细排线叠上去仍是肉眼可见的灰块（用户说的「高光一片黑」）。
+            t *= 1.0 - 0.95 * k * bright_fac;
         }
-        let local = if d < 0.0 { d * 0.85 } else { d * 0.30 };
-        tone[i] = (t + local).clamp(0.0, 1.0);
+        // 小块面（瞳孔、唇缝）不再在这里拉深。以前用 0.4mm 细节把「比大调子
+        // 暗一截」的像素补回来，本意是保住虹膜/瞳孔；但在浅调纸上，一根
+        // 1~2px 的浅排线也满足「比周围暗 0.16」，被补成一块深调，2.2mm 平均后
+        // 整片高光反而被排黑——亮部比原稿黑一倍，正是「明暗调子不对」。
+        // 这些线现在由细节层逐根去描，块面调子只负责「这一片有多黑」。
+        tone[i] = t.clamp(0.0, 1.0);
     }
-    for t in tone.iter_mut() {
-        *t = t.powf(contrast);
-    }
-    HatchTone {
-        tone,
-        detail,
-        bg,
-        contrast,
-    }
+    HatchTone { tone, detail, bg }
 }
 
 /// 调试用：返回背景掩码（true = 背景）。
@@ -469,645 +417,8 @@ pub(crate) fn bg_mask_map(
     hatch_tone(&field, gray, invert, 0.72).bg
 }
 
-/// 素描调子模式主入口：灰度 → 分层排线 + 轮廓重线。
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn hatch_polylines(
-    gray: &image::GrayImage,
-    w: u32,
-    h: u32,
-    scale: f64,
-    threshold: f64,
-    invert: bool,
-    levels: u32,
-    jitter_mm: f64,
-    pen_mm: f64,
-    order_mode: u8,
-    block_px: u32,
-    base_angle_deg: f64,
-    spacing_px: u32,
-    edge_threshold: f64,
-    pens: &[HatchPen],
-    multi_pen: bool,
-) -> HatchOut {
-    if w == 0 || h == 0 {
-        return HatchOut {
-            polylines: Vec::new(),
-            pens: Vec::new(),
-        };
-    }
-    let pen_mm = pen_mm.clamp(0.15, 1.6);
-    let levels = levels.clamp(3, 8) as usize;
-    let field = Field::build(gray, w, h, scale, invert, pen_mm);
-    let ht = hatch_tone(&field, gray, invert, threshold);
-    let tone_c = &ht.tone;
-    let contrast = ht.contrast;
-    let need: Vec<f32> = tone_c.iter().map(|t| t * levels as f32).collect();
-    // 两根线最近也要留 3.2 个笔宽：单色笔的「黑」全靠线密度，
-    // 间距再小一层就盖住 40%，六层叠完全是死黑，纸白全丢。
-    let spacing_mm = (spacing_px.max(1) as f64 * scale).clamp(pen_mm * 3.2, pen_mm * 7.0);
-    let base = base_angle_deg.to_radians();
 
-    // 多笔：至少两支笔且层数够分时才启用。比层数还多的笔没有层可挂，
-    // 强行用会让最深那支一笔都轮不到，黑场永远上不去。
-    let m_eff = if multi_pen {
-        pens.len().min(4).min(levels).max(1)
-    } else {
-        1
-    };
-    let mut layers: Vec<Vec<Stroke>> = Vec::with_capacity(levels);
-    let mut layer_pen: Vec<u8> = Vec::with_capacity(levels);
-    let mut extracted: Option<Vec<Vec<Stroke>>> = None;
-    if m_eff > 1 {
-        // **多笔首先走「提取原稿真实笔触」**：每一支笔画的都是原画里存在的
-        // 线，而不是照明暗另排一套。换笔只决定「这段明暗由哪支笔来画」，
-        // 叠加后仍然贴着原稿；提取不到足够笔触（照片、纯色块）才回落排线。
-        extracted = extracted_multi_pen(&field, threshold, pen_mm, m_eff);
-    }
-    if m_eff > 1 && extracted.is_none() {
-        // 明暗带的起点沿用单笔第 0 层的门槛：调高「明暗对比」时，
-        // 连最浅的一支笔也更晚介入，亮部留给纸白。
-        let light_gate = ((0.45 + 1.2 * threshold as f32) / levels as f32)
-            .powf(1.0f32 / contrast)
-            .clamp(0.12, 0.42);
-        // 带的分界按各笔能压出的最深色分配：8B 比 HB 多出的那段深色，
-        // 正好由它自己负责，而不是让 HB 排到死黑。
-        let ds: Vec<f32> = pens[..m_eff]
-            .iter()
-            .map(|p| p.darkness.clamp(0.2, 1.0))
-            .collect();
-        let dsum: f32 = ds.iter().sum::<f32>().max(1e-6);
-        let mut bounds = Vec::with_capacity(m_eff + 1);
-        bounds.push(light_gate);
-        let mut acc = 0.0f32;
-        for &d in &ds {
-            acc += d;
-            bounds.push(light_gate + (1.0 - light_gate) * (acc / dsum));
-        }
-        if let Some(last) = bounds.last_mut() {
-            *last = 1.0;
-        }
-        // 层按顺序连续分配给各笔（亮 → 暗）。每支笔至少一层，层数多于笔数时
-        // 按比例多分，让每支笔都能在自己的明暗带里叠出层次。
-        let mut counts = [0usize; 4];
-        for k in 0..levels {
-            counts[k * m_eff / levels] += 1;
-        }
-        let mut seen = [0usize; 4];
-        for k in 0..levels {
-            let p = k * m_eff / levels;
-            let j = seen[p];
-            seen[p] += 1;
-            let spec = pens[p];
-            layers.push(pen_hatch_layer(
-                &field,
-                tone_c,
-                bounds[p],
-                bounds[p + 1],
-                spec.width_mm.clamp(0.15, 1.6),
-                spec.darkness.clamp(0.2, 1.0),
-                counts[p],
-                j,
-                k,
-                base,
-                scale,
-                contrast,
-            ));
-            layer_pen.push(p as u8);
-        }
-        if std::env::var("SKETCH_DEBUG").is_ok() {
-            eprintln!(
-                "多笔分带（回落排线）：{} 支笔，起点 {:.2}，边界 {:?}，每笔层数 {:?}",
-                m_eff,
-                light_gate,
-                bounds.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>(),
-                &counts[..m_eff]
-            );
-        }
-    } else if m_eff == 1 {
-        for k in 0..levels {
-            // 第 k 层在「至少需要 k+1 层才铺得出来」的地方起笔。
-            // 第 0 层的门槛跟「明暗对比」走：调高就把浅灰整片留给纸白，
-            // 亮面只由轮廓层交代；调低则连浅灰也铺一层稀排线。
-            let want = if k == 0 {
-                0.45 + 1.2 * threshold as f32
-            } else {
-                k as f32 + 0.35
-            };
-            layers.push(hatch_layer(
-                &field,
-                &need,
-                want,
-                k,
-                base,
-                spacing_mm,
-                scale,
-                pen_mm,
-                levels,
-                contrast,
-            ));
-            layer_pen.push(0);
-        }
-    }
-    // 轮廓始终归最深的一支笔：它是画面里最重的一层，用浅笔会立刻糊掉。
-    let dark_pen = (m_eff - 1) as u8;
-    let dark_width = if m_eff > 1 {
-        pens[m_eff - 1].width_mm.clamp(0.15, 1.6)
-    } else {
-        pen_mm
-    };
-    // 提取通路里结构线已经在笔迹里（并已分给最深笔），再叠一遍轮廓会画成
-    // 两根平行的重线；只有回落到合成排线时才需要单独提轮廓。
-    let structural = if extracted.is_some() {
-        Vec::new()
-    } else {
-        contour_strokes(&field, &ht.detail, &ht.bg, scale, dark_width, edge_threshold)
-    };
-    if std::env::var("SKETCH_DEBUG").is_ok() {
-        let counts: Vec<usize> = layers.iter().map(|l| l.len()).collect();
-        eprintln!(
-            "调子排线：{} 层 {:?}，笔 {:?}，轮廓 {} 条，间距 {:.2}mm",
-            levels,
-            counts,
-            layer_pen,
-            structural.len(),
-            spacing_mm
-        );
-    }
-    let mut out = Vec::new();
-    let mut pens_out = Vec::new();
-    let mut n = 0usize;
-    // 调试开关：只看轮廓层，判断五官丢在哪一步。
-    let only_contour = std::env::var("SKETCH_ONLY").ok().as_deref() == Some("contour");
-    if !only_contour {
-        if let Some(lanes) = &extracted {
-            // 浅笔 → 深笔，每支笔一层；层内按选定的走笔顺序串联。
-            for (p, lane) in lanes.iter().enumerate() {
-                let w = pens[p].width_mm.clamp(0.15, 1.6);
-                emit_hatch_set(
-                    lane,
-                    order_mode,
-                    block_px,
-                    scale,
-                    jitter_mm,
-                    w,
-                    p as u8,
-                    &mut n,
-                    &mut out,
-                    &mut pens_out,
-                );
-            }
-        } else {
-            for (layer, &pen) in layers.iter().zip(layer_pen.iter()) {
-                let w = if m_eff > 1 {
-                    pens[pen as usize].width_mm.clamp(0.15, 1.6)
-                } else {
-                    pen_mm
-                };
-                emit_hatch_set(
-                    layer,
-                    order_mode,
-                    block_px,
-                    scale,
-                    jitter_mm,
-                    w,
-                    pen,
-                    &mut n,
-                    &mut out,
-                    &mut pens_out,
-                );
-            }
-        }
-    }
-    // 轮廓最后压上：排线可以穿过形体，但轮廓必须是最清楚的一层。
-    emit_hatch_set(
-        &structural,
-        order_mode,
-        block_px,
-        scale,
-        jitter_mm,
-        dark_width,
-        dark_pen,
-        &mut n,
-        &mut out,
-        &mut pens_out,
-    );
-    HatchOut {
-        polylines: out,
-        pens: pens_out,
-    }
-}
 
-/// 分区重绘：把黑白深度量化成 N 层，细粒度分块决定排线方向，
-/// 每层由一支笔在自己的深度带里铺线，逐层叠到最深。
-///
-/// 和模式 8 的区别：
-/// - 模式 8 是「按调子连续排线」，一层里整片区域同向；
-/// - 分区重绘先量出「这块到底有多黑」，落到第几层，再按小块的**局部走向**
-///   排该层的线。亮的层先铺、暗的层后叠，最后最深的一支笔压轮廓——
-///   这正是铅笔素描「先浅后深、一层层压暗」的顺序。
-///
-/// 后几层只画在更暗的地方（`lvl >= k`），所以叠加后不会把亮部一起涂黑；
-/// 各层用不同交叉角，叠出来的暗部才有铅笔的网状质感。
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn region_polylines(
-    gray: &image::GrayImage,
-    w: u32,
-    h: u32,
-    scale: f64,
-    threshold: f64,
-    invert: bool,
-    levels: u32,
-    block_mm: f64,
-    jitter_mm: f64,
-    pen_mm: f64,
-    order_mode: u8,
-    order_block_px: u32,
-    base_angle_deg: f64,
-    edge_threshold: f64,
-    pens: &[HatchPen],
-    multi_pen: bool,
-) -> HatchOut {
-    let mut out = Vec::new();
-    let mut pens_out = Vec::new();
-    if w == 0 || h == 0 {
-        return HatchOut {
-            polylines: out,
-            pens: pens_out,
-        };
-    }
-    let pen_mm = pen_mm.clamp(0.15, 1.6);
-    let levels = levels.clamp(3, 8) as usize;
-    let block_mm = block_mm.clamp(1.5, 12.0);
-    let field = Field::build(gray, w, h, scale, invert, pen_mm);
-    let ht = hatch_tone(&field, gray, invert, threshold);
-    let fw = field.w;
-    let fh = field.h;
-    let npix = fw * fh;
-    let m_eff = if multi_pen {
-        pens.len().min(4).min(levels).max(1)
-    } else {
-        1
-    };
-    // 第 0 层的起点：和模式 8 用同一套门槛，亮部照样留给纸白。
-    let gate = ((0.45 + 1.2 * threshold as f32) / levels as f32)
-        .powf(1.0f32 / ht.contrast)
-        .clamp(0.10, 0.42);
-    // 层号要按**这张图自己的调子范围**摊开，不能拿固定的 0..1：
-    // 铅笔稿的深部通常只到 0.5~0.7（线条之间的纸白把 1.3mm 均值拉亮了），
-    // 若按 0..1 分层，5 层里往往只有前两层用得上，深笔永远轮不到。
-    // 取非纸白像素的 p98 当作「这张图最黑的地方」，门槛以上均分成 levels 档。
-    let mut tops: Vec<f32> = (0..npix)
-        .filter(|&i| !ht.bg[i] && ht.tone[i] >= gate)
-        .map(|i| ht.tone[i])
-        .collect();
-    tops.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let tone_hi = if tops.is_empty() {
-        (gate + 0.06).min(1.0)
-    } else {
-        tops[(tops.len() * 98 / 100).min(tops.len() - 1)]
-            .max(gate + 0.06)
-            .min(1.0)
-    };
-    // 逐像素深度层：0 最浅 … levels-1 最深；255 = 纸白/背景，不参与。
-    // 用像素级（而不是块均值）定层，块的颗粒度只决定方向与起笔节奏，
-    // 这样眼窝、唇缝这些只有一两毫米的深色不会因为块平均而被抹浅。
-    let mut lvl = vec![255u8; npix];
-    for i in 0..npix {
-        if ht.bg[i] {
-            continue;
-        }
-        let t = ht.tone[i];
-        if t < gate {
-            continue;
-        }
-        let u = (t - gate) / (tone_hi - gate).max(1e-6);
-        lvl[i] = ((u * levels as f32).floor() as usize).min(levels - 1) as u8;
-    }
-    // 每个小块采样一次原稿的笔触 / 结构走向，块内所有层共用。
-    // 块要细（默认 2.5mm）：同一张脸上，鼻梁、脸颊、眼窝的排线方向本来就不同。
-    let px_block = (block_mm / field.px_mm.max(1e-9)).round().max(2.0) as usize;
-    let bw = (fw + px_block - 1) / px_block;
-    let bh = (fh + px_block - 1) / px_block;
-    let mut bdir = vec![0f32; bw * bh];
-    let mut bgate = vec![0f32; bw * bh];
-    let base = base_angle_deg.to_radians();
-    for by in 0..bh {
-        for bx in 0..bw {
-            let x = ((bx * px_block) as f64 + px_block as f64 * 0.5).min(fw as f64 - 1.0);
-            let y = ((by * px_block) as f64 + px_block as f64 * 0.5).min(fh as f64 - 1.0);
-            let (ra, rc) = field.ridge_ang_at(x, y);
-            let (sa, sc) = field.ang_at(x, y);
-            let cseed = hash_u64(
-                (bx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((by as u64) << 32),
-            );
-            // 原稿有明确笔触方向就参考原稿（头发、衣褶、排线稿）；
-            // 只有成片明暗时退回结构方向；两者都不可信就用规则斜排线，
-            // 但每个块错开一点角度——手不会每块都用同一把尺子。
-            let (dir, g) = if rc > 0.30 {
-                (ra, ((rc - 0.30) / 0.45).clamp(0.0, 1.0))
-            } else if sc > 0.45 {
-                (sa, ((sc - 0.45) / 0.40).clamp(0.0, 1.0))
-            } else {
-                (base as f32 + (hash01(cseed) as f32 - 0.5) * 0.16, 0.0)
-            };
-            let i = by * bw + bx;
-            bdir[i] = dir;
-            bgate[i] = g;
-        }
-    }
-    let base_ppm = field.px_mm.max(1e-9);
-    let pen_of = |k: usize| -> usize {
-        if m_eff <= 1 {
-            0
-        } else {
-            (k * m_eff / levels).min(m_eff - 1)
-        }
-    };
-    let only_contour = std::env::var("SKETCH_ONLY").ok().as_deref() == Some("contour");
-    let mut stroke_no = 0usize;
-    let mut hatch_len = 0.0f64;
-    for k in 0..levels {
-        let p = pen_of(k);
-        let (pw, pdark) = if m_eff > 1 {
-            let spec = pens[p];
-            (
-                spec.width_mm.clamp(0.15, 1.6),
-                spec.darkness.clamp(0.2, 1.0),
-            )
-        } else {
-            (pen_mm, 1.0)
-        };
-        let min_mm = pw * 2.4;
-        let pitch = ((min_mm * 0.82) / base_ppm).max(2.0);
-        let mut used = vec![false; npix];
-        let mut layer: Vec<Stroke> = Vec::new();
-        let seed = 0x51ed_2701_b4e9_2f0d ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let seed_off = 0.29 + 0.23 * k as f64;
-        let mut gy = 0i32;
-        loop {
-            let y = gy as f64 * pitch + seed_off;
-            if y >= fh as f64 {
-                break;
-            }
-            gy += 1;
-            let stagger = if gy & 1 == 0 { 0.0 } else { pitch * 0.5 };
-            let mut gx = 0i32;
-            loop {
-                let x = gx as f64 * pitch + stagger + seed_off * 0.3;
-                if x >= fw as f64 {
-                    break;
-                }
-                gx += 1;
-                let idx = (y as usize) * fw + (x as usize);
-                if used[idx] || lvl[idx] < k as u8 {
-                    continue;
-                }
-                let t = ht.tone[idx];
-                let q = lvl[idx] as usize;
-                let sseed = hash_u64(
-                    (x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                        ^ ((y as i64 as u64) << 1)
-                        ^ seed,
-                );
-                let bi = (y as usize / px_block) * bw + (x as usize / px_block);
-                // 后面各层要**真的和第一层交叉**：把本层的交叉角同时加到
-                // 规则角和「跟随原稿」角上。只加在规则角上的话，原稿笔触方向
-                // 明确时（实拍素描的排线、头发），跟随角占主导，每一层都顺着
-                // 原稿走，叠多少层都只是同一方向的平行线，暗部永远不出网。
-                let cross = HATCH_DIR_DEG[k.min(HATCH_DIR_DEG.len() - 1)].to_radians();
-                let rule = base + cross;
-                let follow = bdir[bi] as f64
-                    + cross
-                    + HATCH_FLOW_DEG[k.min(HATCH_FLOW_DEG.len() - 1)].to_radians();
-                let th = lerp_dir(rule, follow, bgate[bi] as f64);
-                // 一笔的长度：亮处短、暗处长一点，再乘个体差异，避免排成一个模子。
-                let len_mm = (2.5 + 4.5 * t as f64) * (0.6 + 0.55 * hash01(sseed));
-                let s_max = len_mm / base_ppm;
-                let fwd = trace_region(
-                    &field,
-                    &lvl,
-                    &ht.tone,
-                    (x, y),
-                    1.0,
-                    th,
-                    k as u8,
-                    gate,
-                    s_max,
-                    sseed,
-                );
-                let bwd = trace_region(
-                    &field,
-                    &lvl,
-                    &ht.tone,
-                    (x, y),
-                    -1.0,
-                    th,
-                    k as u8,
-                    gate,
-                    s_max,
-                    sseed,
-                );
-                if fwd.len() + bwd.len() < 2 {
-                    continue;
-                }
-                let mut pts: Vec<(f64, f64)> = Vec::with_capacity(fwd.len() + bwd.len() + 1);
-                for &q in bwd.iter().rev() {
-                    pts.push(q);
-                }
-                pts.push((x, y));
-                pts.extend(fwd.iter().copied());
-                let len_px = chain_len(&pts);
-                if len_px < (1.6 / base_ppm).max(2.0) {
-                    continue;
-                }
-                // 这一条线覆盖的调子 → 本层要补的覆盖率 → 实际线距。
-                // 层越深、层数越多，单层要补的越少，线自然越稀；
-                // 暗部层多、每层再按笔的满覆盖深度折算，铅笔的深浅就出来了。
-                let mut sum = 0.0f64;
-                let mut cnt = 0usize;
-                for &(px, py) in &pts {
-                    let i = (py as usize).min(fh - 1) * fw + (px as usize).min(fw - 1);
-                    sum += ht.tone[i] as f64;
-                    cnt += 1;
-                }
-                let mean_t = (sum / cnt.max(1) as f64).clamp(0.0, 1.0) as f32;
-                let n_act = (q + 1).min(levels) as f32;
-                let want = (1.0 - (1.0 - mean_t).powf(1.0 / n_act)).clamp(0.02, 0.55);
-                let cov = (want / pdark).clamp(0.03, 0.58) as f64;
-                let local_mm = (pw / cov).clamp(min_mm, pw * 18.0);
-                let mark_r = ((local_mm / base_ppm).round() as i32).max(1);
-                let r2 = mark_r * mark_r;
-                let step = (mark_r / 2).max(1) as usize;
-                for &(px, py) in pts.iter().step_by(step) {
-                    let cx = px.round() as i32;
-                    let cy = py.round() as i32;
-                    for yy in (cy - mark_r).max(0)..=(cy + mark_r).min(fh as i32 - 1) {
-                        for xx in (cx - mark_r).max(0)..=(cx + mark_r).min(fw as i32 - 1) {
-                            let dx = xx - cx;
-                            let dy = yy - cy;
-                            if dx * dx + dy * dy <= r2 {
-                                used[(yy as usize) * fw + xx as usize] = true;
-                            }
-                        }
-                    }
-                }
-                layer.push(Stroke {
-                    theta: path_theta(&pts),
-                    pts,
-                    loose: [true, true],
-                    len_mm: len_px * base_ppm,
-                    mean_dark: mean_t as f64,
-                    mean_width_mm: pw * 0.9,
-                    rank: k as f64 / (levels - 1).max(1) as f64,
-                    structural: false,
-                    passes: 1,
-                });
-            }
-        }
-        if std::env::var("SKETCH_DEBUG").is_ok() {
-            eprintln!("分区重绘：层 {k} → 笔 {p}，{} 条", layer.len());
-        }
-        hatch_len += layer.iter().map(|s| s.len_mm).sum::<f64>();
-        if !only_contour {
-            emit_hatch_set(
-                &layer,
-                order_mode,
-                order_block_px,
-                scale,
-                jitter_mm,
-                pw,
-                p as u8,
-                &mut stroke_no,
-                &mut out,
-                &mut pens_out,
-            );
-        }
-    }
-    // 轮廓归最深的笔，最后压一遍，五官边界不散。
-    let dark_pen = (m_eff - 1) as u8;
-    let dark_width = if m_eff > 1 {
-        pens[m_eff - 1].width_mm.clamp(0.15, 1.6)
-    } else {
-        pen_mm
-    };
-    // 结构层（最后压的最深一支笔）。优先用**墨脊中线**，而不是等值轮廓：
-    // 轮廓会把原稿每一笔的两侧边缘各描一遍，排线稿上立刻变成成对的重复线
-    // （实测长竖线全是双线）。墨脊提取每条线只给一根中线，既保住形体，
-    // 又不会把原稿复制两遍。照片/纯色块没有可靠墨脊时，才退回轮廓。
-    let ridge_mid = {
-        let (strokes, _) = ridge_strokes(&field, dark_width, threshold, 1.4);
-        strokes
-            .into_iter()
-            .filter(|s| s.structural && s.len_mm >= 3.0)
-            .collect::<Vec<_>>()
-    };
-    let ridge_len: f64 = ridge_mid.iter().map(|s| s.len_mm).sum();
-    let mut structural = if ridge_mid.len() >= 8 && ridge_len >= 40.0 {
-        ridge_mid
-    } else {
-        contour_strokes(&field, &ht.detail, &ht.bg, scale, dark_width, edge_threshold)
-    };
-    // 结构层只做「形的骨架」，不能把原稿每一笔的边缘都重复描一遍：
-    // 按长度×墨色保留最重要的那部分，总长不超过排线总长的 45%——
-    // 足够压住五官和物体边界，又不至于盖过调子层。
-    let budget = (hatch_len * 0.45).max(120.0);
-    let total: f64 = structural.iter().map(|s| s.len_mm).sum();
-    if total > budget {
-        structural.sort_by(|a, b| {
-            (b.len_mm * b.mean_dark)
-                .partial_cmp(&(a.len_mm * a.mean_dark))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut acc = 0.0f64;
-        structural.retain(|s| {
-            if acc + s.len_mm > budget && acc > 0.0 {
-                return false;
-            }
-            acc += s.len_mm;
-            true
-        });
-        if std::env::var("SKETCH_DEBUG").is_ok() {
-            eprintln!(
-                "分区重绘：轮廓 {total:.0}mm 超出预算 {budget:.0}mm，保留 {} 条",
-                structural.len()
-            );
-        }
-    }
-    if !only_contour {
-        emit_hatch_set(
-            &structural,
-            order_mode,
-            order_block_px,
-            scale,
-            jitter_mm,
-            dark_width,
-            dark_pen,
-            &mut stroke_no,
-            &mut out,
-            &mut pens_out,
-        );
-    }
-    HatchOut {
-        polylines: out,
-        pens: pens_out,
-    }
-}
-
-/// 分区重绘的一步：沿排线方向走，碰到更浅的层或纸白就收笔。
-#[allow(clippy::too_many_arguments)]
-fn trace_region(
-    field: &Field,
-    lvl: &[u8],
-    tone: &[f32],
-    start: (f64, f64),
-    sign: f64,
-    theta: f64,
-    level: u8,
-    gate: f32,
-    max_len_px: f64,
-    seed: u64,
-) -> Vec<(f64, f64)> {
-    let w = field.w as i32;
-    let h = field.h as i32;
-    let mut out = Vec::new();
-    let (mut x, mut y) = start;
-    let (mut dx, mut dy) = hatch_dir(theta, x, y, seed);
-    dx *= sign;
-    dy *= sign;
-    let mut walked = 0.0f64;
-    while walked < max_len_px {
-        let nx = x + dx;
-        let ny = y + dy;
-        if nx < 0.0 || ny < 0.0 || nx >= w as f64 || ny >= h as f64 {
-            break;
-        }
-        let ix = nx as i32;
-        let iy = ny as i32;
-        let i = (iy as usize) * w as usize + ix as usize;
-        // 只在本层及更暗的地方走：走到亮部就收笔，层与层之间才有边界。
-        if lvl[i] < level || tone[i] < gate {
-            break;
-        }
-        let (ndx, ndy) = hatch_dir(theta, nx, ny, seed);
-        let (mut sx, mut sy) = (
-            dx * 0.82 + ndx * sign * 0.18,
-            dy * 0.82 + ndy * sign * 0.18,
-        );
-        let l = (sx * sx + sy * sy).sqrt();
-        if l < 1e-9 {
-            break;
-        }
-        sx /= l;
-        sy /= l;
-        dx = sx;
-        dy = sy;
-        x = nx;
-        y = ny;
-        walked += 1.0;
-        out.push((x, y));
-    }
-    out
-}
 
 // ───────────────────── 素描笔触：残差驱动的短直线 ─────────────────────
 //
@@ -1125,21 +436,6 @@ fn trace_region(
 // 5. 多笔时按每支笔能压出的最深色分带：浅笔先补它那一档，深笔再补剩下的；
 // 6. 最后只留少量墨脊/轮廓压形。
 
-/// 一层最多补多少覆盖率。素描的暗部是靠「一层层交叉排线」压出来的，
-/// 每一层本身要留出纸缝：一层就压满会变成实心黑块，后面的交叉层也无缝可补，
-/// 画面读起来只有一层。0.80 让单层线距约 1.25 倍笔宽（HB 约 0.38mm），
-/// 再靠 2~3 个不同角度的交叉层叠出深调——线更细、更密、层次更多。
-const STROKE_PASS_MAX_COV: f64 = 0.80;
-
-/// 各遍的角差（度）。第 0 遍顺形体/原稿排线方向，之后每层错开一点角度。
-///
-/// 不要用 38°/-34° 那种大交叉：实测原稿额头/脖子的排线方向一致性 R≈0.2~0.5，
-/// 大交叉叠完后输出的方向一致性掉到 R≈0.07——一片六七个方向的乱网，
-/// 正是用户说的「间距乱、像划痕」。但也不能只错 4°~17°：那样每层几乎同向，
-/// 叠完读起来只有一层（用户「明暗调子的重叠…只有一层」）。原稿本身是
-/// 2~3 层同向为主、层间错 10°~25° 的排线，这里按同样幅度分档。
-const STROKE_CROSS_DEG: [f64; 8] = [0.0, 15.0, -13.0, 8.0, 24.0, -20.0, 11.0, -9.0];
-const STROKE_CONTOUR_DEG: [f64; 8] = [0.0, 4.0, -4.0, 6.0, -6.0, 3.0, -3.0, 2.0];
 
 /// 素描笔触主入口（融合布线 v2）。
 ///
@@ -1153,6 +449,212 @@ const STROKE_CONTOUR_DEG: [f64; 8] = [0.0, 4.0, -4.0, 6.0, -6.0, 3.0, -3.0, 2.0]
 /// 另加一层**原稿细节**：从墨脊提取原稿真实笔触（发丝、眼线、衣褶），
 /// 用细笔画在最后。它补「精细程度」，合成排线只负责明暗。
 #[allow(clippy::too_many_arguments)]
+/// 一层排线的扫描：返回一组「行内连续段」的两个端点（像素坐标）。
+///
+/// 交叉排线之所以干净，是因为它是一族**严格平行、间距固定**的直线；调子如果
+/// 交给「每个像素各自决定要不要落笔」，线会碎、方向会乱，放大 5 倍就是毛边。
+/// 这里把分工钉死：
+/// - 方向和间距由调用方给定，整层恒定（一层一个角度、一个行距）；
+/// - 一行画不画、画多长，由 `fmap`（还差多少墨 / 这一层能补多少）决定。
+///
+/// 每个行取一个黄金分割低差异阈值 `d`：`f > d` 才落笔。密度随 f 连续变化，
+/// 但落笔点永远是一整段横贯区域的平行线，而不是噪点。两端用 ±`HYST` 滞回，
+/// 免得在边界上抖出一串几像素的碎段。
+///
+/// 逐像素掩膜（例如「深笔只画到原稿真正暗的地方」）由调用方先乘进 `fmap`。
+/// 不能等行内平均之后再乘：那样掩膜边缘的抖动会把长线切成台阶状的短杠，
+/// 放大看就是一排碎笔。
+fn scan_layer_runs(
+    fmap: &[f32],
+    w: usize,
+    h: usize,
+    angle: f64,
+    pitch: f64,
+    phase: f64,
+    step: f64,
+    min_len: f64,
+    smooth_px: f64,
+) -> Vec<((f64, f64), (f64, f64))> {
+    let mut runs = Vec::new();
+    if w < 2 || h < 2 || fmap.len() < w * h {
+        return runs;
+    }
+    let (sn, cs) = angle.sin_cos();
+    // u 沿行方向，n 垂直行（行号方向）；两者正交，t/s 都是像素弧长。
+    let (ux, uy) = (cs, sn);
+    let (nx, ny) = (-sn, cs);
+    let (wf, hf) = (w as f64, h as f64);
+    let (mut smin, mut smax) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut tmin, mut tmax) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in &[(0.0, 0.0), (wf, 0.0), (0.0, hf), (wf, hf)] {
+        let s = x * nx + y * ny;
+        let t = x * ux + y * uy;
+        smin = smin.min(s);
+        smax = smax.max(s);
+        tmin = tmin.min(t);
+        tmax = tmax.max(t);
+    }
+    let pitch = pitch.max(1.0);
+    let step = step.clamp(0.35, 2.0);
+    let nrows = (((smax - smin) / pitch).floor() as usize) + 1;
+    let nsteps = (((tmax - tmin) / step).ceil() as usize) + 2;
+    // 每一层错开行相位：否则不同角度的行都从同一个角落起算，交叉点会结块。
+    let s0 = smin + pitch * (phase.fract().abs() * 0.97);
+    const HYST: f32 = 0.02;
+    // 行内先做 1mm 级滑动平均再判「画不画」。
+    //
+    // 直接用逐像素的 f 卡阈值，原稿调子 1~2mm 的起伏会把每一行切成一截一截的
+    // 短杠——放大看还是「碎排线」，不是交叉排线的长直线。沿行方向平均、不跨行，
+    // 既能拉直成线，又保留「哪几行该落笔」的横向精度：眉毛是几条暗行，脸颊是
+    // 一片浅行，彼此不会糊在一起。细线由细节层负责，不靠排线去描。
+    let rs = ((0.5 * smooth_px / step).round() as usize).clamp(1, nsteps.max(1));
+    let mut row_f = vec![0f32; nsteps];
+    let mut prefix = vec![0f32; nsteps + 1];
+    for r in 0..nrows {
+        let s = s0 + r as f64 * pitch;
+        if s > smax + 0.5 * pitch {
+            break;
+        }
+        // 阈值不能落到 0 附近：一旦 d < HYST，滞回的「继续」条件 `f > d - HYST`
+        // 在 f = 0 的纸面上也成立，一根线会从人脸一直划到画布外，正好就是
+        // 用户看到的「跨过整张图的长斜线」。最稀的一层也保留约 1/25 的行。
+        let d = (((r as f64 + 0.5) * 0.618_033_988_749_894_8 + phase * 7.13).fract() as f32)
+            .max(0.04);
+        for k in 0..nsteps {
+            let t = tmin + k as f64 * step;
+            let x = s * nx + t * ux;
+            let y = s * ny + t * uy;
+            if x < 0.0 || y < 0.0 || x > wf || y > hf {
+                row_f[k] = 0.0;
+            } else {
+                row_f[k] = bil(fmap, w, h, x - 0.5, y - 0.5);
+            }
+        }
+        prefix[0] = 0.0;
+        for k in 0..nsteps {
+            prefix[k + 1] = prefix[k] + row_f[k];
+        }
+        // 蛇形走笔：相邻两行反向，出图时笔少空跑，也不容易在同一头堆墨。
+        let rev = r % 2 == 1;
+        let mut t_start: Option<f64> = None;
+        let mut t_last = 0.0f64;
+        let mut raw: Vec<(f64, f64)> = Vec::new();
+        for k in 0..nsteps {
+            let kk = if rev { nsteps - 1 - k } else { k };
+            let t = tmin + kk as f64 * step;
+            let lo_k = kk.saturating_sub(rs);
+            let hi_k = (kk + rs + 1).min(nsteps);
+            let f = (prefix[hi_k] - prefix[lo_k]) / (hi_k - lo_k) as f32;
+            // 逐行抖动阈值：这一行在「覆盖率要求 > d」的地方落笔。
+            // 一行只在平滑后的覆盖率高于自己的抖动值时画，整块浅调里正好
+            // 有 d 比例的行被选中，落墨量≈目标。以前用「起笔后只要有活就
+            // 一直画」的滞回，行从头发进入脸时不会停，一张图里几乎每行都
+            // 会经过某处暗部、被点亮一次，于是浅调区域被所有行刷满——
+            // 实测浅格落墨是目标的 2~3 倍，正是用户看到的「浅处发灰、
+            // 长线横穿脸」。阈值处的碎断交给后面的断口合并（≤1.5mm）修掉。
+            let on = f > d + HYST;
+            if on {
+                if t_start.is_none() {
+                    t_start = Some(t);
+                }
+                t_last = t;
+            } else if let Some(a) = t_start.take() {
+                raw.push((a.min(t_last), a.max(t_last)));
+            }
+        }
+        if let Some(a) = t_start.take() {
+            raw.push((a.min(t_last), a.max(t_last)));
+        }
+        // 把同一行里的小断口合回去：放大后 3~5mm 的碎段最像「排线乱」。
+        // 只有接近 1mm 的空白才算真正的断开（五官间隙、高光边）。
+        raw.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let gap = min_len * 4.0;
+        let mut i = 0;
+        while i < raw.len() {
+            let (lo, mut hi) = raw[i];
+            i += 1;
+            while i < raw.len() && raw[i].0 - hi <= gap {
+                hi = hi.max(raw[i].1);
+                i += 1;
+            }
+            if hi - lo >= min_len {
+                runs.push((
+                    (s * nx + lo * ux, s * ny + lo * uy),
+                    (s * nx + hi * ux, s * ny + hi * uy),
+                ));
+            }
+        }
+    }
+    runs
+}
+
+/// 与本流水线配套的墨量模拟：线宽严格等于笔宽，只做最近像素填充。
+///
+/// 旧的 `stamp_ink` 带固定 0.9px 软边；0.2mm 笔在 9px/mm 下本体只有 1.8px，
+/// 软边把线抹成近 0.5mm，`view` 会高估墨量两三倍——浅调刚排一层就「够了」，
+/// 纸上却几乎空白。这里按真实笔宽刷，模糊交给后面的 `view` 平均。
+fn stamp_ink_hard(
+    ink: &mut [f32],
+    w: usize,
+    h: usize,
+    a: (f64, f64),
+    b: (f64, f64),
+    half: f64,
+    dark: f32,
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let half = half.max(0.35);
+    let pad = half + 1.0;
+    let x0 = (a.0.min(b.0) - pad).floor().max(0.0) as usize;
+    let y0 = (a.1.min(b.1) - pad).floor().max(0.0) as usize;
+    let x1 = ((a.0.max(b.0) + pad).ceil() as isize)
+        .min(w as isize - 1)
+        .max(0) as usize;
+    let y1 = ((a.1.max(b.1) + pad).ceil() as isize)
+        .min(h as isize - 1)
+        .max(0) as usize;
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let r2 = half * half;
+    for yy in y0..=y1 {
+        for xx in x0..=x1 {
+            let (px, py) = (xx as f64 + 0.5, yy as f64 + 0.5);
+            let t = if len2 > 1e-12 {
+                (((px - a.0) * dx + (py - a.1) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let qx = a.0 + dx * t;
+            let qy = a.1 + dy * t;
+            let d2 = (px - qx) * (px - qx) + (py - qy) * (py - qy);
+            if d2 <= r2 {
+                let i = yy * w + xx;
+                if dark > ink[i] {
+                    ink[i] = dark;
+                }
+            }
+        }
+    }
+}
+
+/// 交叉排线基底的分层排线。
+///
+/// 上一版（`stroke_polylines_legacy`）的落笔单位是「每根 2~6mm 的短笔触」，
+/// 方向来自逐像素方向场再加抖动。放大看有三个硬伤：
+/// 1. 目标场被 0.8mm 平均，原稿 1~2px 的排线/发丝在目标里就被抹掉了；
+/// 2. 每根笔触各取各的方向，相邻笔触能差几十度，排线是「乱」的；
+/// 3. 落笔位置由随机数决定，线距不匀，暗部堆成黑块、亮部留白。
+///
+/// 这一版把动作换成和交叉排线同一套：**一族平行、等距、横贯区域的直线**。
+/// 不同的只是每一层有自己的角度、笔和「补多少墨」的预算：
+/// - 浅调只落一层最细的 HB，单方向、很疏；
+/// - 中间调叠第二层 2B，方向转 90°；
+/// - 暗部再叠 4B/8B 和对角方向，覆盖率接近满格。
+///
+/// 每一层画完把墨量并集重新平均一次，下一层只看**还差多少**。调子因此是
+/// 由「线的疏密 × 笔的深浅」堆出来的，不会像旧版那样靠反复描同一条线变黑。
 pub(crate) fn stroke_polylines(
     gray: &image::GrayImage,
     w: u32,
@@ -1168,7 +670,6 @@ pub(crate) fn stroke_polylines(
     order_mode: u8,
     order_block_px: u32,
     base_angle_deg: f64,
-    edge_threshold: f64,
     pens: &[HatchPen],
     multi_pen: bool,
 ) -> HatchOut {
@@ -1180,10 +681,10 @@ pub(crate) fn stroke_polylines(
             pens: pens_out,
         };
     }
+    // 方向和长度都不再逐笔决定：方向由层角度给定（这是「不乱」的前提），
+    // 排线本来就横贯整块区域，短笔触长度参数在这里没有意义。
+    let _ = (follow_mode, stroke_len_mm);
     let pen_mm = pen_mm.clamp(0.15, 1.6);
-    let passes = passes.clamp(2, 8) as usize;
-    let stroke_len = stroke_len_mm.clamp(1.5, 8.0);
-    let follow = follow_mode.min(2);
     let field = Field::build(gray, w, h, scale, invert, pen_mm);
     let ht = hatch_tone(&field, gray, invert, threshold);
     let fw = field.w;
@@ -1191,161 +692,101 @@ pub(crate) fn stroke_polylines(
     let npix = fw * fh;
     let px_mm = field.px_mm.max(1e-9);
     let base = base_angle_deg.to_radians();
-    // 局部「线条密度」：细尺度脊响应在 1.5mm 内的平均。它量的不是明暗，
-    // 而是「这片地方原稿排了多少线」——浅而密的排线调子很低，但密度很高，
-    // 只按调子反算间距会把它们排成大间距的深线，完全不是原稿的样子。
-    let r_tex = ((1.5 / px_mm).round() as usize).clamp(2, 24);
-    let ridge_cap: Vec<f32> = field.ridge.iter().map(|&r| r.min(0.12)).collect();
-    let tex = box_blur(&ridge_cap, fw, fh, r_tex);
-    if std::env::var("SKETCH_DEBUG").is_ok() {
-        let mut tv: Vec<f32> = (0..npix)
-            .filter(|&i| !ht.bg[i] && ht.tone[i] > 0.004)
-            .map(|i| tex[i])
-            .collect();
-        tv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let q = |f: f64| {
-            if tv.is_empty() {
-                0.0
-            } else {
-                tv[((tv.len() - 1) as f64 * f) as usize]
+
+    if let Ok(p) = std::env::var("SKETCH_DUMP_TONE") {
+        let mut img = image::GrayImage::new(fw as u32, fh as u32);
+        for y in 0..fh {
+            for x in 0..fw {
+                let v = (ht.tone[y * fw + x] * 255.0).clamp(0.0, 255.0) as u8;
+                img.put_pixel(x as u32, y as u32, image::Luma([v]));
             }
-        };
-        eprintln!(
-            "纹理密度：p10 {:.4} p25 {:.4} p50 {:.4} p75 {:.4} p90 {:.4} p98 {:.4}（场 {}×{}，px_mm {:.3}）",
-            q(0.10),
-            q(0.25),
-            q(0.50),
-            q(0.75),
-            q(0.90),
-            q(0.98),
-            fw,
-            fh,
-            px_mm
-        );
-        for (x, y, label) in [
-            (500usize, 600usize, "额头"),
-            (400, 1200, "左脸"),
-            (700, 700, "脸颊"),
-            (100, 400, "背景左上"),
-            (900, 400, "头发"),
-            (800, 1300, "右脸"),
-            (960, 1700, "颈"),
-            (1190, 330, "发右"),
-            (480, 850, "颈半"),
-            (350, 475, "额半"),
-            (240, 1100, "左颊半"),
-            (700, 350, "发1"),
-            (780, 400, "发2"),
-            (820, 480, "发3"),
-            (760, 560, "发4"),
-            (880, 330, "发5"),
-            (700, 480, "发6"),
-            (620, 420, "发7"),
-            (390, 1045, "衬衫左"),
-            (430, 1085, "衬衫中"),
-            (480, 1140, "衬衫下"),
-            (515, 1060, "衬衫右"),
-            (250, 700, "左脸"),
-            (330, 760, "面中"),
+        }
+        let _ = img.save(&p);
+        for (fx, fy, label) in [
+            (0.70, 0.28, "右发"),
+            (0.38, 0.52, "脸颊"),
+            (0.48, 0.38, "额头"),
+            (0.07, 0.36, "背景左"),
+            (0.92, 0.10, "背景右"),
         ] {
-            if x < fw && y < fh {
-                let i = y * fw + x;
-                let (a1, c1) = field.ang_at(x as f64, y as f64);
-                let (a2, c2) = field.smooth_ridge_ang_at(x as f64, y as f64);
-                let (a3, c3) = field.broad_ridge_ang_at(x as f64, y as f64);
-                let (a4, c4) = stroke_dir(&field, follow, base, x as f64, y as f64);
-                eprintln!(
-                    "  纹理 {label} ({x},{y})：调子 {:.3} 脊 {:.4} 归一脊 {:.3} 密度 {:.4} | \
-                     等照 {:.0}°/{:.2} 脊向 {:.0}°/{:.2} 块向 {:.0}°/{:.2} 合成 {:.0}°/{:.2}",
-                    field.tone[i],
-                    field.ridge[i],
-                    field.nridge[i],
-                    tex[i],
-                    a1.to_degrees(),
-                    c1,
-                    a2.to_degrees(),
-                    c2,
-                    a3.to_degrees(),
-                    c3,
-                    a4.to_degrees(),
-                    c4
-                );
-            }
+            let x = ((fx * fw as f64) as usize).min(fw - 1);
+            let y = ((fy * fh as f64) as usize).min(fh - 1);
+            eprintln!("  调子场 {label} = {:.3}", ht.tone[y * fw + x]);
         }
     }
 
-    // —— 把调子摊到这张图自己的范围上 ——
-    //
-    // 素描稿的「最黑」通常只有 0.5~0.8：线条之间的纸白把 1.3mm 均值拉亮了。
-    // p98 归一化后再留一个很低的死区挡纸纹，其余摊开；threshold 只调对比。
+    // 纹理密度与邻近墨只用于纸白判定（见下）。
+    let r_tex = ((1.5 / px_mm).round() as usize).clamp(2, 24);
+    let ridge_cap: Vec<f32> = field.ridge.iter().map(|&r| r.min(0.12)).collect();
+    let tex = box_blur(&ridge_cap, fw, fh, r_tex);
+    let r_near = ((1.2 / px_mm).round() as usize).clamp(2, 20);
+    let near_ink = box_blur(&ridge_cap, fw, fh, r_near);
+
+    // —— 调子分布（调试用）——
     let mut tops: Vec<f32> = (0..npix)
         .filter(|&i| !ht.bg[i] && ht.tone[i] > 0.004)
         .map(|i| ht.tone[i])
         .collect();
     tops.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let tone_hi = if tops.is_empty() {
-        0.10
-    } else {
-        tops[(tops.len() * 98 / 100).min(tops.len() - 1)]
-            .max(0.06)
-            .min(1.0)
-    };
-    // 死区只挡纸纹。原稿左脸实测只有 0.031 的浅调子（还有可见排线），
-    // 0.015 的死区 + 0.015 的起笔门槛正好把它吃干净，脸就白了。
-    // 纸白本身是 0.000，靠背景掩码排除；这里只留 0.5% 给扫描噪点。
-    let dead = tone_hi * 0.005;
-    // 调子曲线：gamma < 1 才留得住中间调。
-    //
-    // 上一版用 0.82+0.70*threshold（默认 1.32），把脸颊 0.1 的调子压到 0.05：
-    // 实测亮档墨量只有原稿的 23%，脸像没画。素描的中间调本来就是靠
-    // 「细而密的浅排线」堆出来的，压暗曲线等于把这一层直接抹掉。
-    // 门槛仍留给用户调对比，但映射回到 0.70~0.95，最亮档也有肉。
-    let gamma = 0.70 + 0.25 * threshold as f32;
     if std::env::var("SKETCH_DEBUG").is_ok() && !tops.is_empty() {
         let q = |f: f64| tops[((tops.len() - 1) as f64 * f) as usize];
         eprintln!(
-            "素描笔触：有效调子 p10 {:.3} p25 {:.3} p50 {:.3} p75 {:.3} p90 {:.3} p98 {:.3}；死区 {dead:.3}",
-            q(0.10), q(0.25), q(0.50), q(0.75), q(0.90), q(0.98)
+            "分层排线：绝对调子 p10 {:.3} p50 {:.3} p90 {:.3} p98 {:.3}",
+            q(0.10),
+            q(0.50),
+            q(0.90),
+            q(0.98)
         );
     }
+
+    // —— 块面调子 ——
+    // 排线负责的是「这一片该压多黑」，不是「这个像素有多黑」。原稿里的
+    // 1~2px 暗线（发丝、睫毛、排线本身）如果直接进调子场，一根头发就会把
+    // 周围几毫米拖进 4B/8B，眉毛和头发被涂成黑板；而它们本来是细节层的活。
+    // 所以先做 1.35mm 平均，只留下块面明暗；单像素的线交给细节层去描。
+    let mut tone_raw = vec![0f32; npix];
+    for i in 0..npix {
+        if !ht.bg[i] {
+            tone_raw[i] = ht.tone[i];
+        }
+    }
+    let r_mass = ((2.20 / px_mm).round() as usize).clamp(1, 30);
+    let tone_mass = box_blur(&tone_raw, fw, fh, r_mass);
+
+    // `target` = 这一小块纸面该压到多黑（0 = 纸白，1 = 全黑）。
+    // 排线的覆盖率不等于连续调子：同样 0.15 的墨量，一排 0.2mm 的线在纸上
+    // 远看确实是一层浅灰，但落笔覆盖与墨深是两回事，覆盖模型本身会低估
+    // 叠线后的实际暗度；整体抬一档再交给物理墨量评测校准。
+    const TONE_GAIN: f32 = 1.08;
     let mut target = vec![0f32; npix];
     for i in 0..npix {
         if ht.bg[i] {
             continue;
         }
-        let u = ((ht.tone[i] - dead) / (tone_hi - dead).max(1e-6)).clamp(0.0, 1.0);
-        let by_tone = u.powf(gamma);
-        // 纹理密度给出的下限：原稿这里排了多少线，就用细笔排多密。
-        // 只按平均调子算，浅而密的排线（脸）会被当成「几乎白」而排成大间距
-        // 的深线，稀疏得完全不像原稿；只按纹理算，暗部又不够黑。两者取大。
-        let by_tex = (((tex[i] - 0.006) / 0.030).clamp(0.0, 1.0)).powf(0.8) * 0.17;
-        // 浅调子的「肉」：0.02~0.15 的柔和阴影在原稿里是一层看得见的细排线，
-        // 但幂映射后低于起笔门槛，脸会大片留白。给浅调一个缓坡下限，
-        // 只作用于明确高于纸纹的像素（>0.018），纸白/背景仍然不落笔。
-        //
-        // 这里不能再用 sqrt：开方会把 0.02 的浅调抬到 0.2 以上，而且很早就
-        // 撞上一层固定的天花板——脸、脖子、嘴唇全被抬成同一档灰，原稿的
-        // 「浅→中」层次就没了（实测脖子、嘴唇的墨量是原稿的 1.9~2.2 倍）。
-        // 改成单调缓坡：浅处只微微提，越深提得越多，层次跟着调子走。
-        let by_shade = if ht.tone[i] > 0.018 {
-            by_tone.powf(0.80) * 0.72
+        // 纸白门槛与旧版一致：只挡纸面/背景，不挡脸。
+        let paper = tone_mass[i] < 0.015
+            && tex[i] < 0.0055
+            && near_ink[i] < 0.0025
+            && ht.detail[i].abs() < 0.03;
+        if paper {
+            continue;
+        }
+        // 绝对调子就是「这一片纸面该有多黑」：不再按本图最深的 p98 拉伸。
+        // 拉伸会让浅调人像整张脸被推到 0，同时把头发钉死在 1——对比度是
+        // 由原稿决定的，不是由最黑的那个像素决定的。
+        let by_tone = (tone_mass[i] * TONE_GAIN).min(0.92);
+        let has_ink = tone_mass[i] > 0.05;
+        let by_tex = if has_ink {
+            (((tex[i] - 0.008) / 0.030).clamp(0.0, 1.0)).powf(0.8) * 0.018
         } else {
             0.0
         };
-        // 最黑处留一点纸，并且把「大片深发」和「真重音」分开：
-        // 实测按 0.78 排线，6mm 格的暗部墨量是原稿的 1.4 倍，头发比原稿还黑。
-        // 大片深发压到 0.46：发丛主体只让 HB+2B 细排。4B 0.8mm、8B 1.0mm
-        // 铺在整片头发上就是一根根粗黑杠，原稿的头发是 0.2mm 细线密的；
-        // 粗笔只留瞳孔/眼线（>0.90 → 0.88）。
-        let cap = if ht.tone[i] > 0.90 {
-            0.88
-        } else if ht.tone[i] > 0.70 {
-            0.66
-        } else {
-            0.88
-        };
-        target[i] = by_tone.max(by_tex).max(by_shade).min(cap);
+        target[i] = by_tone.max(by_tex);
     }
+    // 密度场只做 0.9mm 平均：块面调子已经 1.35mm 平均过，这里再把边界抹圆，
+    // 排线才不会沿着 1~2mm 的调子起伏断开。
+    let r_tone = ((1.20 / px_mm).round() as usize).clamp(1, 16);
+    target = box_blur(&target, fw, fh, r_tone);
     if let Ok(p) = std::env::var("SKETCH_DUMP_TARGET") {
         let mut img = image::GrayImage::new(fw as u32, fh as u32);
         for y in 0..fh {
@@ -1356,193 +797,6 @@ pub(crate) fn stroke_polylines(
         }
         let _ = img.save(&p);
     }
-    if std::env::var("SKETCH_DEBUG").is_ok() {
-        for (x, y, label) in [
-            (300usize, 450usize, "左额上"),
-            (350, 650, "左额"),
-            (330, 850, "左颊"),
-            (430, 800, "左颊内"),
-            (600, 950, "鼻梁"),
-            (800, 950, "右颊"),
-            (900, 500, "发中"),
-            (1000, 700, "发右"),
-            (350, 750, "左眼"),
-            (500, 745, "右眼"),
-            (460, 745, "右眼内"),
-        ] {
-            if x < fw && y < fh {
-                let i = y * fw + x;
-                let (sa, sc) = field.smooth_ridge_ang_at(x as f64, y as f64);
-                let (ia, ic) = field.ang_at(x as f64, y as f64);
-                let (ba, bc) = field.broad_ridge_ang_at(x as f64, y as f64);
-                let (ua, uc) = stroke_dir(&field, follow, base, x as f64, y as f64);
-                eprintln!(
-                    "  目标 {label} ({x},{y})：调子 {:.3} 归一脊 {:.3} 密度 {:.4} 背景 {} → 目标 {:.3}；脊向 {:.0}°/{:.2} 等照 {:.0}°/{:.2} 宽向 {:.0}°/{:.2} → 用 {:.0}°/{:.2}",
-                    ht.tone[i],
-                    field.nridge[i],
-                    tex[i],
-                    ht.bg[i],
-                    target[i],
-                    sa.to_degrees(),
-                    sc,
-                    ia.to_degrees(),
-                    ic,
-                    ba.to_degrees(),
-                    bc,
-                    ua.to_degrees(),
-                    uc
-                );
-            }
-        }
-    }
-
-    // 纸白门槛：只挡纸面与背景，不再把整张脸一起挡掉。
-    //
-    // 上一版按 0.05+0.22*threshold（约 0.21）设门槛，而这张稿子的脸颊
-    // 归一化调子只有 0.09：整张脸都低于门槛，浅笔（HB/2B）一笔都落不下去，
-    // 最后只剩 8B 在黑发上压出粗条。门槛回到纸纹量级后，浅调靠缺口自然排疏，
-    // 多笔分层也才真正生效。
-    let paper_gate = 0.006f32;
-
-    // —— 多笔：按各笔满覆盖深度分带，浅笔先补它那一档 ——
-    let m_eff = if multi_pen {
-        pens.len().min(4).max(1)
-    } else {
-        1
-    };
-    let mut bounds = Vec::with_capacity(m_eff + 1);
-    bounds.push(0.0f32);
-    if m_eff > 1 {
-        // 分界按各笔自己的深度：HB 补到 0.45、2B 到 0.65、4B 到 0.82、
-        // 8B 收尾。同样的墨量，0.3mm 的线比 0.5mm 的线细一倍——用户要的
-        // 「线更细、更密」只能靠让最细的 HB 多干活：目标覆盖率不变时，
-        // 细笔要多排一倍行数才够墨，密度自然上去，单根线却更细。
-        //
-        // 之前用过两个映射，都让粗笔过早接管：
-        // - 按用墨量正比（HB 0.16 / 2B 0.38 / 4B 0.67 / 8B 1.0）：8B 从 0.67
-        //   就接管，整片头发被 1mm 黑条盖死，细发丝全丢；
-        // - 按 1/笔深（0.37 / 0.63 / 0.83 / 1.0）：HB/2B 被推到 0.83，
-        //   脸和衬衫为了补足墨量反复叠线，画面发脏。
-        for p in &pens[..m_eff] {
-            bounds.push(p.darkness.clamp(0.2, 1.0));
-        }
-        if let Some(last) = bounds.last_mut() {
-            *last = 1.0;
-        }
-        if m_eff == 4 {
-            // 分界按「每支笔铺到这一档时覆盖率还在排线范围（0.8 左右）」来定，
-            // 而不是按笔的浓度。按浓度分（0.42/0.62/0.80/1.0）时，HB 为了够
-            // 0.42 要在暗部铺满 100% 覆盖——画面变成灰饼、笔数爆炸（HB 一条
-            // 笔就 25 万毫米），4B/8B 反而被预算挤掉，最深的头发全靠 HB 的 150
-            // 灰撑着。改成 0.34/0.52/0.70 后，HB 在 0.81 覆盖处交棒，深发
-            // 由 4B 在 0.84 覆盖处接手，8B 才轮得到瞳孔和发芯。
-            bounds[1] = 0.34;
-            bounds[2] = 0.52;
-            bounds[3] = 0.70;
-        }
-    } else {
-        bounds.push(1.0);
-    }
-
-    let only_contour = std::env::var("SKETCH_ONLY").ok().as_deref() == Some("contour");
-    let only_hatch = std::env::var("SKETCH_ONLY").ok().as_deref() == Some("hatch");
-    // 诊断用：只留原稿墨脊（细节层），用来分辨「形不对」是提取的问题
-    // 还是合成排线/结构层压上去的问题。
-    let only_detail = std::env::var("SKETCH_ONLY").ok().as_deref() == Some("detail");
-
-    // 细节线归「细而够深」的那支笔，而不是最深最粗的 8B：
-    // 拿 1.0mm 笔去描发丝/眼线，会把它们涂成黑带。
-    let detail_pen = if m_eff > 1 {
-        let mut best = 0usize;
-        let mut best_d = f64::INFINITY;
-        for (i, p) in pens[..m_eff].iter().enumerate() {
-            // 细节线取「浓度最接近 0.65」的那支笔。旧的「最深 − k×线宽」
-            // 打分在四支笔线宽都收窄后会选到 8B，发丝立刻变粗。
-            let d = (p.darkness as f64 - 0.65).abs();
-            if d < best_d {
-                best_d = d;
-                best = i;
-            }
-        }
-        best as u8
-    } else {
-        0
-    };
-    let detail_width = if m_eff > 1 {
-        pens[detail_pen as usize].width_mm.clamp(0.15, 1.6)
-    } else {
-        pen_mm
-    };
-    let detail_depth = if m_eff > 1 {
-        pens[detail_pen as usize].darkness.clamp(0.2, 1.0)
-    } else {
-        1.0
-    };
-    // 浅结构线用小笔：下颌、鼻梁这些是「形」而不是「重音」，
-    // 拿 2B 画会和发丝、眼线抢重。最细的那支笔（HB）刚好。
-    let fine_pen = if m_eff > 1 {
-        let mut best = 0usize;
-        for i in 1..m_eff {
-            if pens[i].width_mm < pens[best].width_mm {
-                best = i;
-            }
-        }
-        best as u8
-    } else {
-        0
-    };
-    let fine_width = if m_eff > 1 {
-        pens[fine_pen as usize].width_mm.clamp(0.15, 1.6)
-    } else {
-        pen_mm
-    };
-    let fine_depth = if m_eff > 1 {
-        pens[fine_pen as usize].darkness.clamp(0.2, 1.0)
-    } else {
-        1.0
-    };
-
-    let detail = if only_hatch {
-        Vec::new()
-    } else {
-        // 检测尺度用「画细节的那支细笔」，不用 2B：原稿脸颊排线只有 1~2px，
-        // 按 0.5mm 的笔宽去拉开间距，会把相邻两根浅排线并成一根。
-        source_detail_strokes(&field, &ht, threshold, fine_width)
-    };
-    // 分开落笔：浅线用细笔、深线用 2B。投影笔没有压力，
-    // 一条线只能靠「哪支笔画」来决定轻重；混在一支笔里，
-    // 下颌线要么太黑、要么太浅。
-    let (mut detail_light, mut detail_dark): (Vec<Stroke>, Vec<Stroke>) = detail
-        .into_iter()
-        .partition(|s| s.mean_dark < 0.50);
-
-    // 细节线先记进「已落墨」：合成排线看到发丝/眼线已经画过，就不会在上面
-    // 再糊一层同向线，既保住细节，也省笔墨。
-    let mut ink = vec![0f32; npix];
-    for (list, w_mm, d) in [
-        (&detail_light, fine_width, fine_depth),
-        (&detail_dark, detail_width, detail_depth),
-    ] {
-        for s in list {
-            for seg in s.pts.windows(2) {
-                stamp_ink(
-                    &mut ink,
-                    fw,
-                    fh,
-                    seg[0],
-                    seg[1],
-                    // 占位要按细节线的真实墨量记：上一版只记 0.85 深度，
-                    // 合成排线以为发丝间还空着 15%，又补了一层，头发就糊成黑块。
-                    // 放大到 0.68 笔宽：细节线画在最后，排线必须让位，否则同一根
-                    // 发丝会被「提取线 + 合成线」叠两遍，黑成一片。
-                    (w_mm * 0.68) / px_mm,
-                    d,
-                );
-            }
-        }
-    }
-    let r_view = ((0.70 / px_mm).round() as usize).clamp(1, 12);
-    let mut view = box_blur(&ink, fw, fh, r_view);
     if let Ok(p) = std::env::var("SKETCH_DUMP_BG") {
         let mut img = image::GrayImage::new(fw as u32, fh as u32);
         for y in 0..fh {
@@ -1553,6 +807,308 @@ pub(crate) fn stroke_polylines(
         }
         let _ = img.save(&p);
     }
+
+    let m_eff = if multi_pen {
+        pens.len().min(4).max(1)
+    } else {
+        1
+    };
+    let pen_dark = |p: usize| -> f32 {
+        if m_eff > 1 {
+            pens[p].darkness.clamp(0.2, 1.0)
+        } else {
+            0.85
+        }
+    };
+    let pen_width = |p: usize| -> f64 {
+        if m_eff > 1 {
+            pens[p].width_mm.clamp(0.15, 1.6)
+        } else {
+            pen_mm
+        }
+    };
+
+    let only_hatch = std::env::var("SKETCH_ONLY").ok().as_deref() == Some("hatch");
+    let only_detail = std::env::var("SKETCH_ONLY").ok().as_deref() == Some("detail");
+
+    // —— 细节层：原稿真实画出来的线（发丝、眼线、衣褶、浅排线）——
+    //
+    // 排线的行距最细也有 0.3~0.5mm，斜着穿过一根 0.1mm 的发丝只能留下一个小段；
+    // 这些线必须单独描一遍，否则 5 倍放大后脸和头发都是「格子」而没有「线」。
+    let detail = if only_hatch {
+        Vec::new()
+    } else {
+        let narrow = (0..m_eff)
+            .map(pen_width)
+            .fold(f64::INFINITY, f64::min)
+            .min(pen_mm.max(0.15));
+        source_detail_strokes(&field, &ht, threshold, narrow)
+    };
+    let abs_at = |x: f64, y: f64| -> f32 {
+        let xi = (x as usize).min(fw - 1);
+        let yi = (y as usize).min(fh - 1);
+        let v = gray.get_pixel(xi as u32, yi as u32).0[0] as f32;
+        ((field.paper - v) / field.paper.max(1.0)).clamp(0.0, 1.0)
+    };
+    // 细节是「线」，不是「块」。以前只发最细的两支笔，结果睫毛、眼线、
+    // 鼻底这些原稿压得最重的地方，描出来也只有 2B 的灰（0.50），还没旁边
+    // 排线深——放大看五官是糊的。现在按原稿墨量分到 HB/2B/4B 三档；
+    // 4B 线宽 0.32mm 仍在「线」的范围内，再往上才有黑棍感。
+    let pen_for_abs = |a: f32| -> usize {
+        if m_eff <= 1 {
+            return 0;
+        }
+        let limit = 2.min(m_eff - 1);
+        for i in 0..=limit {
+            if pen_dark(i) >= a * 0.85 {
+                return i;
+            }
+        }
+        limit
+    };
+    let mut buckets: Vec<Vec<Stroke>> = (0..m_eff).map(|_| Vec::new()).collect();
+    for s in detail {
+        let n = s.pts.len().max(1) as f32;
+        let need: f32 = s.pts.iter().map(|&(x, y)| abs_at(x, y)).sum::<f32>() / n;
+        buckets[pen_for_abs(need)].push(s);
+    }
+
+    // 细节层先落纸：排线只补「细节还不够黑」的那部分。
+    // 以前细节最后画、排线不知道它的存在，头发里密集的发丝被同一块 8B
+    // 排线压在下面——放大看只剩一片带白点的黑，发丝一根也看不见。
+    // 这里按 2.2mm 尺度量出细节已经提供的墨量，从目标里减掉；尺度取得和
+    // 块面调子一样，才不会有「绕着每根线留一圈白晕」的浮雕感。
+    let mut detail_ink = vec![0f32; npix];
+    for (p, list) in buckets.iter().enumerate() {
+        let (pw, pdark) = (pen_width(p), pen_dark(p));
+        let half = (pw * 0.5 / px_mm).max(0.5);
+        for s in list {
+            for w in s.pts.windows(2) {
+                stamp_ink_hard(&mut detail_ink, fw, fh, w[0], w[1], half, pdark);
+            }
+        }
+    }
+    let detail_mass = box_blur(&detail_ink, fw, fh, r_mass);
+    for i in 0..npix {
+        // 细节层只能提供最细两支笔的墨深（HB/2B）。在暗部它描的是发丝之间的
+        // 分界，不是整块的黑：若把细节墨量全额从目标里扣掉，头发会掉一档
+        // （实测暗档 0.57→0.48），还会在细节稀疏处留下白色针眼。按调子限制
+        // 扣除比例——亮处细节几乎就是全部墨量，暗处排线仍是底色。
+        // 暗部（头发、瞳孔）一点都不扣：细节在那里是发丝的分界，排线才是
+        // 整块的黑。扣了会在发丛里留下成片白针眼，放大看像掉墨。
+        let t = target[i];
+        let share = if t < 0.30 {
+            0.80
+        } else if t < 0.55 {
+            0.40
+        } else {
+            0.0
+        };
+        target[i] = (t - detail_mass[i] * share).max(0.0);
+    }
+
+    // —— 分层落线 ——
+    let mut ink = vec![0f32; npix];
+    let mut view = vec![0f32; npix];
+    // 0.9mm 约等于两个最粗行距：既能把「行」平均成调子，又看得到真实的缝。
+    let r_view = ((0.90 / px_mm).round() as usize).clamp(1, 60);
+    // 一层的目标覆盖率。线距 = 笔宽 / cov_max，所以一层最多补
+    // `笔深 × cov_max` 的墨；剩余缺口由下一层（另一支笔 / 另一个角度）补。
+    // 深笔覆盖率给得更高：暗部要靠「线挨线」才压得下去，浅笔留缝才有纸白。
+    // 每一层 =（笔, 方向）。全图只用两个方向（基准角与垂直），和交叉排线
+    // 一样：层与层之间是同一族平行线的加密与加深，不会织出四向乱网。
+    // 浅中调用 HB/2B 两个方向交叉；4B/8B 只在块面足够暗时补同一对方向。
+    const LAYER_PLAN: [(usize, f64); 8] = [
+        (0, 0.0),
+        (0, 90.0),
+        (1, 0.0),
+        (1, 90.0),
+        (2, 0.0),
+        (2, 90.0),
+        (3, 0.0),
+        (3, 90.0),
+    ];
+    // 单笔模式也只有基准角与垂直两族：层数越多只是同一族线排得更密、叠得更深，
+    // 和交叉排线一样。以前这里每层换一个角度（45/135/22/112…），几层下来就是
+    // 四向乱网——这正是用户说的「排线混乱」。
+    const SINGLE_DEG: [f64; 8] = [0.0, 90.0, 0.0, 90.0, 0.0, 90.0, 0.0, 90.0];
+    // 每支笔负责一个调子带：低于下沿不画，高于上沿交棒给下一支笔。
+    // 带在交界处重叠 0.08~0.10（渐变），两支笔各画一部分，看不出接缝。
+    // 带宽由「笔深 × 覆盖率」决定；这样同一块纸上最多叠两支笔，
+    // 不会出现四支笔全压上去的实心黑板（眉毛、发丛被涂黑的主因）。
+    const PEN_LO: [f32; 4] = [0.0, 0.14, 0.40, 0.64];
+    const PEN_HI: [f32; 4] = [0.28, 0.50, 0.74, 1.01];
+    const PEN_RAMP: [f32; 4] = [0.05, 0.06, 0.06, 0.06];
+    let n_layers = if only_detail {
+        0
+    } else {
+        passes.clamp(2, 8) as usize
+    };
+    const MAX_STROKES: usize = 120_000;
+    const MAX_LEN_MM: f64 = 900_000.0;
+    let mut stroke_no = 0usize;
+    let mut total_strokes = 0usize;
+    let mut total_len = 0.0f64;
+    // 行距按「真实笔宽」算；`view` 的每层墨量按同一套几何折算。
+    let hatch_jitter = (jitter_mm * 0.35).min(0.05);
+    for li in 0..n_layers {
+        if total_strokes >= MAX_STROKES || total_len >= MAX_LEN_MM {
+            break;
+        }
+        // 换笔时重算已落墨量。同一支笔的两个方向（li、li+1）共用这个 view：
+        // 第二个方向要的是同一个缺口，不是第一层画完后的残余。
+        if li % 2 == 0 && li > 0 {
+            view = box_blur(&ink, fw, fh, r_view);
+        }
+        // 笔和方向都来自固定计划；层数多出来的部分循环这套顺序。
+        let (p, deg) = if m_eff > 1 {
+            let (plan_p, plan_deg) = LAYER_PLAN[li % LAYER_PLAN.len()];
+            (plan_p.min(m_eff - 1), plan_deg)
+        } else {
+            (0, SINGLE_DEG[li % SINGLE_DEG.len()])
+        };
+        let (pw, pdark) = (pen_width(p), pen_dark(p));
+        let cov_max = if m_eff > 1 {
+            [0.72f64, 0.80, 0.88, 1.00][p.min(3)]
+        } else {
+            0.72
+        };
+        let half_px = (pw * 0.5 / px_mm).max(0.5);
+        let pitch_px = ((pw / cov_max) / px_mm).max(1.5);
+        let cov_eff = (2.0 * half_px / pitch_px).clamp(0.10, 1.0);
+        let cap = (pdark as f64 * cov_eff) as f32;
+        let ang = base + deg.to_radians();
+        let (lo, hi, ramp) = if m_eff > 1 {
+            (PEN_LO[p], PEN_HI[p], PEN_RAMP[p])
+        } else {
+            (0.0, 1.01, 0.10)
+        };
+        // 两个方向的配合：第一方向最多铺到 72% 的行密度，再暗由第二方向补。
+        // 浅调（n < 0.72）只有第一方向——和真实排线一样，浅灰是一族平行线，
+        // 不是网格；中间调开始出现交叉；暗部两个方向都满，才压得下去。
+        // 第二方向的密度由「并集 = 目标覆盖率」反解，不会重叠过量。
+        let is_b = li % 2 == 1;
+        let mut fmap = vec![0f32; npix];
+        let mut peak = 0.0f32;
+        for i in 0..npix {
+            if ht.bg[i] {
+                continue;
+            }
+            let t = target[i];
+            if t <= 0.035 {
+                continue;
+            }
+            let need = t - view[i];
+            if need <= 0.004 {
+                continue;
+            }
+            let gate = {
+                let up = if lo <= 0.0 {
+                    1.0
+                } else {
+                    let x = ((t - lo) / ramp).clamp(0.0, 1.0);
+                    x * x * (3.0 - 2.0 * x)
+                };
+                let dn = if hi >= 1.0 {
+                    1.0
+                } else {
+                    let x = ((t - hi) / 0.08).clamp(0.0, 1.0);
+                    1.0 - x * x * (3.0 - 2.0 * x)
+                };
+                up * dn
+            };
+            if gate <= 0.0 {
+                continue;
+            }
+            let n = (need / cap).clamp(0.0, 1.0) as f64;
+            let fa = n.min(0.72);
+            let f = if is_b {
+                let ua = fa * cov_eff;
+                let un = n * cov_eff;
+                if un > ua + 1e-4 {
+                    (((un - ua) / (1.0 - ua).max(1e-6)) / cov_eff).min(1.0)
+                } else {
+                    0.0
+                }
+            } else {
+                fa
+            };
+            let f = (f as f32) * gate;
+            if f > 0.02 {
+                fmap[i] = f;
+                if f > peak {
+                    peak = f;
+                }
+            }
+        }
+        if peak <= 0.0 {
+            continue;
+        }
+        let min_run = (0.37 / px_mm).max(1.5);
+        let runs = scan_layer_runs(
+            &fmap,
+            fw,
+            fh,
+            ang,
+            pitch_px,
+            li as f64 * 0.371,
+            0.8,
+            min_run,
+            (2.40 / px_mm).max(3.0),
+        );
+        if runs.is_empty() {
+            continue;
+        }
+        let mut layer: Vec<Stroke> = Vec::with_capacity(runs.len());
+        let mut layer_len = 0.0f64;
+        for &(a, b) in &runs {
+            let d = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+            let len_mm = d * px_mm;
+            if len_mm < 0.30 {
+                continue;
+            }
+            layer.push(Stroke {
+                pts: vec![a, b],
+                loose: [true, true],
+                len_mm,
+                mean_dark: pdark as f64,
+                mean_width_mm: pw,
+                theta: ang,
+                rank: 0.5,
+                structural: false,
+                passes: 1,
+            });
+            // 墨量按并集记：同一格被 2B 和 8B 各画一次，纸上仍是 8B 那一层。
+            stamp_ink_hard(&mut ink, fw, fh, a, b, half_px, pdark);
+            layer_len += len_mm;
+        }
+        if layer.is_empty() {
+            continue;
+        }
+        if std::env::var("SKETCH_DEBUG").is_ok() {
+            eprintln!(
+                "分层排线：层 {li} 笔 {p} 角度 {:.0}° 行距 {:.2}mm · {} 条 / {:.0}mm",
+                ang.to_degrees(),
+                pitch_px * px_mm,
+                layer.len(),
+                layer_len
+            );
+        }
+        total_strokes += layer.len();
+        total_len += layer_len;
+        emit_hatch_set(
+            &layer,
+            order_mode,
+            order_block_px,
+            scale,
+            hatch_jitter,
+            pw,
+            p as u8,
+            &mut stroke_no,
+            &mut out,
+            &mut pens_out,
+        );
+    }
     if let Ok(p) = std::env::var("SKETCH_DUMP_VIEW") {
         let mut img = image::GrayImage::new(fw as u32, fh as u32);
         for y in 0..fh {
@@ -1562,107 +1118,6 @@ pub(crate) fn stroke_polylines(
             }
         }
         let _ = img.save(&p);
-    }
-    if std::env::var("SKETCH_DEBUG").is_ok() {
-        for (x, y, label) in [
-            (300usize, 450usize, "左额上"),
-            (350, 650, "左额"),
-            (330, 850, "左颊"),
-            (430, 800, "左颊内"),
-            (600, 950, "鼻梁"),
-            (800, 950, "右颊"),
-            (900, 500, "发中"),
-            (1000, 700, "发右"),
-        ] {
-            if x < fw && y < fh {
-                let i = y * fw + x;
-                eprintln!(
-                    "  预落墨 {label}：目标 {:.3} 已墨 {:.3} 缺口 {:.3}",
-                    target[i],
-                    view[i],
-                    target[i] - view[i]
-                );
-            }
-        }
-    }
-
-    // 预算按「最细的笔」留足。笔宽收到 0.20mm 后，同样墨量要排近两倍
-    // 的线：HB 一遍就要 3.7 万笔，旧的 6 万上限让 2B/4B/8B 一笔都轮不到
-    // （实测 4B/8B = 0 条，暗部掉到原稿的 0.71 倍）。这里放宽到 16 万笔，
-    // 由各遍自己的缺口收敛把关，不至于无限排下去。
-    const MAX_STROKES: usize = 160_000;
-    const MAX_LEN_MM: f64 = 420_000.0;
-    let mut total_len = 0.0f64;
-    let mut total_strokes = 0usize;
-    let mut stroke_no = 0usize;
-
-    for p in 0..m_eff {
-        let (pw, pdark) = if m_eff > 1 {
-            (
-                pens[p].width_mm.clamp(0.15, 1.6),
-                pens[p].darkness.clamp(0.2, 1.0),
-            )
-        } else {
-            (pen_mm, 1.0)
-        };
-        let lo = bounds[p];
-        let hi = bounds[p + 1];
-        if hi - lo < 1e-4 {
-            continue;
-        }
-        for pass in 0..passes {
-            if only_contour || only_detail {
-                break;
-            }
-            if total_strokes >= MAX_STROKES || total_len >= MAX_LEN_MM {
-                break;
-            }
-            let seed = 0x51ed_2701_b4e9_2f0d
-                ^ (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ (pass as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
-            let layer = stroke_pass_v2(
-                &field,
-                &target,
-                &ht.bg,
-                &view,
-                &mut ink,
-                follow,
-                base,
-                lo.max(paper_gate),
-                hi,
-                pdark,
-                pw,
-                stroke_len,
-                pass,
-                seed,
-                MAX_STROKES.saturating_sub(total_strokes),
-            );
-            let n = layer.len();
-            if std::env::var("SKETCH_DEBUG").is_ok() {
-                eprintln!(
-                    "素描笔触：笔 {p} 第 {pass} 遍，{n} 条，累计 {:.0}mm",
-                    total_len + layer.iter().map(|s| s.len_mm).sum::<f64>()
-                );
-            }
-            if n == 0 {
-                break;
-            }
-            total_len += layer.iter().map(|s| s.len_mm).sum::<f64>();
-            total_strokes += n;
-            emit_hatch_set(
-                &layer,
-                order_mode,
-                order_block_px,
-                scale,
-                jitter_mm,
-                pw,
-                p as u8,
-                &mut stroke_no,
-                &mut out,
-                &mut pens_out,
-            );
-            view = box_blur(&ink, fw, fh, r_view);
-        }
     }
     if let Ok(p) = std::env::var("SKETCH_DUMP_INK") {
         let mut img = image::GrayImage::new(fw as u32, fh as u32);
@@ -1675,152 +1130,22 @@ pub(crate) fn stroke_polylines(
         let _ = img.save(&p);
     }
 
-    // —— 结构层：少量真正的边（眼线、唇缝、下颌），细笔单遍压形 ——
-    if !only_hatch && !only_detail {
-        let contour =
-            contour_strokes(&field, &ht.detail, &ht.bg, scale, detail_width, edge_threshold);
-        let mut structural: Vec<Stroke> = contour
-            .into_iter()
-            .filter(|s| s.len_mm >= 2.2 && s.mean_dark >= 0.10)
-            .collect();
-        // 轮廓层只留「真形体」，不能把原稿脸上的浅排线也串成一条长线：
-        // 细线排线在 detail 图里同样是暗响应，骨架会把这些短笔触连成
-        // 几十毫米的「划痕」，压在排线上非常扎眼。用 1.3mm 归一调子
-        // （ht.tone，不是原始 tone）区分：五官、发丝处调子高，排线只是
-        // 0.02~0.10 的浅纹理。均值低的链一律丢掉。
-        //
-        // 门槛从 0.28 抬到 0.40：0.28 时额头、脸颊的密排线也被串成
-        // 几百条长斜线，整张脸读起来像刮痕。真轮廓（眼线、唇缝、下颌、
-        // 鼻孔）的 1.3mm 调子都在 0.5 以上，抬起门槛只砍伪线。
-        let before_n = structural.len();
-        structural.retain(|s| {
-            let n = s.pts.len().max(1);
-            let mean_tone: f32 = s
-                .pts
-                .iter()
-                .map(|&(x, y)| {
-                    let xi = (x as usize).min(fw.saturating_sub(1));
-                    let yi = (y as usize).min(fh.saturating_sub(1));
-                    ht.tone[yi * fw + xi]
-                })
-                .sum::<f32>()
-                / n as f32;
-            // 上限 0.90：瞳孔、眼线这些实心黑线的边界会被边缘检测抽出
-            // 一内一外两条平行线，再各描一笔就成了「双线 + 白芯」的方框。
-            // 这类黑线本身已经由原稿墨脊（细节深层）沿中线描出，轮廓层
-            // 只补中间调的形体边（脸颊阴影、鼻梁、下颌）。
-            //
-            // `passes == 1` 再挡一道：`contour_strokes` 把「响应超过强阈 3 倍」
-            // 的链标成双遍（眼线、睫毛、瞳孔边）。原稿真正画出来的线已经在
-            // 墨脊层里，轮廓层再描一遍就是两条叠在一起的粗线——眼睛因此
-            // 变成「双线白芯」。轮廓层只留弱响应（形体转折），强线全部让给墨脊。
-            mean_tone > 0.40 && mean_tone < 0.90 && s.passes == 1
-        });
-        if std::env::var("SKETCH_DEBUG").is_ok() {
-            eprintln!(
-                "素描笔触：轮廓去浅排线 {} → {} 条",
-                before_n,
-                structural.len()
-            );
-        }
-        // 结构层不能跟着排线总量一起缩：排线一稀，预算掉到 80mm，
-        // 只够留下 5 条边，整张脸就没有下颌线。给一个下限，至少保住形。
-        let budget = if only_contour {
-            1e9
-        } else {
-            (total_len * 0.10).clamp(900.0, 2_800.0)
-        };
-        let total: f64 = structural.iter().map(|s| s.len_mm).sum();
-        if total > budget {
-            let score = |s: &Stroke| s.len_mm.min(40.0) * s.mean_dark.clamp(0.0, 1.0).powi(2);
-            structural.sort_by(|a, b| {
-                score(b)
-                    .partial_cmp(&score(a))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut acc = 0.0f64;
-            structural.retain(|s| {
-                if acc + s.len_mm > budget && acc > 0.0 {
-                    return false;
-                }
-                acc += s.len_mm;
-                true
-            });
-        }
-        for s in structural.iter_mut() {
-            s.passes = 1;
-            // 等值线骨架在 1px 网格上是折线，直接描出来眼角、鼻翼全是方角。
-            // 三遍三点平均保留原稿的弯，只去掉像素锯齿——轮廓层要像原稿的
-            // 手绘线一样连续圆滑，而不是像排线那样一节节直段。
-            if s.pts.len() >= 3 {
-                smooth_in_place(&mut s.pts);
-                smooth_in_place(&mut s.pts);
-                smooth_in_place(&mut s.pts);
-            }
-        }
-        if std::env::var("SKETCH_DEBUG").is_ok() {
-            eprintln!(
-                "素描笔触：结构 {} 条 {:.0}mm（预算 {budget:.0}mm），总笔触 {:.0}mm",
-                structural.len(),
-                structural.iter().map(|s| s.len_mm).sum::<f64>(),
-                total_len
-            );
-            let mut longest: Vec<&Stroke> = structural.iter().collect();
-            longest.sort_by(|a, b| {
-                b.len_mm
-                    .partial_cmp(&a.len_mm)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for s in longest.iter().take(5) {
-                let n = s.pts.len().max(1);
-                let mt: f32 = s
-                    .pts
-                    .iter()
-                    .map(|&(x, y)| {
-                        let xi = (x as usize).min(fw.saturating_sub(1));
-                        let yi = (y as usize).min(fh.saturating_sub(1));
-                        ht.tone[yi * fw + xi]
-                    })
-                    .sum::<f32>()
-                    / n as f32;
-                eprintln!("  结构长线 {:.1}mm 调子 {:.2}", s.len_mm, mt);
-            }
-        }
-        emit_hatch_set(
-            &structural,
-            order_mode,
-            order_block_px,
-            scale,
-            jitter_mm,
-            detail_width,
-            detail_pen,
-            &mut stroke_no,
-            &mut out,
-            &mut pens_out,
-        );
-    }
-
-    // 细节最后画：原稿里的发丝、眼线、衣褶压在排线之上，形才立得住。
-    // 先浅后深：下颌/鼻梁的浅结构用细笔，发丝/眼线的重音用 2B 压在上面。
-    if only_contour {
-        detail_light.clear();
-        detail_dark.clear();
-    }
-    for (list, w_mm, depth, pen, label) in [
-        (&mut detail_light, fine_width, fine_depth, fine_pen, "浅细节"),
-        (&mut detail_dark, detail_width, detail_depth, detail_pen, "深细节"),
-    ] {
+    // 细节最后画：原稿真实存在的线压在排线之上，形才立得住。
+    // 不再把细节先记进「已落墨」——旧版那样做会让排线绕着细节留一圈白晕，
+    // 放大看就是发丝/眼线旁边一条白边。石墨叠在一起不会更黑，重一点无妨。
+    for (p, list) in buckets.iter_mut().enumerate() {
         if list.is_empty() {
             continue;
         }
+        let (pw, pdark) = (pen_width(p), pen_dark(p));
         for s in list.iter_mut() {
             s.passes = 1;
-            s.mean_width_mm = w_mm;
-            s.mean_dark = depth as f64;
+            s.mean_width_mm = pw;
+            s.mean_dark = pdark as f64;
         }
         if std::env::var("SKETCH_DEBUG").is_ok() {
             eprintln!(
-                "素描笔触：{label} {} 条 {:.0}mm，笔 {pen}",
+                "分层排线：细节笔 {p} {} 条 {:.0}mm",
                 list.len(),
                 list.iter().map(|s| s.len_mm).sum::<f64>()
             );
@@ -1831,8 +1156,8 @@ pub(crate) fn stroke_polylines(
             order_block_px,
             scale,
             jitter_mm,
-            w_mm,
-            pen,
+            pw,
+            p as u8,
             &mut stroke_no,
             &mut out,
             &mut pens_out,
@@ -1849,6 +1174,7 @@ pub(crate) fn stroke_polylines(
         pens: pens_out,
     }
 }
+
 
 /// 原稿细节层：墨脊 = 原稿里真实画出来的笔触。
 ///
@@ -1868,18 +1194,35 @@ fn source_detail_strokes(
     // 不做墨量自校准：目标是复现原稿的线位与线距，不是用 0.3mm 的笔去凑面积。
     let (mut strokes, _) =
         ridge_strokes_gated(field, pen_mm, threshold, 1.6, 0.012, 0.016, false);
+    let stage = |label: &str, v: &[Stroke]| {
+        if std::env::var("SKETCH_DEBUG").is_ok() {
+            eprintln!(
+                "  细节{label} {} 条 {:.0}mm",
+                v.len(),
+                v.iter().map(|s| s.len_mm).sum::<f64>()
+            );
+        }
+    };
+    stage("提取", &strokes);
     let fw = field.w;
     let fh = field.h;
     // 粗黑团块（瞳孔、虹膜、浓密发丛）内部的骨架不是「线」而是填充：
     // 照线描出来是一坨坨粗黑折块，把眼睛画成碎玻璃。轮廓、发丝都在
     // 0.7mm 以内；超过 1.05mm 的宽脊交给排线去填。
     strokes.retain(|s| s.mean_width_mm <= 1.05);
+    stage("宽度", &strokes);
+    // 只保留「真线」：发丝、眼线、唇缝、衣褶，以及原稿里明确画重的笔触；
+    // 另外把**浅排线**也放进来（门槛从 0.50 降到 0.20）。
+    //
+    // 0.50 是为了挡「骨架把相邻浅排线串成弯曲线」——那批伪线确实难看。
+    // 但一刀切掉浅排线等于把原稿最细的一层调子全丢了，只剩合成排线，
+    // 放大看就「没细节」。现在改用几何 + 方向 + 墨量三重校验：
+    // 只在「短、与局部排线同向、确实压在墨上」的地方保留浅排线，
+    // 乱串出来的弯线仍然会被丢掉。
+    strokes.retain(|s| s.mean_dark >= 0.16);
+    stage("墨深", &strokes);
     strokes.retain(|s| {
-        // 原稿的浅排线本身就有 1.5~5mm 的短段；位置和走向都是原作定的。
-        if s.len_mm < 1.5 {
-            return false;
-        }
-        if s.mean_dark < 0.010 {
+        if s.len_mm < 1.2 {
             return false;
         }
         // 只看中点会漏掉「一半在纸上、一半飘在背景里」的碎发与纸纹链，
@@ -1892,14 +1235,17 @@ fn source_detail_strokes(
                 bg_n += 1;
             }
         }
-        if bg_n * 3 > s.pts.len() {
+        if bg_n * 100 > s.pts.len() * 15 {
             return false;
         }
         // 实心黑团（瞳孔、虹膜、最深的发芯）内部没有「线」，只有填充。
-        // 骨架会在团块里分出许多支叉，照线描出来是一团乱麻，眼睛变成毛线球。
-        // 1.3mm 平滑调子仍然接近全黑（>0.93）的深笔触交给排线去压深；
+        // 骨架会在团块里分出许多支叉，照线描出来是一团乱麻，眼睛变成毛线球，
+        // 深发芯则被 2B 沿脊描成一块实心黑。1.3mm 平滑调子仍然接近全黑的
+        // 笔触交给排线去压深——排线能靠笔档和线距控制灰度，骨架描线只会叠墨。
+        // 门槛从 0.93 收到 0.84：实测顶灯下发丛主体 tone 常在 0.85~0.92，
+        // 0.93 时全被放过，正好在那块最亮的高光旁边糊成一团黑。
         // 眼线只有 0.4~0.6mm 宽，平滑后会掉到 0.7 以下，不会被误删。
-        if s.mean_dark >= 0.90 {
+        if s.mean_dark >= 0.85 {
             let n = s.pts.len().max(1);
             let mt: f32 = s
                 .pts
@@ -1910,7 +1256,7 @@ fn source_detail_strokes(
                 })
                 .sum::<f32>()
                 / n as f32;
-            if mt > 0.93 {
+            if mt > 0.84 {
                 return false;
             }
         }
@@ -1927,6 +1273,124 @@ fn source_detail_strokes(
         }
         true
     });
+    // —— 浅排线的三重校验 ——
+    //
+    // 提取器在浅调区最容易犯两种错：把相邻几根排线串成一条斜跨的
+    // 「划痕」，或者沿纸纹/噪点走出一段弯线。两者都会在画面上变成
+    // 原稿没有的重线。这里对 mean_dark < 0.45 的浅笔触逐个检查：
+    //   1) 整条确实压在墨上（不是纸白）；
+    //   2) 走向与周围排线（1.2mm / 6mm 脊向）基本一致；
+    //   3) 不出现十几毫米的近乎直线的一笔——原稿的浅排线都有起落，
+    //      那种长直线是缝合伪线。
+    // 深调（发丝、眼线、唇缝）本来就在墨脊上，不再过这三道。
+    let dir_ok = |s: &Stroke| -> (bool, bool) {
+        // 返回 (是否可判定, 是否一致)。整条附近都没有可靠方向时不可判定。
+        let n_pts = s.pts.len();
+        if n_pts < 3 {
+            return (false, true);
+        }
+        let mut n = 0usize;
+        let mut ok = 0usize;
+        let mut k = 1usize;
+        while k + 1 < n_pts {
+            let a = s.pts[k - 1];
+            let b = s.pts[k + 1];
+            let dx = b.0 - a.0;
+            let dy = b.1 - a.1;
+            if dx * dx + dy * dy < 4.0 {
+                k += 3;
+                continue;
+            }
+            let th = dy.atan2(dx);
+            let (ga, gc) = field.smooth_ridge_ang_at(s.pts[k].0, s.pts[k].1);
+            let (ba, bc) = field.broad_ridge_ang_at(s.pts[k].0, s.pts[k].1);
+            let (fa, fc) = if gc >= bc {
+                (ga as f64, gc)
+            } else {
+                (ba as f64, bc)
+            };
+            if fc < 0.18 {
+                k += 3;
+                continue;
+            }
+            n += 1;
+            let mut d = (th - fa).abs() % std::f64::consts::PI;
+            if d > std::f64::consts::FRAC_PI_2 {
+                d = std::f64::consts::PI - d;
+            }
+            // 40° / 半数为界：原稿的浅排线是斜向交叉的，局部主方向（结构张量）
+            // 只会记住更密的那一族，另一族在 26° 判据下会被整批当成「方向不符」
+            // 丢掉——实测 1200 条里 1178 条死在这一步，浅调细节因此只剩头发。
+            // 放宽后仍能挡住沿鼻侧、下颌乱走的伪线：它们与主方向的夹角接近 90°。
+            if d < 40f64.to_radians() {
+                ok += 1;
+            }
+            k += 3;
+        }
+        (n > 0, n == 0 || ok * 2 >= n)
+    };
+    let ppm = field.px_mm.max(1e-9);
+    let mut rej = [0usize; 6];
+    strokes.retain(|s| {
+        if s.mean_dark >= 0.45 {
+            return true;
+        }
+        if s.mean_width_mm > 0.80 {
+            rej[0] += 1;
+            return false;
+        }
+        let n = s.pts.len().max(1);
+        let mut tone_sum = 0f32;
+        let mut inked = 0usize;
+        for &(x, y) in &s.pts {
+            let xi = (x as usize).min(fw.saturating_sub(1));
+            let yi = (y as usize).min(fh.saturating_sub(1));
+            let t = ht.tone[yi * fw + xi];
+            tone_sum += t;
+            if t > 0.025 {
+                inked += 1;
+            }
+        }
+        let mean_tone = tone_sum / n as f32;
+        if mean_tone < 0.050 || inked * 20 < n * 13 {
+            rej[1] += 1;
+            return false;
+        }
+        // 中浅调里比半根笔宽还宽的脊不是「线」，是明暗过渡的坡：
+        // 鼻侧、唇角、脸颊阴影的边界在 Hessian 上也是脊，但宽度 1mm 以上，
+        // 照线描出来就是原稿没有的硬轮廓。真正的排线/发丝都在 0.75mm 内。
+        if s.mean_dark < 0.60 && s.mean_width_mm > 0.75 {
+            rej[2] += 1;
+            return false;
+        }
+        let (known, agree) = dir_ok(s);
+        if known && !agree {
+            rej[3] += 1;
+            return false;
+        }
+        if !known && s.len_mm > 4.0 {
+            rej[4] += 1;
+            return false;
+        }
+        // 浅调里十几毫米的近直线几乎都是缝合伪线；明显的弯是下颌、唇线，保留。
+        if s.len_mm > 10.0 {
+            let a = s.pts.first().copied().unwrap_or((0.0, 0.0));
+            let b = s.pts.last().copied().unwrap_or(a);
+            let chord = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt() * ppm;
+            if chord > 1e-6 && s.len_mm / chord > 0.985 {
+                rej[5] += 1;
+                return false;
+            }
+        }
+        true
+    });
+    stage("浅校验", &strokes);
+    if std::env::var("SKETCH_DEBUG").is_ok() {
+        eprintln!(
+            "  浅校验拒因 宽 {}/ 墨 {}/ 坡度 {}/ 方向 {}/ 无向长 {}/ 直链 {}",
+            rej[0], rej[1], rej[2], rej[3], rej[4], rej[5]
+        );
+    }
     // 预算分两池：浅调（脸颊排线）和深调（发丝、五官）各有上限。
     // 单池按「长 × 深²」排序时，浅排线的分数只有头发的一个零头，预算再大
     // 也轮不到它们——脸就永远空着。分池后浅调至少有自己的一份。
@@ -2020,16 +1484,18 @@ fn source_detail_strokes(
         if curved {
             slice_detail_curve(s, px_mm, 4.0, &mut short);
         } else {
-            split_detail_chords(s, px_mm, 2.2, 0.45, &mut short);
+            split_detail_chords(s, px_mm, 2.6, 0.25, &mut short);
         }
     }
     // 深调（发丝、眼线、衣褶、下颌）是「形」，不是调子：沿原流线切片、
-    // **保留中间点**，绝不把一根弯曲的轮廓捋成几段直线。切片上限压到 8mm：
-    // 追踪经常把一根眉线、一缕头发一路拉到 40~57mm（端点距/弧长 0.96，
-    // 几乎是直线），横穿眼睛和脸颊，正是用户说的「像调子的线段都是直的」。
-    // 8mm 一段仍是连续折线，形没变，但一笔不会横跨半个五官。
+    // **保留中间点**，绝不把一根弯曲的轮廓捋成几段直线。
+    //
+    // 上限从 6mm 放宽到 18mm：6mm 时一缕 30~60mm 的长发被切成五六截，
+    // 放大看头发是一堆短划痕，没有「发丝」的连续性——正是用户说的
+    // 「细节丢失、线条不够细」。18mm 仍能挡住追踪把几根线连成 40~57mm
+    // 的伪线（那种一笔横穿半张脸的长线），又保得住一根发丝的起伏。
     for s in kept_dark {
-        slice_detail_curve(s, px_mm, 8.0, &mut short);
+        slice_detail_curve(s, px_mm, 18.0, &mut short);
     }
     if std::env::var("SKETCH_DEBUG").is_ok() {
         eprintln!(
@@ -2178,431 +1644,6 @@ fn slice_path(pts: &[(f64, f64)], a0: f64, a1: f64) -> Vec<(f64, f64)> {
     out
 }
 
-/// 一遍「流线短直段」。
-///
-/// 种子是打乱的抖动网格；每个种子按「还差多少墨」反算线距，再沿走向场
-/// 连续走一段，最后切成 1.6~5.5mm 的直线弦。同一遍里用胶囊占位控制线距；
-/// 流线本身是连续的，所以线距对了就是一片排线，而不是一格一根短杠。
-#[allow(clippy::too_many_arguments)]
-fn stroke_pass_v2(
-    field: &Field,
-    target: &[f32],
-    bg: &[bool],
-    view: &[f32],
-    ink: &mut [f32],
-    follow: u8,
-    base: f64,
-    lo: f32,
-    hi: f32,
-    dark: f32,
-    pen_mm: f64,
-    stroke_len: f64,
-    pass: usize,
-    seed: u64,
-    max_strokes: usize,
-) -> Vec<Stroke> {
-    let fw = field.w;
-    let fh = field.h;
-    let px = field.px_mm.max(1e-9);
-    let mut layer: Vec<Stroke> = Vec::new();
-    if fw == 0 || fh == 0 || max_strokes == 0 {
-        return layer;
-    }
-    let mut occupied = vec![false; fw * fh];
-    // 种子网格要细到能承载目标线距：HB 单层线距约 0.38mm，种子却按 1.2mm
-    // 放，一格里最多一根，再密的目标也排不出来。按 1.10 倍笔宽铺种子
-    // （HB 约 0.24mm），线距够近时占位自然会筛掉多余的起点。
-    // 下限从 0.30 降到 0.24：笔宽收到 0.20 之后，0.30 的格子会让最细的笔
-    // 也排不出原稿那种 0.3~0.5mm 的细密排线。
-    // 种子步距必须小于目标线距，否则每格只能落一根，覆盖被网格量化卡死：
-    // 4B 目标线距 0.36mm、步距却 0.35mm，把上限从 0.80 放到 0.90 一根都没多。
-    // 收到 0.95 倍笔宽后，深调的 0.86~0.94 覆盖率才真正落得下去。
-    let step_mm = (pen_mm * 0.95).max(0.20);
-    let step_px = step_mm / px;
-    let cols = ((fw as f64 / step_px).ceil() as usize) + 1;
-    let rows = ((fh as f64 / step_px).ceil() as usize) + 1;
-    let mut cand: Vec<u32> = Vec::with_capacity(cols * rows);
-    for cy in 0..rows {
-        for cx in 0..cols {
-            cand.push((cy * cols + cx) as u32);
-        }
-    }
-    let mut s = seed | 1;
-    for i in (1..cand.len()).rev() {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        let j = (s % (i as u64 + 1)) as usize;
-        cand.swap(i, j);
-    }
-    let phase_x = (hash01(seed.rotate_left(11)) * 0.94) * step_px;
-    let phase_y = (hash01(seed.rotate_left(29)) * 0.94) * step_px;
-    // 8B 负责瞳孔、虹膜、发芯这些「实心黑块」：原稿那里没有缝，
-    // 0.80 的上限会让 0.4mm 的笔排成带白缝的条纹，眼睛读成灰色。
-    // 只对最深的笔放开到 0.92，4B 及以下仍保留排线间隙。
-    // 深调每支笔的线距都要收到「几乎挨着」：原稿的暗发实测 66% 像素是墨，
-    // 4B 按 0.80 覆盖铺出来、预览里仍有 34% 纯白缝，整片读成灰色。
-    // 线距是 1/覆盖，0.80→0.88 就把白缝砍掉一半，深调也才真正压得住。
-    // 亮调的笔（HB）保持 0.80，脸上不会糊成一片。
-    let max_cov = if dark > 0.88 {
-        0.94
-    } else if dark > 0.74 {
-        0.90
-    } else if dark > 0.56 {
-        0.86
-    } else {
-        STROKE_PASS_MAX_COV
-    };
-    let cross_deg = if follow == 0 {
-        STROKE_CONTOUR_DEG[pass.min(STROKE_CONTOUR_DEG.len() - 1)]
-    } else {
-        STROKE_CROSS_DEG[pass.min(STROKE_CROSS_DEG.len() - 1)]
-    };
-    let mut n_bg = 0usize;
-    let mut n_low = 0usize;
-    let mut n_full = 0usize;
-    let mut n_occ = 0usize;
-    let mut n_short = 0usize;
-
-    for ci in cand {
-        if layer.len() >= max_strokes {
-            break;
-        }
-        let gx = ci as usize % cols;
-        let gy = ci as usize / cols;
-        let h = hash_u64(seed ^ (ci as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let h2 = hash_u64(h ^ 0xD1B5_4A32_D192_ED03);
-        // 每遍把整张抖动网格平移一个随机相位：第 1 遍的种子才会落在
-        // 第 0 遍两根线之间，而不是反复落在同一格、被占位挡掉。
-        // 没有这个相位，脸的墨量只能到网格上限（0.3/0.6 = 0.5 覆盖），
-        // 目标 0.30 永远补不满，画面就会出现「中间空一块」。
-        let x = (gx as f64 + 0.08 + 0.84 * hash01(h)) * step_px + phase_x;
-        let y = (gy as f64 + 0.08 + 0.84 * hash01(h2)) * step_px + phase_y;
-        if x < 1.0 || y < 1.0 || x >= fw as f64 - 1.0 || y >= fh as f64 - 1.0 {
-            continue;
-        }
-        let ix = x as usize;
-        let iy = y as usize;
-        let i = iy * fw + ix;
-        if bg[i] {
-            n_bg += 1;
-            continue;
-        }
-        let t = target[i];
-        if t <= lo + 0.006 {
-            n_low += 1;
-            continue;
-        }
-        let desired = t.min(hi);
-        let deficit = desired - view[i];
-        if deficit <= 0.010 {
-            n_full += 1;
-            continue;
-        }
-        let (mut theta, conf) = stroke_dir(field, follow, base, x, y);
-        // 交叉层从中间调就开始启用：亮部也交叉会立刻变成乱网。
-        // 起点从 0.30 提前到 0.18：原稿额头的浅排线本身就带一层反向的
-        // 短笔，只按 0.30 起算，脸和衬衫上的每一遍都同向，叠多少遍都
-        // 只读出一层。提前后浅调只是 ±几度，中间调才真正交叉开。
-        let dark_fac = smoothstep01((t - 0.18) / 0.42);
-        // 角差本来就小（十几度），这里只需把发流/眼线处的方向再压一点。
-        let hair_guard = if follow == 0 {
-            1.0f64
-        } else {
-            1.0 - 0.30 * conf as f64
-        };
-        // 每一遍都用满自己的交叉角：0° / 15° / -13° / 8° / 24° 拉开，
-        // 深调靠 2~3 层交叉叠出来，而不是把线加粗。
-        let cross_eff = cross_deg;
-        theta += cross_eff.to_radians() * dark_fac * hair_guard;
-        // 同一遍里再给每根线一个按调子放大的小角差。真实排线没有两根是
-        // 严格平行的；完全没有角差时，即使叠了五遍也像一把梳子只梳了一遍。
-        // 浅调 ±2°，深调 ±8°，和原稿实测的层间角差（约 10°）同一个量级。
-        theta += (hash01(h2) - 0.5) * (0.07 + 0.21 * dark_fac);
-        // 再叠一层约 9mm 的「组向」：同一片排线整体偏几度，隔壁那片偏另一边。
-        // 原稿的排线区就是这么一块块换方向的；没有它，几百根线共用一个角，
-        // 放大看是木纹，不是手画。
-        theta += (vnoise01(x * px / 9.0, y * px / 9.0, seed ^ 0x51ED) - 0.5)
-            * 9.0f64.to_radians()
-            * (0.45 + 0.55 * dark_fac)
-            * hair_guard;
-
-        let cov = ((deficit as f64) / (dark.max(0.05) as f64)).clamp(0.02, max_cov);
-        // 线距不仅由「还差多少墨」决定，还要服从排线本身的梳齿尺度：
-        // 浅调按缺口反算能到 2~3mm 一行，画出来是一根根孤零零的斜线，
-        // 和原稿 1mm 量级的细排线完全不是一回事。上限压到 1.10mm，
-        // 缺口小的时候由后面的交叉遍插空补齐，而不是把行距拉大。
-        // 笔宽收到 0.20~0.40 之后，2.6 倍笔宽正好是原稿那种 0.5~1.0mm
-        // 的梳齿尺度；旧值 3.2 倍会在浅调留下 0.9mm 的空档。
-        // 但最亮的一档（脸、衬衫高光）不能按 2.6 倍硬排：那里原稿几乎
-        // 是纸白，0.5mm 的间距叠到 0.20mm 细笔上会把整张脸压灰。目标
-        // 低于 0.18 时放宽到 3.8 倍，笔数仍比旧版多，但脸留得住白。
-        let cap_k = if t < 0.18 { 3.8 } else { 2.6 };
-        // 3.5mm 的密度成片：松的地方线距 ×1.2，密的地方 ×0.8。
-        // 「该密的密、该疏的疏」不只是明暗差异——原稿同一块调子里，
-        // 排线本身也是一簇一簇的，均匀间距会让整片读成网纹。
-        let clump = 0.80 + 0.40 * vnoise01(x * px / 3.5, y * px / 3.5, seed ^ 0x9A7);
-        let pitch = (pen_mm / cov * clump)
-            .clamp(pen_mm * 1.02, (pen_mm * cap_k).min(1.10));
-        let keep_px = pitch * 0.5 / px;
-        if occupied_near(&occupied, fw, fh, ix, iy) {
-            n_occ += 1;
-            continue;
-        }
-        // 除「随轮廓」外，方向在起笔时锁定：素描排线是一组同向短直线，
-        // 走到哪儿改到哪儿只会得到一根长曲线。跟随轮廓才逐点取等照度线，
-        // 让一条线顺着发流/形体转过去。深发（t>0.58）也逐点取：发丝本来
-        // 就是顺着发流弯的长线，锁成直线会横穿发丛，看着像划痕。
-        let straight = follow > 0 && t <= 0.58;
-        let base_l = if straight {
-            stroke_len * (0.95 + 0.85 * conf as f64)
-        } else {
-            stroke_len * (1.55 + 2.4 * conf as f64)
-        };
-        let lmax = (base_l
-            * (1.0 - 0.12 * pass.min(3) as f64)
-            * (0.86 + 0.28 * hash01(h2)))
-        .clamp(stroke_len * 0.9, if straight { 6.0 } else { 16.0 });
-
-        let mut cx = x;
-        let mut cy = y;
-        let mut pts: Vec<(f64, f64)> = vec![(x, y)];
-        let mut dx = theta.cos();
-        let mut dy = theta.sin();
-        let step_trace = 0.35f64;
-        let step_trace_px = step_trace / px;
-        let max_steps = ((lmax / step_trace).ceil() as usize).clamp(2, 90);
-        let mut walked = 0.0f64;
-        for _ in 1..=max_steps {
-            let th = if straight {
-                theta
-            } else {
-                let (mut th, _) = stroke_dir(field, follow, base, cx, cy);
-                th += cross_eff.to_radians() * dark_fac * hair_guard;
-                th
-            };
-            let (mut nx, mut ny) = (th.cos(), th.sin());
-            if !straight {
-                // 与上一段方向混合：脊方向逐像素会翻，混合后才是「一根线」。
-                nx = dx * 0.55 + nx * 0.45;
-                ny = dy * 0.55 + ny * 0.45;
-            }
-            let m = (nx * nx + ny * ny).sqrt();
-            if m < 1e-6 {
-                break;
-            }
-            nx /= m;
-            ny /= m;
-            let nxp = cx + nx * step_trace_px;
-            let nyp = cy + ny * step_trace_px;
-            if nxp < 1.0 || nyp < 1.0 || nxp >= fw as f64 - 1.0 || nyp >= fh as f64 - 1.0 {
-                break;
-            }
-            let ni = (nyp as usize) * fw + (nxp as usize);
-            if bg[ni] || target[ni] < lo + 0.008 {
-                break;
-            }
-            // 走到已经够墨的地方就收笔，别把暗部的线拖进亮部。
-            //
-            // 但「够墨」要按遍数留一点余量：第 1、2 遍如果一进墨就收，
-            // 种子几乎全被判成「已补满」，中间调只剩第 0 遍那一层同向线，
-            // 叠不出来交叉层。允许压过目标 2%~7%（越暗余量越大），
-            // 后一遍才会在前一遍的缝里再补一层不同角度的短线。
-            // 暗部余量仍比亮部大：那里本来就要靠多遍同向叠加才够黑，
-            // 上一版一进墨就收，头发的黑色砖块就是这么来的。
-            let over = (0.015 + 0.035 * smoothstep01((t - 0.30) / 0.42)) as f32;
-            if view[ni] >= desired + over {
-                break;
-            }
-            walked += step_trace;
-            cx = nxp;
-            cy = nyp;
-            pts.push((cx, cy));
-            dx = nx;
-            dy = ny;
-            if walked >= lmax {
-                break;
-            }
-        }
-        if pts.len() < 2 {
-            n_short += 1;
-            continue;
-        }
-        let total: f64 = pts
-            .windows(2)
-            .map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt())
-            .sum();
-        if total * px < pen_mm * 1.6 {
-            n_short += 1;
-            continue;
-        }
-        // 本遍占位：胶囊沿整条流线，线距由 pitch 决定。
-        for seg in pts.windows(2) {
-            stamp_mask(&mut occupied, fw, fh, seg[0], seg[1], keep_px);
-        }
-        // 切成短直线弦。相邻弦共享端点，视觉上仍是连续的一笔。
-        //
-        // 原稿实测一根排线只有 2~5mm；十几毫米的直线横在脸上就是「划痕」。
-        // 这里把弦压到 1.5~4.5mm：线距变密后，短弦才不会让整片调子变糊。
-        // 深部（发丝、眼线）稍长一点，但也不超过 4.5mm——方向随形，
-        // 每一笔仍是铅笔的短直线段，而不是抽象的弯曲线。
-        let chord_mm = if follow == 0 {
-            (stroke_len * 0.8).clamp(1.5, 3.5).max(pen_mm * 2.2)
-        } else if t > 0.62 {
-            (stroke_len * 1.0).clamp(2.0, 4.5).max(pen_mm * 2.2)
-        } else {
-            (stroke_len * 0.8).clamp(1.8, 3.2).max(pen_mm * 2.2)
-        };
-        let n_ch = ((total * px / chord_mm).round() as usize).max(1);
-        let seg = total / n_ch as f64;
-        // 明暗调子的弦两端各留 12% 空档：相邻弦首尾相接时，plotter 一笔画下来
-        // 就是一根 20mm 的长线，整片读成「木纹」；原稿排线是分开的一段段，
-        // 笔尖反复起落。深发（t>0.58）不留缝——发丝本来就是连续的。
-        let gap = if t > 0.58 { 0.0 } else { 0.12 };
-        for k in 0..n_ch {
-            if layer.len() >= max_strokes {
-                break;
-            }
-            let a = point_at(&pts, seg * (k as f64 + gap));
-            let b = point_at(&pts, seg * ((k + 1) as f64 - gap));
-            let lmm = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt() * px;
-            if lmm < pen_mm * 1.2 {
-                n_short += 1;
-                continue;
-            }
-            stamp_ink(ink, fw, fh, a, b, pen_mm * 0.5 / px, dark);
-            layer.push(Stroke {
-                theta: path_theta(&[a, b]),
-                pts: vec![a, b],
-                loose: [true, true],
-                len_mm: lmm,
-                mean_dark: desired as f64,
-                mean_width_mm: pen_mm,
-                rank: pass as f64 / 7.0,
-                structural: false,
-                passes: 1,
-            });
-        }
-    }
-    if std::env::var("SKETCH_DEBUG").is_ok() {
-        eprintln!(
-            "  种子 {}：接受 {}，背景 {}，浅于层 {}，已补满 {}，占用 {}，收得太短 {}",
-            cols * rows,
-            layer.len(),
-            n_bg,
-            n_low,
-            n_full,
-            n_occ,
-            n_short
-        );
-    }
-    layer
-}
-
-/// 合成笔触的走向。
-///
-/// - 0 跟随轮廓：结构张量的等照度线切向（形体转折、发流），整条线随形弯曲。
-/// - 1 跟随原稿：平滑后的墨脊方向；没有可靠脊的地方退回基准角。
-/// - 2 混合（默认）：原稿笔触方向优先，平坦区退到等照度线，再退到基准角。
-///
-/// 关键是**不给平坦区逐像素取脊方向**：原稿没有脊的地方，那个方向是噪声，
-/// 上一版就是在这里把整张脸画成草。另外除模式 0 外，落笔后方向锁定在
-/// 起点——素描排线是短直线，只有「随轮廓」才允许一条线跟着形走。
-fn stroke_dir(field: &Field, follow: u8, base: f64, x: f64, y: f64) -> (f64, f32) {
-    match follow {
-        0 => {
-            let (a, c) = field.ang_at(x, y);
-            if c > 0.16 {
-                (a as f64, c)
-            } else {
-                (base, 0.0)
-            }
-        }
-        1 => {
-            let (a, c) = field.smooth_ridge_ang_at(x, y);
-            if c > 0.30 {
-                (a as f64, c.min(1.0))
-            } else {
-                (base, 0.0)
-            }
-        }
-        _ => {
-            // 混合模式。暗部和亮部的「可靠方向」不是同一个场：
-            //
-            // 暗发里的脊检测尺度跟的是单根细发丝（1~2px），而实心暗发是
-            // 5~10px 宽的深色带，小尺度 Hessian 在带内看到的是噪声——实测
-            // 发中脊向 46°、发右 17°，而发流实际约 -22°。按脊向排线就是把
-            // 头发织成乱网。2.5mm 等照度线反而正好沿着「暗带/亮缝」走。
-            //
-            // 亮部则相反：脸上的浅排线本身就是一排细脊，等照度线是形体走向，
-            // 用它会把每一笔各自转向。所以亮部优先脊向，暗部优先等照度线。
-            //
-            // 判据是「逐像素方向与原稿一致的比例」（tools/_dir.py）：暗部用
-            // 等照度线时头发一致率 93.3%、平均角差 11.3°；改用整块 6mm 块向后
-            // 只剩 78.3%/18.6°——块向在发丛里跟着一缕缕的局部走向摆，整体方向
-            // 反而散了。额头同样从 91.3% 掉到 79.2%。这条实测推翻了「块向
-            // 统一更好」的直觉，保留原策略。
-            let dark = field.tone_at(x, y) > 0.42;
-            let (ia, ic) = field.ang_at(x, y);
-            if dark {
-                if ic > 0.30 {
-                    return (ia as f64, ic);
-                }
-                let (a, c) = field.smooth_ridge_ang_at(x, y);
-                if c > 0.30 {
-                    return (a as f64, c.min(1.0));
-                }
-                return (base, 0.0);
-            }
-            // 浅调同样优先 2.5mm 等照线。这一版原本用 6mm 块向，实测在衬衫上
-            // 排成了和原稿镜像的 52~66°：块向是「按脊响应加权」的平均，原稿
-            // 交叉排线里稍深的那一层会把权重拉过去，主排线（约 124°）反而丢了
-            // （tools/_orient.py 逐块统计）。等照线在浅色区的一致性本来就高
-            // （衬衫 0.80~0.94），锁在落笔点也不会逐笔乱转。
-            if ic > 0.55 {
-                return (ia as f64, ic);
-            }
-            let (ba, bc) = field.broad_ridge_ang_at(x, y);
-            if bc > 0.40 {
-                return (ba as f64, bc.min(1.0));
-            }
-            (base, 0.0)
-        }
-    }
-}
-
-/// 取值在 0~1 的平滑值噪声（格点哈希 + 双线性 smoothstep）。
-///
-/// 用来给排线加「一块一块」的手感：真实素描的排线是分组成片的，有的地方
-/// 密、有的地方松，组与组之间还会差几度方向。完全均匀的间距和走向，
-/// 再细也会像机织布。
-fn vnoise01(x: f64, y: f64, seed: u64) -> f64 {
-    let xi = x.floor();
-    let yi = y.floor();
-    let fx = x - xi;
-    let fy = y - yi;
-    let h = |cx: i64, cy: i64| {
-        hash01(
-            seed ^ (cx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ (cy as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F),
-        )
-    };
-    let (x0, y0) = (xi as i64, yi as i64);
-    let a = h(x0, y0);
-    let b = h(x0 + 1, y0);
-    let c = h(x0, y0 + 1);
-    let d = h(x0 + 1, y0 + 1);
-    let u = fx * fx * (3.0 - 2.0 * fx);
-    let v = fy * fy * (3.0 - 2.0 * fy);
-    (a * (1.0 - u) + b * u) * (1.0 - v) + (c * (1.0 - u) + d * u) * v
-}
-
-fn smoothstep01(t: f32) -> f64 {
-    let u = t.clamp(0.0, 1.0) as f64;
-    u * u * (3.0 - 2.0 * u)
-}
-
-/// 折线上按弧长取点。
 fn point_at(pts: &[(f64, f64)], s: f64) -> (f64, f64) {
     if pts.len() < 2 || s <= 0.0 {
         return pts[0];
@@ -2620,568 +1661,19 @@ fn point_at(pts: &[(f64, f64)], s: f64) -> (f64, f64) {
     *pts.last().unwrap()
 }
 
-fn occupied_near(mask: &[bool], w: usize, h: usize, x: usize, y: usize) -> bool {
-    for yy in y.saturating_sub(1)..=(y + 1).min(h.saturating_sub(1)) {
-        for xx in x.saturating_sub(1)..=(x + 1).min(w.saturating_sub(1)) {
-            if mask[yy * w + xx] {
-                return true;
-            }
-        }
-    }
-    false
-}
 
-/// 把一条线段按半宽刷进「视觉墨量」图：中心是满墨，边缘按 1px 过渡。
-fn stamp_ink(
-    ink: &mut [f32],
-    w: usize,
-    h: usize,
-    a: (f64, f64),
-    b: (f64, f64),
-    r: f64,
-    dark: f32,
-) {
-    if w == 0 || h == 0 {
-        return;
-    }
-    let r = r.max(0.5);
-    let pad = r + 1.5;
-    let x0 = (a.0.min(b.0) - pad).floor().max(0.0) as usize;
-    let y0 = (a.1.min(b.1) - pad).floor().max(0.0) as usize;
-    let x1 = ((a.0.max(b.0) + pad).ceil() as isize).min(w as isize - 1).max(0) as usize;
-    let y1 = ((a.1.max(b.1) + pad).ceil() as isize).min(h as isize - 1).max(0) as usize;
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let len2 = dx * dx + dy * dy;
-    for yy in y0..=y1 {
-        for xx in x0..=x1 {
-            let (px, py) = (xx as f64 + 0.5, yy as f64 + 0.5);
-            let t = if len2 > 1e-12 {
-                (((px - a.0) * dx + (py - a.1) * dy) / len2).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let qx = a.0 + dx * t;
-            let qy = a.1 + dy * t;
-            let d = ((px - qx) * (px - qx) + (py - qy) * (py - qy)).sqrt();
-            let cov = ((r + 0.45 - d) / 0.9).clamp(0.0, 1.0);
-            if cov <= 0.0 {
-                continue;
-            }
-            let add = dark * cov as f32;
-            let i = yy * w + xx;
-            // 取最黑的一笔，而不是 α 叠加同色笔迹。
-            //
-            // 5 遍 × 4 支笔会在同一处反复压线，α 叠加把 0.42 的 HB 算成
-            // 1-(0.58)^8≈0.99，缺口立刻关闭，后面的笔一根都不落；实际纸上
-            // 同一支笔叠十遍仍只是 0.42 的灰度。暗发因此一直停在 0.37，
-            // 而目标 0.68——整整差一半。取 max 后缺口记账才和画面一致。
-            if add > ink[i] {
-                ink[i] = add;
-            }
-        }
-    }
-}
 
-/// 把线段周围 `r` 半径内的候选点标成占用（胶囊），保证同一遍的线距。
-fn stamp_mask(
-    mask: &mut [bool],
-    w: usize,
-    h: usize,
-    a: (f64, f64),
-    b: (f64, f64),
-    r: f64,
-) {
-    if w == 0 || h == 0 {
-        return;
-    }
-    let r = r.max(0.5);
-    let x0 = (a.0.min(b.0) - r).floor().max(0.0) as usize;
-    let y0 = (a.1.min(b.1) - r).floor().max(0.0) as usize;
-    let x1 = ((a.0.max(b.0) + r).ceil() as isize).min(w as isize - 1).max(0) as usize;
-    let y1 = ((a.1.max(b.1) + r).ceil() as isize).min(h as isize - 1).max(0) as usize;
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let len2 = dx * dx + dy * dy;
-    let r2 = r * r;
-    for yy in y0..=y1 {
-        for xx in x0..=x1 {
-            let (px, py) = (xx as f64 + 0.5, yy as f64 + 0.5);
-            let t = if len2 > 1e-12 {
-                (((px - a.0) * dx + (py - a.1) * dy) / len2).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let qx = a.0 + dx * t;
-            let qy = a.1 + dy * t;
-            let d2 = (px - qx) * (px - qx) + (py - qy) * (py - qy);
-            if d2 <= r2 {
-                mask[yy * w + xx] = true;
-            }
-        }
-    }
-}
 
-/// 多笔提取：每一笔都来自原稿的墨脊，按笔重分给不同铅笔。
-///
-/// 返回 `None` 表示「这张图上没有足够多真实笔触」（照片、纯色块、渐变），
-/// 调用方回落到按明暗带排线。
-fn extracted_multi_pen(
-    field: &Field,
-    threshold: f64,
-    pen_mm: f64,
-    m_eff: usize,
-) -> Option<Vec<Vec<Stroke>>> {
-    // 密度 2.6：多笔要的是「原稿上画过的线尽量都拿到」。
-    // 单笔调子模式才需要严格按墨量取舍，否则浅笔触会被整体砍掉，
-    // 分成 4 支笔后每支只剩零星几根——这正是「线条提取过少」的来源。
-    let (mut strokes, _cover) = ridge_strokes(field, pen_mm, threshold, 2.6);
-    strokes.retain(|s| s.len_mm >= 1.2);
-    let src = field.tone.iter().map(|&t| t as f64).sum::<f64>()
-        * field.px_mm
-        * field.px_mm;
-    let ink = strokes.iter().map(|s| s.len_mm).sum::<f64>() * pen_mm;
-    if strokes.len() < m_eff * 8 || ink < src * 0.22 {
-        if std::env::var("SKETCH_DEBUG").is_ok() {
-            eprintln!(
-                "多笔提取：{} 条 / {:.0}mm，原稿墨量 {:.0}，不足 → 回落排线",
-                strokes.len(),
-                ink,
-                src
-            );
-        }
-        return None;
-    }
-    // 按笔重（明暗 + 线宽）排序后等分成 m 段：最轻的一段给 HB、最重的给 8B。
-    // 等分而不是按固定明暗阈值切，是因为实拍素描的笔触大多挤在中暗调，
-    // 按阈值切会让浅笔一根都分不到。
-    let n = strokes.len();
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        stroke_weight(&strokes[a])
-            .partial_cmp(&stroke_weight(&strokes[b]))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut assign = vec![0u8; n];
-    // 结构线强制归最深笔只在它们确实是少数时成立。整张图都由高响应长线组成
-    // （纯线稿、只描边的人像）时，`ridge_strokes` 会把每一根都标成结构线——
-    // 若照单全收，四支笔里就只剩 8B 有活，多笔分层名存实亡。这种情况下
-    // 退回纯按笔重等分，让深浅不同的线各自找到对应的铅笔。
-    let structural_n = strokes.iter().filter(|s| s.structural).count();
-    let force_darkest = structural_n * 3 <= n;
-    for (rank, &idx) in order.iter().enumerate() {
-        let mut p = (rank * m_eff / n).min(m_eff - 1);
-        // 结构线（轮廓、眼线、唇缝）无条件归最深笔：换浅笔画会立刻糊掉。
-        if force_darkest && strokes[idx].structural {
-            p = m_eff - 1;
-        }
-        assign[idx] = p as u8;
-    }
-    let mut out: Vec<Vec<Stroke>> = (0..m_eff).map(|_| Vec::new()).collect();
-    for (idx, mut s) in strokes.into_iter().enumerate() {
-        let p = assign[idx] as usize;
-        s.rank = p as f64 / m_eff as f64;
-        out[p].push(s);
-    }
-    if std::env::var("SKETCH_DEBUG").is_ok() {
-        let counts: Vec<usize> = out.iter().map(|v| v.len()).collect();
-        let lens: Vec<f64> = out
-            .iter()
-            .map(|v| v.iter().map(|s| s.len_mm).sum::<f64>())
-            .collect();
-        eprintln!(
-            "多笔提取：{} 笔，墨量 {:.0} / 原稿 {:.0}；每笔条数 {:?} 长度 {:?}",
-            n, ink, src, counts, lens
-        );
-    }
-    Some(out)
-}
 
-/// 一层排线：沿该层的固定交叉角铺线，**间距随局部明暗连续变化**。
-///
-/// 这里刻意不让排线跟着形体方向走。跟着等照度线排，亮部会绕成同心环，
-/// 一整块暗部看起来像一摊水；而人手排线是几个固定走向的短笔，靠疏密和
-/// 叠加层数表现灰。方向固定还有一个好处：所有层之间一定能交叉出网，
-/// 不会出现「两层恰好同向、叠了等于没叠」。
-#[allow(clippy::too_many_arguments)]
-fn hatch_layer(
-    field: &Field,
-    need: &[f32],
-    want: f32,
-    layer: usize,
-    base: f64,
-    spacing_mm: f64,
-    scale: f64,
-    pen_mm: f64,
-    levels: usize,
-    contrast: f32,
-) -> Vec<Stroke> {
-    let w = field.w as i32;
-    let h = field.h as i32;
-    let n = (w * h) as usize;
-    let theta = base + HATCH_DIR_DEG[layer.min(HATCH_DIR_DEG.len() - 1)].to_radians();
-    let min_mm = spacing_mm.max(pen_mm * 3.2);
-    // 候选网格按最小间距铺；更稀的排线靠「占位圆盘」把实际间距撑大，
-    // 这样同一层里既能铺很淡的灰，也能在暗部压到最小间距。
-    let pitch = ((min_mm * 0.82) / scale.max(1e-9)).max(2.0);
-    let mut used = vec![false; n];
-    let mut out = Vec::new();
-    let seed = 0x8d31_6f2a_9c47_b105 ^ (layer as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    // 每层种子错开，避免各层的线恰好压在同一个交点上，织成规整的网。
-    let seed_off = 0.31 + 0.27 * layer as f64;
-    let min_len_px = (1.2 / scale.max(1e-9)).max(2.0);
-    // 本层的起笔门槛：比它更亮的地方这一层一根都不排。
-    let stop = want;
-    let accept_lo = stop;
 
-    let mut gy = 0i32;
-    loop {
-        let y = gy as f64 * pitch + seed_off;
-        if y >= h as f64 {
-            break;
-        }
-        let stagger = if gy & 1 == 0 { 0.0 } else { pitch * 0.5 };
-        let mut gx = 0i32;
-        loop {
-            let x = gx as f64 * pitch + stagger + seed_off * 0.5;
-            if x >= w as f64 {
-                break;
-            }
-            gx += 1;
-            let idx = (y as usize) * w as usize + x as usize;
-            if used[idx] || need[idx] < stop {
-                continue;
-            }
-            // 每根笔各带一个种子：方向漂移、起止点、长度都不同，
-            // 整片排线才不是一张印出来的网。
-            let sseed = hash_u64(
-                (x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ ((y as i64 as u64) << 1)
-                    ^ seed,
-            );
-            let tone_seed = ((need[idx] / levels as f32).clamp(0.0, 1.0)).powf(1.0f32 / contrast);
-            // 头发、衣褶这类强方向区域改沿「等调子线」排——在铅笔稿里就是发丝
-            // 和布褶自己的走向。方向场可信度低（皮肤、平涂阴影）时仍回落到固定
-            // 斜角；否则会跟着噪点走，满纸蠕虫。
-            let (flow_a, flow_coh) = field.ang_at(x as f64 + 0.5, y as f64 + 0.5);
-            // 只在「很暗 + 方向很一致」的地方跟走向，也就是头发。
-            // 门放得太宽时，脸颊的明暗交界也会被当成方向区，排线会沿鼻梁
-            // 绕出一个个长钩子，脸就散了。
-            let dark_gate = ((tone_seed - 0.50) / 0.25).clamp(0.0, 1.0);
-            let coh_gate = ((flow_coh - 0.45) / 0.35).clamp(0.0, 1.0);
-            let gate = (dark_gate * coh_gate) as f64;
-            let flow_th = flow_a as f64
-                + HATCH_FLOW_DEG[layer.min(HATCH_FLOW_DEG.len() - 1)].to_radians();
-            let th = lerp_dir(theta, flow_th, gate);
-            // 亮处用短笔（4~8mm），暗处可以拉长到 12mm；手在浅灰区更爱抬笔。
-            // 排线太长会像绘图仪拉尺子，短笔才有手劲的顿挫。
-            let s_max = (4.0 + 8.0 * tone_seed as f64) / scale.max(1e-9)
-                * (0.55 + 0.65 * hash01(sseed));
-            let fwd = trace_hatch(field, need, (x, y), 1.0, th, stop, s_max, sseed);
-            let bwd = trace_hatch(field, need, (x, y), -1.0, th, stop, s_max, sseed);
-            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(fwd.len() + bwd.len() + 1);
-            for &p in bwd.iter().rev() {
-                pts.push(p);
-            }
-            pts.push((x, y));
-            pts.extend(fwd.iter().copied());
-            if pts.len() < 3 {
-                continue;
-            }
-            let len_px = chain_len(&pts);
-            if len_px < min_len_px {
-                continue;
-            }
-            // 这一条线覆盖的调子（沿线平均），决定它该用多稀的间距。
-            let mut sum = 0.0f64;
-            let mut cnt = 0usize;
-            for &(px, py) in &pts {
-                let i = (py as usize).min(h as usize - 1) * w as usize + (px as usize).min(w as usize - 1);
-                sum += need[i] as f64;
-                cnt += 1;
-            }
-            let mean = (sum / cnt.max(1) as f64) as f32;
-            if mean < accept_lo {
-                continue;
-            }
-            // 由明暗反算排线间距：
-            // 目标覆盖率 = 调子；这块地方一共有 n 层可用，就把覆盖率均摊到每层，
-            // 单层需要的线距 = 笔宽 / 单层覆盖率。
-            // 例：调子 0.2 只需一层 → 线距 5 个笔宽；调子 0.8 叠 5 层 →
-            // 每层约 27%，线距约 3.7 个笔宽。灰阶因此和原图对得上，
-            // 不会再出现「亮部第一层就太黑、中间调全挤成一块」。
-            let mean_t = ((mean / levels as f32).clamp(0.0, 1.0)).powf(1.0f32 / contrast);
-            let n_act = (((mean - 0.35).floor().max(0.0)) as usize + 1).min(levels);
-            let cov = (1.0 - (1.0 - mean_t.min(0.985)).powf(1.0f32 / n_act as f32))
-                .clamp(0.02, 0.32) as f64;
-            let local_mm = (pen_mm / cov).clamp(min_mm, pen_mm * 22.0);
-            // 占位半径 = 期望线距（不是一半）：要挡住的是「离这条线一个线距以内」
-            // 的所有起笔，半径取一半的话下一行起笔正好落在圈外，线距失效，
-            // 而且追踪时一碰到邻居的圈就得停——整片排线会被切成小短线。
-            let mark_r = ((local_mm / scale.max(1e-9)).round() as i32).max(1);
-            let mark_r2 = mark_r * mark_r;
-            let mark_step = (mark_r / 2).max(1) as usize;
-            for &(px, py) in pts.iter().step_by(mark_step) {
-                let cx = px.round() as i32;
-                let cy = py.round() as i32;
-                for yy in (cy - mark_r).max(0)..=(cy + mark_r).min(h - 1) {
-                    let dy = yy - cy;
-                    for xx in (cx - mark_r).max(0)..=(cx + mark_r).min(w - 1) {
-                        let dx = xx - cx;
-                        if dx * dx + dy * dy <= mark_r2 {
-                            used[(yy as usize) * w as usize + xx as usize] = true;
-                        }
-                    }
-                }
-            }
-            let theta_s = path_theta(&pts);
-            out.push(Stroke {
-                pts,
-                loose: [true, true],
-                len_mm: len_px * scale,
-                mean_dark: (mean / want).clamp(0.0, 1.0) as f64,
-                mean_width_mm: pen_mm * 0.9,
-                theta: theta_s,
-                rank: layer as f64 / (HATCH_DIR_DEG.len().max(1) - 1) as f64,
-                structural: false,
-                // 调子排线只走一遍：明暗完全由层数/密度决定，再叠一遍会把灰阶翻倍。
-                passes: 1,
-            });
-        }
-        gy += 1;
-    }
-    out
-}
 
-/// 多笔模式的一层排线：只负责一支笔的一段明暗带。
-///
-/// 和单笔的 `hatch_layer` 不同，这里的「暗」不再全由密度承担：
-/// 这一层最多只需要补出 `band_hi − band_lo` 的深度，除以这支笔的
-/// `darkness` 就是它需要的覆盖率。于是 HB 只铺浅灰、8B 只压深黑，
-/// 每支笔都工作在自己能表现的那一段，不会让 HB 排到死黑还是不够黑。
-#[allow(clippy::too_many_arguments)]
-fn pen_hatch_layer(
-    field: &Field,
-    tone: &[f32],
-    band_lo: f32,
-    band_hi: f32,
-    pen_mm: f64,
-    darkness: f32,
-    layers_in_pen: usize,
-    layer_in_pen: usize,
-    global_layer: usize,
-    base: f64,
-    scale: f64,
-    _contrast: f32,
-) -> Vec<Stroke> {
-    let w = field.w as i32;
-    let h = field.h as i32;
-    let n = (w * h) as usize;
-    let lp = layers_in_pen.max(1);
-    let j = layer_in_pen.min(lp - 1);
-    let span = (band_hi - band_lo).max(1e-4);
-    let theta = base
-        + HATCH_DIR_DEG[global_layer.min(HATCH_DIR_DEG.len() - 1)].to_radians();
-    // 多笔时每支笔都有明确的深浅分工，不需要像单笔那样留 3.2 个笔宽防糊死；
-    // 2.4 个笔宽已经能把纸缝保留下来，再密就只是把暗部涂成一块。
-    let min_mm = pen_mm * 2.4;
-    let pitch = ((min_mm * 0.82) / scale.max(1e-9)).max(2.0);
-    let mut used = vec![false; n];
-    let mut out = Vec::new();
-    let seed = 0x8d31_6f2a_9c47_b105
-        ^ (global_layer as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let seed_off = 0.31 + 0.27 * global_layer as f64;
-    let min_len_px = (1.2 / scale.max(1e-9)).max(2.0);
-    // 第 0 层在带底就开始，后面的层依次接管更深的一段。
-    let sub = if j == 0 { 0.05 } else { j as f32 / lp as f32 };
-    let stop = band_lo + span * sub.clamp(0.0, 0.95);
-    let cov_cap = (0.30 + 0.22 * (darkness - 0.50).max(0.0)).clamp(0.30, 0.44) as f64;
-
-    let mut gy = 0i32;
-    loop {
-        let y = gy as f64 * pitch + seed_off;
-        if y >= h as f64 {
-            break;
-        }
-        let stagger = if gy & 1 == 0 { 0.0 } else { pitch * 0.5 };
-        let mut gx = 0i32;
-        loop {
-            let x = gx as f64 * pitch + stagger + seed_off * 0.5;
-            if x >= w as f64 {
-                break;
-            }
-            gx += 1;
-            let idx = (y as usize) * w as usize + x as usize;
-            if used[idx] || tone[idx] < stop {
-                continue;
-            }
-            let sseed = hash_u64(
-                (x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ ((y as i64 as u64) << 1)
-                    ^ seed,
-            );
-            let tone_seed = tone[idx].clamp(0.0, 1.0);
-            let (flow_a, flow_coh) = field.ang_at(x as f64 + 0.5, y as f64 + 0.5);
-            let dark_gate = ((tone_seed - 0.50) / 0.25).clamp(0.0, 1.0);
-            let coh_gate = ((flow_coh - 0.45) / 0.35).clamp(0.0, 1.0);
-            let gate = (dark_gate * coh_gate) as f64;
-            let flow_th = flow_a as f64
-                + HATCH_FLOW_DEG[global_layer.min(HATCH_FLOW_DEG.len() - 1)].to_radians();
-            let th = lerp_dir(theta, flow_th, gate);
-            let s_max = (4.0 + 8.0 * tone_seed as f64) / scale.max(1e-9)
-                * (0.55 + 0.65 * hash01(sseed));
-            let fwd = trace_hatch(field, tone, (x, y), 1.0, th, stop, s_max, sseed);
-            let bwd = trace_hatch(field, tone, (x, y), -1.0, th, stop, s_max, sseed);
-            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(fwd.len() + bwd.len() + 1);
-            for &p in bwd.iter().rev() {
-                pts.push(p);
-            }
-            pts.push((x, y));
-            pts.extend(fwd.iter().copied());
-            if pts.len() < 3 {
-                continue;
-            }
-            let len_px = chain_len(&pts);
-            if len_px < min_len_px {
-                continue;
-            }
-            let mut sum = 0.0f64;
-            let mut cnt = 0usize;
-            for &(px, py) in &pts {
-                let i = (py as usize).min(h as usize - 1) * w as usize
-                    + (px as usize).min(w as usize - 1);
-                sum += tone[i] as f64;
-                cnt += 1;
-            }
-            let mean_tone = (sum / cnt.max(1) as f64) as f32;
-            if mean_tone < stop {
-                continue;
-            }
-            let u = ((mean_tone - band_lo) / span).clamp(0.0, 1.0);
-            let n_act = (((u * lp as f32 - 0.05).floor().max(0.0)) as usize + 1).min(lp);
-            // 这一层要补的深度 = 带内位置 × 带宽；除以笔的满覆盖深度才是覆盖率。
-            let want_dark = (span * u / darkness.max(0.2)).clamp(0.0, 0.85);
-            let cov = (1.0 - (1.0 - want_dark.min(0.985)).powf(1.0f32 / n_act as f32))
-                .clamp(0.03, cov_cap as f32) as f64;
-            let local_mm = (pen_mm / cov).clamp(min_mm, pen_mm * 20.0);
-            let mark_r = ((local_mm / scale.max(1e-9)).round() as i32).max(1);
-            let mark_r2 = mark_r * mark_r;
-            let mark_step = (mark_r / 2).max(1) as usize;
-            for &(px, py) in pts.iter().step_by(mark_step) {
-                let cx = px.round() as i32;
-                let cy = py.round() as i32;
-                for yy in (cy - mark_r).max(0)..=(cy + mark_r).min(h - 1) {
-                    let dy = yy - cy;
-                    for xx in (cx - mark_r).max(0)..=(cx + mark_r).min(w - 1) {
-                        let dx = xx - cx;
-                        if dx * dx + dy * dy <= mark_r2 {
-                            used[(yy as usize) * w as usize + xx as usize] = true;
-                        }
-                    }
-                }
-            }
-            let theta_s = path_theta(&pts);
-            out.push(Stroke {
-                pts,
-                loose: [true, true],
-                len_mm: len_px * scale,
-                mean_dark: u as f64,
-                mean_width_mm: pen_mm * 0.9,
-                theta: theta_s,
-                rank: global_layer as f64 / (HATCH_DIR_DEG.len().max(1) - 1) as f64,
-                structural: false,
-                passes: 1,
-            });
-        }
-        gy += 1;
-    }
-    out
-}
-
-/// 从种子向一个方向追踪一根排线（像素坐标，不含种子点）。
-#[allow(clippy::too_many_arguments)]
-fn trace_hatch(
-    field: &Field,
-    need: &[f32],
-    start: (f64, f64),
-    sign: f64,
-    theta: f64,
-    stop: f32,
-    max_len_px: f64,
-    seed: u64,
-) -> Vec<(f64, f64)> {
-    let w = field.w as i32;
-    let h = field.h as i32;
-    let mut out = Vec::new();
-    let (mut x, mut y) = start;
-    let (mut dx, mut dy) = hatch_dir(theta, x, y, seed);
-    dx *= sign;
-    dy *= sign;
-    let mut walked = 0.0f64;
-    while walked < max_len_px {
-        let nx = x + dx;
-        let ny = y + dy;
-        if nx < 0.0 || ny < 0.0 || nx >= w as f64 || ny >= h as f64 {
-            break;
-        }
-        let ix = nx as i32;
-        let iy = ny as i32;
-        let i = (iy as usize) * w as usize + ix as usize;
-        // 只看调子，不看占位：占位是给「起笔」用的。追踪时一碰邻居就停，
-        // 排线会被剪成一根根小短线，看着像虚线。
-        if need[i] < stop {
-            break;
-        }
-        // 方向只做很慢的低频漂移：每步吸收 18%，整根线才会缓弯而不是折线。
-        let (ndx, ndy) = hatch_dir(theta, nx, ny, seed);
-        let (mut sx, mut sy) = (dx * 0.82 + ndx * sign * 0.18, dy * 0.82 + ndy * sign * 0.18);
-        let l = (sx * sx + sy * sy).sqrt();
-        if l < 1e-9 {
-            break;
-        }
-        sx /= l;
-        sy /= l;
-        dx = sx;
-        dy = sy;
-        x = nx;
-        y = ny;
-        walked += 1.0;
-        out.push((x, y));
-    }
-    out
-}
-
-/// 两个「无向」角度之间插值：排线的 0° 和 180° 是同一根线，
-/// 直接线性插值会在 0/π 附近转一整圈。
-fn lerp_dir(a: f64, b: f64, w: f64) -> f64 {
-    if w <= 0.0 {
-        return a;
-    }
-    let mut d = (b - a).rem_euclid(std::f64::consts::PI);
-    if d > std::f64::consts::FRAC_PI_2 {
-        d -= std::f64::consts::PI;
-    }
-    a + d * w
-}
-
-/// 排线方向：本层固定角 + 每根笔自己的低频手漂和约 ±2° 的落笔角差。
-///
-/// 不跟局部脊方向走：原稿的铅笔颗粒、纸纹都会给出「假脊」，
-/// 跟着它排会得到满纸蠕动的曲线；等照度线又会绕成同心环。
-/// 固定交叉角 + 疏密才是单色笔最稳的表达。
-fn hatch_dir(theta: f64, x: f64, y: f64, seed: u64) -> (f64, f64) {
-    // 每根笔的固定角差：手不会每次都落在完全相同的角度上。
-    let fixed = (hash01(seed ^ 0x51ed_2701_b4e9_2f0d) - 0.5) * 0.07;
-    // 波长约 20~30mm：一根 10mm 的排线上只弯一两度，像手腕的轻微摆动。
-    let wob = value_noise(x * 0.004 + y * 0.003, seed) * 0.035;
-    let th = theta + fixed + wob;
-    (th.cos(), th.sin())
-}
 
 /// 从四周边框泛洪，找出连成一片的背景（背景当纸白）。
 ///
 /// `norm` 是原始调子，用来判断「这里是不是纸」；`smooth` 是 0.4mm 平滑图，
 /// 只用来判断相邻像素的缓变。两者分工：纸纹的逐像素起伏不该切断漫填，
 /// 而人脸那种由轮廓线界定的跳变必须切断。
-fn background_mask(norm: &[f32], smooth: &[f32], w: usize, h: usize) -> Vec<bool> {
+fn background_mask(norm: &[f32], smooth: &[f32], tex: &[f32], w: usize, h: usize) -> Vec<bool> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
@@ -3219,11 +1711,20 @@ fn background_mask(norm: &[f32], smooth: &[f32], w: usize, h: usize) -> Vec<bool
     // 相邻像素材质差：背景是平滑的（哪怕有渐变），笔触/人脸边界会跳变。
     // 用「相邻差」而不是固定区间，才能沿着背景的渐变一直走，又在头发、
     // 下颌这些地方停住。
+    //
     let step_max = 0.018f32;
     let abs_max = 0.42f32;
-    // 纯纸白（调子 0~0.006）不参与漫填：它要么是背景（本来就不会排线），
-    // 要么是额头/鼻梁高光。把它标成背景的好处为零，却给「从背景漏进人脸」
-    // 留了一条白走廊。
+    // 漫填只能停在「比纸白略深一点」的地方。只靠相邻差不够：脸是平滑的，
+    // 从纸白一路按 0.018/px 爬，几十像素就爬进脸颊——背景掩码把整张脸吞掉，
+    // 脸上一根调子都不排，就是「画面发白、明暗没层次」的直接原因。
+    // 纸的渐变/暗角不会超过纸白 0.09；超过就是画面内容。
+    let climb_max = 0.09f32;
+    // 纹理屏障：纸面只有均匀的颗粒，脸/衣褶即使很亮，也有 0.8mm 尺度上的
+    // 排线起伏。高频能量超过 0.012 就停下，漫填不会穿过高光进入画面内容。
+    let tex_max = 0.012f32;
+    // 纯纸白不参与漫填：它要么是背景（本来就不会排线），要么是额头/鼻梁
+    // 高光。收紧步进试过（0.006），结果反把半张脸判成背景——高调人像的
+    // 脸颊本来就与纸白连续。白走廊的问题交给下面的「墨量邻近度」处理。
     let raw_floor = 0.006f32;
     let mut mask = vec![false; w * h];
     let mut stack: Vec<usize> = Vec::new();
@@ -3244,8 +1745,10 @@ fn background_mask(norm: &[f32], smooth: &[f32], w: usize, h: usize) -> Vec<bool
         let x = i % w;
         let y = i / w;
         let base = smooth[i];
-        let mut visit = |j: usize, stack: &mut Vec<usize>, mask: &mut Vec<bool>| {
-            if mask[j] || norm[j] <= raw_floor || norm[j] > abs_max {
+        let visit = |j: usize, stack: &mut Vec<usize>, mask: &mut Vec<bool>| {
+            if mask[j] || norm[j] <= raw_floor || norm[j] > abs_max || norm[j] > bg + climb_max
+                || tex[j] > tex_max
+            {
                 return;
             }
             if (smooth[j] - base).abs() <= step_max {
@@ -3266,6 +1769,33 @@ fn background_mask(norm: &[f32], smooth: &[f32], w: usize, h: usize) -> Vec<bool
             visit(i + w, &mut stack, &mut mask);
         }
     }
+    // 掩码外扩 2px。
+    //
+    // 漫填按「相邻平滑差」走，纸纹上偶尔有一两个像素的暗点通不过，留下
+    // 针孔；针孔里会落进一根 1~3mm 的短笔，在大图背景里就是一根根
+    // 没来由的碎线（放大最扎眼）。外扩 2px（约 0.14mm）把细孔吃掉，
+    // 边界只内收一条线宽，发梢/衣角不受影响。
+    let mut grown = mask.clone();
+    for y in 0..h {
+        for x in 0..w {
+            if !mask[y * w + x] {
+                continue;
+            }
+            for dy in -2i32..=2 {
+                let yy = y as i32 + dy;
+                if yy < 0 || yy >= h as i32 {
+                    continue;
+                }
+                for dx in -2i32..=2 {
+                    let xx = x as i32 + dx;
+                    if xx >= 0 && xx < w as i32 {
+                        grown[yy as usize * w + xx as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+    let mask = grown;
     if std::env::var("SKETCH_DEBUG").is_ok() {
         let n = mask.iter().filter(|&&v| v).count();
         eprintln!(
@@ -3298,236 +1828,6 @@ fn background_mask(norm: &[f32], smooth: &[f32], w: usize, h: usize) -> Vec<bool
     mask
 }
 
-/// 轮廓/五官层：局部细节调子 → 骨架 → 折线。
-///
-/// 不直接用梯度找边：全局梯度被头发、衣褶这些强纹理占满，脸上的眼睛、
-/// 鼻翼、唇线幅度小得多，按分位切永远轮不到它们。改用
-/// `0.4mm 调子 − 2.2mm 调子`——「这一小块比周围暗多少」。
-/// 眼睛、唇缝、发丝、领口这一类「形」都会稳定地浮出来，纸面噪点则接近 0。
-fn contour_strokes(
-    field: &Field,
-    detail: &[f32],
-    bg: &[bool],
-    scale: f64,
-    pen_mm: f64,
-    edge_threshold: f64,
-) -> Vec<Stroke> {
-    let (w, h) = (field.w, field.h);
-    // 阈值跟着「轮廓阈值」滑块走：调高只留最明确的五官与轮廓，调低连浅发丝也要。
-    let thr = (0.12 - 0.08 * edge_threshold.clamp(0.05, 0.9) as f32).clamp(0.045, 0.14);
-    // 双阈值滞后：强响应决定「哪些是真的形」，弱响应只负责把同一段形连起来。
-    // 单阈值会把五官切成一段段虚线，滞后能补上中间掉下去的那几像素，
-    // 又不至于把纸面噪点整体放进骨架。
-    let mask = hysteresis_mask(detail, w, h, thr);
-    let skel = thin_ink(&mask, w as u32, h as u32);
-    let paths = skeleton_paths(&skel, w as u32, h as u32);
-    let min_px = (2.5 / scale.max(1e-9)).max(4.0);
-    let mut out = Vec::new();
-    for path in paths {
-        if (path.len() as f64) < min_px {
-            continue;
-        }
-        // 整条平均强度太弱的不要：纸纹和压缩噪点也能连成细链，
-        // 它们正是轮廓外那一圈「虚线头屑」。真五官、真发丝的均值明显更高。
-        let mut sum = 0f32;
-        let mut bg_n = 0usize;
-        for &(x, y) in &path {
-            let i = y as usize * w + x as usize;
-            sum += detail[i];
-            if bg[i] {
-                bg_n += 1;
-            }
-        }
-        let mean_d = sum / (path.len() as f32);
-        if mean_d < thr * 1.5 {
-            continue;
-        }
-        // 背景里没有形体，只有纸纹连成的链；整条落在背景上的一律丢掉。
-        if bg_n * 5 > path.len() * 3 {
-            continue;
-        }
-        let px: Vec<(f64, f64)> = path.iter().map(|&(x, y)| (x as f64, y as f64)).collect();
-        let mm: Vec<(f64, f64)> = px.iter().map(|&(x, y)| (x * scale, y * scale)).collect();
-        let simple = simplify_path(&mm, 0.12);
-        if simple.len() < 2 {
-            continue;
-        }
-        let pts: Vec<(f64, f64)> = simple.iter().map(|&(x, y)| (x / scale, y / scale)).collect();
-        let len_mm = chain_len(&pts) * scale;
-        if len_mm < 2.5 {
-            continue;
-        }
-        let theta = path_theta(&pts);
-        out.push(Stroke {
-            pts,
-            loose: [true, true],
-            len_mm,
-            mean_dark: if mean_d > thr * 3.0 { 1.0 } else { 0.92 },
-            mean_width_mm: pen_mm * 1.0,
-            theta,
-            rank: 1.0,
-            structural: true,
-            // 一笔画成的线，不再横铺成宽墨带：双遍 + 1.6 笔宽会让五官变成
-            // 一团粗黑疙瘩，像描了三遍边，反而不像铅笔画。
-            // 只有最强的那类（眼线、唇缝、发丝根）叠第二遍压重，
-            // 浅结构仍是一笔带过，画面上才有轻重。
-            passes: if mean_d > thr * 3.0 { 2 } else { 1 },
-        });
-    }
-    link_structural(out, scale)
-}
-
-/// 把首尾靠近、方向也接得上的轮廓碎片接成一条长线。
-///
-/// 骨架在浅灰处会断成一段段：单独看每段都像随手划的短线，接起来才是
-/// 手画的那一根下颌线。门槛卡得比较死（1.2mm、约 28°），宁可少接，
-/// 不能把眉毛和眼线焊在一起，也不能把两段夹角大的边接成 Z 形折线。
-fn link_structural(strokes: Vec<Stroke>, scale: f64) -> Vec<Stroke> {
-    let n = strokes.len();
-    if n < 2 {
-        return strokes;
-    }
-    let gap = 1.2 / scale.max(1e-9);
-    let mut used = vec![false; n];
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        strokes[b]
-            .len_mm
-            .partial_cmp(&strokes[a].len_mm)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut out: Vec<Stroke> = Vec::with_capacity(n);
-    for &s in &order {
-        if used[s] {
-            continue;
-        }
-        used[s] = true;
-        let mut chain = strokes[s].pts.clone();
-        let mut dark = strokes[s].mean_dark;
-        let mut width = strokes[s].mean_width_mm;
-        let mut passes = strokes[s].passes;
-        // 先向尾端接，再整体掉头接另一端（两轮后方向复原）。
-        for _ in 0..2 {
-            loop {
-                let m = chain.len();
-                if m < 2 {
-                    break;
-                }
-                let end = chain[m - 1];
-                let prev = chain[m - 2];
-                let (mut ex, mut ey) = (end.0 - prev.0, end.1 - prev.1);
-                let el = (ex * ex + ey * ey).sqrt().max(1e-9);
-                ex /= el;
-                ey /= el;
-                let mut best: Option<(usize, bool, f64)> = None;
-                for j in 0..n {
-                    if used[j] || strokes[j].pts.len() < 2 {
-                        continue;
-                    }
-                    let p = &strokes[j].pts;
-                    let last = p.len() - 1;
-                    let cand = [(p[0], p[1]), (p[last], p[last - 1])];
-                    for (qi, &(q, qn)) in cand.iter().enumerate() {
-                        let (vx, vy) = (q.0 - end.0, q.1 - end.1);
-                        let d = (vx * vx + vy * vy).sqrt();
-                        if d > gap {
-                            continue;
-                        }
-                        let inv = 1.0 / d.max(1e-9);
-                        let (vx, vy) = (vx * inv, vy * inv);
-                        let (mut qdx, mut qdy) = (qn.0 - q.0, qn.1 - q.1);
-                        let ql = (qdx * qdx + qdy * qdy).sqrt().max(1e-9);
-                        qdx /= ql;
-                        qdy /= ql;
-                        if ex * vx + ey * vy < 0.88 || qdx * vx + qdy * vy < 0.88 {
-                            continue;
-                        }
-                        if best.map_or(true, |(_, _, bd)| d < bd) {
-                            best = Some((j, qi == 1, d));
-                        }
-                    }
-                }
-                let Some((j, rev, _)) = best else { break };
-                used[j] = true;
-                let mut pts = strokes[j].pts.clone();
-                if rev {
-                    pts.reverse();
-                }
-                if chain.last() == pts.first() {
-                    pts.remove(0);
-                }
-                chain.extend(pts);
-                dark = dark.max(strokes[j].mean_dark);
-                width = width.max(strokes[j].mean_width_mm);
-                passes = passes.max(strokes[j].passes);
-                if chain_len(&chain) * scale > 45.0 {
-                    break;
-                }
-            }
-            chain.reverse();
-        }
-        let len_mm = chain_len(&chain) * scale;
-        out.push(Stroke {
-            theta: path_theta(&chain),
-            pts: chain,
-            loose: [true, true],
-            len_mm,
-            mean_dark: dark,
-            mean_width_mm: width,
-            rank: 1.0,
-            structural: true,
-            passes,
-        });
-    }
-    out
-}
-
-/// 双阈值滞后：弱阈值连通域里只要有两处强响应就整段保留。
-fn hysteresis_mask(detail: &[f32], w: usize, h: usize, thr: f32) -> Vec<bool> {
-    let lo = thr * 0.55;
-    let low: Vec<bool> = detail.iter().map(|&d| d > lo).collect();
-    let mut keep = vec![false; detail.len()];
-    let mut seen = vec![false; detail.len()];
-    let mut comp: Vec<usize> = Vec::new();
-    let mut stack: Vec<usize> = Vec::new();
-    for i in 0..detail.len() {
-        if !low[i] || seen[i] {
-            continue;
-        }
-        comp.clear();
-        stack.push(i);
-        seen[i] = true;
-        let mut strong = 0usize;
-        while let Some(j) = stack.pop() {
-            comp.push(j);
-            if detail[j] > thr {
-                strong += 1;
-            }
-            let x = j % w;
-            let y = j / w;
-            let x0 = x.saturating_sub(1);
-            let x1 = (x + 1).min(w - 1);
-            let y0 = y.saturating_sub(1);
-            let y1 = (y + 1).min(h - 1);
-            for yy in y0..=y1 {
-                let row = yy * w;
-                for xx in x0..=x1 {
-                    let k = row + xx;
-                    if low[k] && !seen[k] {
-                        seen[k] = true;
-                        stack.push(k);
-                    }
-                }
-            }
-        }
-        if strong >= 2 {
-            for &j in &comp {
-                keep[j] = true;
-            }
-        }
-    }
-    keep
-}
 
 /// 按层顺序落笔：同一层内按所选顺序串联，层与层之间保持「浅 → 深」。
 #[allow(clippy::too_many_arguments)]
@@ -3572,85 +1872,7 @@ fn emit_hatch_set(
     }
 }
 
-/// 线稿通路：沿墨脊逐笔追踪 + 调子取舍（见本文件开头的说明）。
-fn line_strokes(
-    gray: &image::GrayImage,
-    w: u32,
-    h: u32,
-    scale: f64,
-    threshold: f64,
-    invert: bool,
-    pen_mm: f64,
-    mid_frac: f64,
-) -> Vec<Stroke> {
-    if std::env::var("SKETCH_DEBUG").is_ok() {
-        eprintln!("调子渲染：中调占比 {mid_frac:.3} → 线稿；走墨脊追踪");
-    }
-    let traced = trace_strokes(gray, w, h, scale, threshold, invert);
-    if traced.is_empty() {
-        return Vec::new();
-    }
-    let mut strokes: Vec<Stroke> = traced
-        .into_iter()
-        .map(|t| Stroke {
-            theta: path_theta(&t.pts),
-            len_mm: t.len_mm,
-            mean_dark: t.tone,
-            mean_width_mm: t.width_px * scale,
-            loose: [true, true],
-            pts: t.pts,
-            rank: 0.5,
-            structural: false,
-            passes: 0,
-        })
-        .collect();
-    // 明暗取舍：素描靠「线条疏密」表现明暗，不是把原稿每一根线都照抄一遍。
-    let tone = tone_map(gray, w, h, invert, threshold, scale);
-    let (keep, structural) = tone_gate(&strokes, &tone, scale, pen_mm);
-    for (i, f) in structural.iter().enumerate() {
-        strokes[i].structural = *f;
-    }
-    let mut it = keep.into_iter();
-    strokes.retain(|_| it.next().unwrap_or(true));
-    strokes
-}
 
-/// 收尾：排序 → 规划走笔 → 落笔。
-fn finish(
-    mut strokes: Vec<Stroke>,
-    pressure: u32,
-    jitter_mm: f64,
-    pen_mm: f64,
-    order_mode: u8,
-    block_px: u32,
-    scale: f64,
-) -> Vec<Polyline> {
-    assign_ranks(&mut strokes);
-    strokes.sort_by(|a, b| {
-        a.pts[0]
-            .1
-            .partial_cmp(&b.pts[0].1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let plan = plan_order(&strokes, order_mode, block_px, scale);
-    let pressure = pressure.clamp(1, 6);
-    let jitter_mm = jitter_mm.max(0.0);
-    let mut out = Vec::new();
-    for (n, p) in plan.into_iter().enumerate() {
-        emit_stroke(
-            &strokes[p.idx],
-            p.rev,
-            n,
-            pressure,
-            jitter_mm,
-            pen_mm,
-            scale,
-            &mut out,
-        );
-    }
-    out
-}
 
 /// 调试用：把算法内部看到的调子图按 0..255 返回（深 = 调子高）。
 #[allow(dead_code)]
@@ -3792,147 +2014,6 @@ pub(crate) fn tone_map(
     }
 }
 
-/// 按调子做「墨量预算」取舍：这一块该有多少线，由它有多暗决定。
-///
-/// 每格允许的墨面积 = 明暗值^γ × 增益 × 格面积；一条线落在格里的长度 × 笔宽就是
-/// 它要花的墨。花得起就留下，花不起就整条丢掉——亮部于是自然留白，而不是靠用户
-/// 把阈值调高（调阈值只会把暗部的线也一起丢掉，明暗关系更糟）。
-///
-/// γ > 1 把中间调往下压：投影笔只有一种黑度，浅灰的排线画出来和重线一样黑，
-/// 所以只能靠「更少」来表现「更浅」。增益把整页墨量收在原稿附近，避免一边
-/// 说要明暗、一边把整张纸涂黑。
-///
-/// 先后顺序按「深、宽」排：轮廓线在自己的格里最黑，所以亮部也能留下来；
-/// 浅排线在同样的格里花不起墨，第一批被删掉。这正是人画素描的取舍。
-fn tone_gate(
-    strokes: &[Stroke],
-    tone: &Tone,
-    scale: f64,
-    pen_mm: f64,
-) -> (Vec<bool>, Vec<bool>) {
-    let area = tone.cell_mm * tone.cell_mm;
-    let env = |k: &str, d: f64| -> f64 {
-        std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
-    };
-    let gain = env("SKETCH_TONE_GAIN", 0.70);
-    let gamma = env("SKETCH_TONE_GAMMA", 1.5);
-    // 死区：比这更亮的地方**一根排线都不画**。人画素描时最亮的部分就是留白，
-    // 不会把纸的纹理、辅助线也描出来；投影笔一笔就是实黑，描了反而把亮部压暗。
-    let dead = env("SKETCH_TONE_DEAD", 0.22);
-    let caps: Vec<f32> = tone
-        .cells
-        .iter()
-        .map(|&v| {
-            let t = (v as f64).powf(gamma) * gain;
-            if (v as f64) < dead {
-                0.0
-            } else {
-                t.min(1.4) as f32 * area as f32
-            }
-        })
-        .collect();
-    // 结构线（形）：全画面最黑的那一批长线——轮廓、结构转折，素描里必须先立住。
-    // 用**绝对**墨色分位而不是「比周围黑多少」：浅网格线在亮区里也是「最黑的」，
-    // 相对判据会把整片背景网格当轮廓，画面立刻又变成满页线条。
-    let mut tones: Vec<f64> = strokes.iter().map(|s| s.mean_dark).collect();
-    tones.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let dark_cut = tones[(tones.len() * 3 / 4).min(tones.len().saturating_sub(1))]
-        .max(0.55)
-        .min(0.98);
-    let mut used = vec![0.0f32; caps.len()];
-    let mut order: Vec<usize> = (0..strokes.len()).collect();
-    let imp = |s: &Stroke| -> f64 {
-        // 只按「有多黑多宽」排，**不能给长度加权**：串线（从一根线窜到另一根）
-        // 的产物恰恰又长又乱，一旦让长线优先，预算会被这些错线吃光，
-        // 正确的短排线反而被挤掉——画面就从「密」变成「乱」。
-        let width_term = (0.7 + 0.3 * (s.mean_width_mm / pen_mm).min(2.0)).min(1.3);
-        s.mean_dark.powi(2) * width_term
-    };
-    order.sort_by(|&a, &b| {
-        imp(&strokes[b])
-            .partial_cmp(&imp(&strokes[a]))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut keep = vec![true; strokes.len()];
-    let mut structural = vec![false; strokes.len()];
-    let mut touch: Vec<(usize, f32)> = Vec::new();
-    for idx in order {
-        let s = &strokes[idx];
-        touch.clear();
-        let mut tot = 0.0f32;
-        for pair in s.pts.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt() * scale;
-            if len <= 0.0 {
-                continue;
-            }
-            let mx = (a.0 + b.0) * 0.5 * scale;
-            let my = (a.1 + b.1) * 0.5 * scale;
-            let cx = (mx / tone.cell_mm) as isize;
-            let cy = (my / tone.cell_mm) as isize;
-            if cx < 0 || cy < 0 || cx >= tone.cw as isize || cy >= tone.ch as isize {
-                continue;
-            }
-            let cell = cy as usize * tone.cw + cx as usize;
-            let l = len as f32;
-            tot += l;
-            match touch.iter_mut().find(|e| e.0 == cell) {
-                Some(e) => e.1 += l,
-                None => touch.push((cell, l)),
-            }
-        }
-        if tot <= 0.0 {
-            continue;
-        }
-        let pen = pen_mm as f32;
-        // 一条线真正耗的墨是「长度 × 笔宽 × 铺几遍」。遍数由**几何**决定，和落笔时
-        // 用的是同一套算法：墨带比一笔宽才需要横向铺满，否则就是一遍。
-        // （早先这里按墨色估遍数，把细线按 2.4 遍记，预算提前一倍半见底，
-        // 暗部只剩一半线条——暗部于是不够暗，刚好反了。）
-        let est = ((s.mean_width_mm / pen_mm).clamp(1.0, 2.5)) as f32;
-        // 这条线沿路的「背景调子」：取最亮的那一格，而不是平均值。
-        // 平均值会被线自己撑高——轮廓在自己的格里占了大半，平均下来反而像暗部，
-        // 判据就永远不成立。最亮的格子才代表它走过的背景。
-        let local = touch
-            .iter()
-            .map(|&(c, _)| tone.cells[c])
-            .fold(1.0f32, f32::min);
-        // **结构线免死**：墨色进了全画面最重的那一批、又够长，就是「形」。
-        // 它们常常走在亮区边上，亮区的预算接近 0，按纯墨量算必然被砍；
-        // 砍掉轮廓，画面就散成一堆排线，明暗再对也认不出画的是什么。
-        let contour = s.mean_dark >= dark_cut && s.len_mm >= 4.0 && local < 0.75;
-        if contour {
-            keep[idx] = true;
-            structural[idx] = true;
-            for &(c, l) in touch.iter() {
-                // 结构线也要占一点预算，否则亮区会被轮廓塞满。
-                used[c] = (used[c] + l * pen * est * 0.45).min(caps[c] * 1.4);
-            }
-            continue;
-        }
-        // **整条取舍，不能拦腰截断**。线段的预算按格算，但决定要按整条线做：
-        // 一条 80mm 的竖排线横穿 20 个格，只要过半的格还有余量就整条画下去。
-        // 早先按「超过 1/4 的墨落不下就整条丢掉」，长线几乎必被砍；改成逐段
-        // 截断又会让线在半空中断掉、画面显得残缺——那不像人画的，像打印机缺墨。
-        let mut fit = 0usize;
-        let mut nc = 0usize;
-        for &(c, l) in touch.iter() {
-            nc += 1;
-            if used[c] + l * pen * est <= caps[c] * 1.15 {
-                fit += 1;
-            }
-        }
-        if nc > 0 && fit * 2 < nc {
-            keep[idx] = false;
-            continue;
-        }
-        for &(c, l) in touch.iter() {
-            let cap = caps[c] * 1.4;
-            used[c] = (used[c] + l * pen * est).min(cap);
-        }
-    }
-    (keep, structural)
-}
 
 /// 建墨浓度图。
 ///
@@ -4512,8 +2593,6 @@ struct Field {
     coh: Vec<f32>,
     aw: usize,
     ah: usize,
-    /// 中调（0.15..0.7）像素占比：用来判断这是色调稿还是线稿
-    mid_frac: f64,
     /// 调子归一化的纸白与黑白跨度（灰阶 0..255），轮廓层复用它算细节调子。
     paper: f32,
     span: f32,
@@ -4618,15 +2697,9 @@ impl Field {
             }
         }
         let span = (paper - deep).max(16.0);
-        let mut mid = 0usize;
         for v in raw.iter_mut() {
-            let t = ((paper - *v) / span).max(0.0);
-            *v = t;
-            if t > 0.15 && t < 0.7 {
-                mid += 1;
-            }
+            *v = ((paper - *v) / span).max(0.0);
         }
-        let mid_frac = mid as f64 / n as f64;
 
         // 笔触提取要在**未做任何平滑**的调子图上算：铅笔笔触只有 1~3px 宽，
         // 先糊一遍就抹平了。平滑由 Hessian 在每个尺度里自己做。
@@ -4831,7 +2904,6 @@ impl Field {
             coh,
             aw,
             ah,
-            mid_frac,
             paper,
             span,
             ridge,
@@ -4854,7 +2926,8 @@ impl Field {
 
     /// (排线方向, 一致性)
     fn ang_at(&self, x: f64, y: f64) -> (f32, f32) {
-        let hx = (x * 0.5 - 0.5).max(0.0);        let hy = (y * 0.5 - 0.5).max(0.0);
+        let hx = (x * 0.5 - 0.5).max(0.0);
+        let hy = (y * 0.5 - 0.5).max(0.0);
         let x0 = (hx as usize).min(self.aw - 1);
         let y0 = (hy as usize).min(self.ah - 1);
         let x1 = (x0 + 1).min(self.aw - 1);
@@ -4873,18 +2946,6 @@ impl Field {
         (0.5 * s2.atan2(c2), pick(&self.coh))
     }
 
-    /// (原稿笔触走向, 可信度)：跟得住单根发丝、排线，尺度约 3px。
-    ///
-    /// 和 `ang_at` 的区别是尺度：`ang_at` 是 2.5mm 的「一片区域一个走向」，
-    /// 这个场只看 0.6mm 内、按脊响应加权的方向。分区重绘要「参考原稿的
-    /// 排线方向」，用的是后者；成片明暗里没有脊，可信度自然为 0，回落到
-    /// 手绘规则角。
-    fn ridge_ang_at(&self, x: f64, y: f64) -> (f32, f32) {
-        let c2 = bil(&self.rdc, self.w, self.h, x, y);
-        let s2 = bil(&self.rds, self.w, self.h, x, y);
-        (0.5 * s2.atan2(c2), bil(&self.rcoh, self.w, self.h, x, y))
-    }
-
     /// (成片笔触走向, 可信度)：平滑到约 1.2mm 的脊方向。
     fn smooth_ridge_ang_at(&self, x: f64, y: f64) -> (f32, f32) {
         let c2 = bil(&self.sdc, self.w, self.h, x, y);
@@ -4899,14 +2960,6 @@ impl Field {
         (0.5 * s2.atan2(c2), bil(&self.bcoh, self.w, self.h, x, y))
     }
 
-    /// 这张图是「色调稿」还是「线稿」。
-    ///
-    /// 线稿的白纸与线条之间几乎没有中间调；铅笔素描靠渐变与排线出调子，
-    /// 中调像素占比高得多。分不清这两类就会用错算法：拿追踪器画素描是乱涂，
-    /// 拿排线画线稿则会把干净的线条糊成一片阴影。
-    fn is_tonal(&self) -> bool {
-        self.mid_frac > 0.09
-    }
 }
 
 
@@ -5403,36 +3456,6 @@ fn stream_walk(
     (pts, dup)
 }
 
-/// 笔触提取：把原稿上真实画出来的铅笔线条一根根描出来。
-///
-/// 和「调子排线」的根本差别：排线是**照明暗重新编**一组线，位置和走向都跟原稿
-/// 对不上，所以怎么调都"不像"；这里描的是原稿本来那一根——发丝、眼线、唇线、
-/// 衬衫的斜排线，位置、走向、长短都是原作定的。
-///
-/// 流程有四步，每一步都对应一次实测失败：
-/// 1. **多尺度 Hessian 暗脊响应** → 只有「法向弯、沿脊平」的像素才有响应，
-///    抹开的阴影拿不到响应，所以不需要"画线还是画明暗"的开关；
-/// 2. **法向 NMS** 削成 1px 脊线。直接在响应平台上阈值化会连成一片；
-/// 3. **滞后阈值** 接断点。只用一个门槛切，同一根发丝会被切成好几截——
-///    实测头发区每行只有 22 段、段长中位 3.2mm，暗部墨量只有原稿的 25%。
-///    接上之后暗部墨量回到 76%；
-/// 4. **沿骨架追踪**成长折线，平滑、抽稀，再按笔宽拉开间距落笔。
-/// 墨量自校准：先按默认间距跑一遍，量出「画了多少墨 / 原稿有多少墨」，
-/// 偏了就把间距按比例重跑一遍。
-///
-/// 为什么必须有这一步：不同稿子用同一套常量，墨量能差到 0.45~1.29——
-/// 09_1 淡得只剩轮廓，05_1 又把脸糊住。差别不在参数，在于**每张稿子能被
-/// 提取出来的笔触有多密**：有的原稿笔触清晰、一笔一画都提得到，有的大片
-/// 是擦揉出来的调子、根本没有线可提。间距是唯一的墨量旋钮，而它该拧多少
-/// 只有量过才知道，所以先量再定。
-fn ridge_strokes(
-    f: &Field,
-    pen_mm: f64,
-    thr_slider: f64,
-    density: f64,
-) -> (Vec<Stroke>, Vec<u8>) {
-    ridge_strokes_gated(f, pen_mm, thr_slider, density, 0.20, 0.004, true)
-}
 
 /// 可调「纸白门槛」的提取。
 ///
@@ -5873,24 +3896,6 @@ fn bil(a: &[f32], w: usize, h: usize, x: f64, y: f64) -> f32 {
         + (p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx) * fy
 }
 
-/// 色调稿的完整笔迹：把原稿上真实画出来的铅笔线一根根描下来，再缝合断头。
-///
-/// 只有这一条路。所有"按明暗重新排一套线"的尝试（调子排线、稀疏补白、
-/// 第二轮低门槛追踪）都试过了，结果一样：画面立刻变成两层笔迹——一层跟着
-/// 形体走、一层是等距直梳，怎么调都脏。原稿的每根线都是原作画的，位置、粗细、
-/// 走向都有理由，编不出来。
-fn tonal_strokes(f: &Field, pen_mm: f64, threshold: f64, _pressure: u32, _seed: u64) -> Vec<Stroke> {
-    let (out, _covered) = ridge_strokes(f, pen_mm, threshold, 1.0);
-    if std::env::var("SKETCH_DEBUG").is_ok() {
-        eprintln!(
-            "笔触渲染：中调占比 {:.3} → 色调稿；{} 条，总长 {:.0}mm",
-            f.mid_frac,
-            out.len(),
-            out.iter().map(|s| s.len_mm).sum::<f64>()
-        );
-    }
-    out
-}
 /// 把一条已画的笔迹写进占用图。
 ///
 /// 除了「这里被占了」，还一起记下**这根线自己朝哪走**（倍角单位向量）。
@@ -5984,51 +3989,8 @@ fn path_theta(pts: &[(f64, f64)]) -> f64 {
     theta
 }
 
-/// 「笔重」：越黑、越粗越重。用来给全部笔迹排一个分位。
-fn stroke_weight(s: &Stroke) -> f64 {
-    let w = ((s.mean_width_mm - 0.25) / 0.75).clamp(0.0, 1.0);
-    (0.8 * s.mean_dark + 0.2 * w).clamp(0.0, 1.0)
-}
 
-/// 给每条笔迹打上笔重分位（0..1），供分层与叠描遍数使用。
-fn assign_ranks(strokes: &mut [Stroke]) {
-    let n = strokes.len();
-    if n == 0 {
-        return;
-    }
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        stroke_weight(&strokes[a])
-            .partial_cmp(&stroke_weight(&strokes[b]))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    for (i, &idx) in order.iter().enumerate() {
-        strokes[idx].rank = if n > 1 {
-            i as f64 / (n - 1) as f64
-        } else {
-            0.5
-        };
-    }
-}
 
-/// 按笔重分位分层：0 起稿轻线 / 1 主体 / 2 暗部强调。
-///
-/// 手绘的顺序就是先轻后重：先打稿定位，再描主体，最后压暗部。
-/// 用分位而不是绝对明暗，任何曝光差异的原稿都能分出同样的三层。
-fn tone_layers(strokes: &[Stroke]) -> Vec<u8> {
-    strokes
-        .iter()
-        .map(|s| {
-            if s.rank < 0.35 {
-                0
-            } else if s.rank < 0.72 {
-                1
-            } else {
-                2
-            }
-        })
-        .collect()
-}
 
 fn bounds(pts: &[(f64, f64)]) -> (f64, f64, f64, f64) {
     let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -6066,10 +4028,6 @@ fn orient_near(s: &Stroke, cur: (f64, f64)) -> (bool, (f64, f64)) {
     }
 }
 
-fn direction_bin(theta: f64) -> usize {
-    let b = (theta / (std::f64::consts::PI / DIR_BINS as f64)).floor() as i64;
-    (b.rem_euclid(DIR_BINS as i64)) as usize
-}
 
 fn scan_plan(strokes: &[Stroke]) -> Vec<Planned> {
     let mut ids: Vec<usize> = (0..strokes.len()).collect();
@@ -6179,93 +4137,7 @@ fn block_plan(strokes: &[Stroke], block_px: u32, scale: f64) -> Vec<Planned> {
     plan
 }
 
-/// 默认顺序：按力度分层；每层先长线、再短线按方向分组（排线感）。
-fn layered_plan(strokes: &[Stroke]) -> Vec<Planned> {
-    let layers = tone_layers(strokes);
-    let mut buckets: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for (i, &l) in layers.iter().enumerate() {
-        buckets[l as usize].push(i);
-    }
-    let mut plan = Vec::with_capacity(strokes.len());
-    let mut cur = (0.0, 0.0);
-    for bucket in buckets.iter() {
-        let mut longs = Vec::new();
-        let mut shorts = Vec::new();
-        for &i in bucket {
-            if strokes[i].len_mm >= LONG_STROKE_MM {
-                longs.push(i);
-            } else {
-                shorts.push(i);
-            }
-        }
-        longs.sort_by(|&a, &b| {
-            let ba = bounds(&strokes[a].pts);
-            let bb = bounds(&strokes[b].pts);
-            ((ba.1 / 10.0).floor() as i64)
-                .cmp(&((bb.1 / 10.0).floor() as i64))
-                .then(ba.0.partial_cmp(&bb.0).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        for i in longs {
-            let (rev, exit) = orient_near(&strokes[i], cur);
-            cur = exit;
-            plan.push(Planned { idx: i, rev });
-        }
-        let mut bins: [Vec<usize>; DIR_BINS] = std::array::from_fn(|_| Vec::new());
-        for i in shorts {
-            bins[direction_bin(strokes[i].theta)].push(i);
-        }
-        let mut bin_order: Vec<usize> = (0..DIR_BINS).collect();
-        bin_order.sort_by(|&a, &b| {
-            let la: f64 = bins[a].iter().map(|&i| strokes[i].len_mm).sum();
-            let lb: f64 = bins[b].iter().map(|&i| strokes[i].len_mm).sum();
-            lb.partial_cmp(&la)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
-        for b in bin_order {
-            if bins[b].is_empty() {
-                continue;
-            }
-            let theta = (b as f64 + 0.5) * std::f64::consts::PI / DIR_BINS as f64;
-            let (nx, ny) = (-theta.sin(), theta.cos());
-            let mut ids = bins[b].clone();
-            ids.sort_by(|&a, &c| {
-                let ca = centroid(&strokes[a].pts);
-                let cc = centroid(&strokes[c].pts);
-                let na = ca.0 * nx + ca.1 * ny;
-                let nc = cc.0 * nx + cc.1 * ny;
-                na.partial_cmp(&nc)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for i in ids {
-                let (rev, exit) = orient_near(&strokes[i], cur);
-                cur = exit;
-                plan.push(Planned { idx: i, rev });
-            }
-        }
-    }
-    plan
-}
 
-fn plan_order(
-    strokes: &[Stroke],
-    mode: u8,
-    block_px: u32,
-    scale: f64,
-) -> Vec<Planned> {
-    match mode {
-        1 => {
-            if strokes.len() <= 4000 {
-                nearest_plan(strokes)
-            } else {
-                layered_plan(strokes)
-            }
-        }
-        2 => scan_plan(strokes),
-        3 => block_plan(strokes, block_px, scale),
-        _ => layered_plan(strokes),
-    }
-}
 
 fn hash_u64(mut x: u64) -> u64 {
     x ^= x >> 33;

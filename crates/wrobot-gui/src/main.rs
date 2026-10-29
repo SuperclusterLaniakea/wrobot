@@ -6,6 +6,7 @@ mod fontmgr;
 mod io;
 mod preview;
 mod sketch;
+mod sketch_legacy;
 mod state;
 mod theme;
 mod ui;
@@ -122,11 +123,13 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result {
-    // 命令行：--port COM3 [--baud 115200] 直接连接；--auto 自动搜索并连接
+    // 命令行：--port COM3 [--baud 115200] 直接连接；--auto 自动搜索并连接；
+    // --no-connect 只开界面，不扫描串口也不自动连接（安全预览用）。
     let args: Vec<String> = std::env::args().collect();
     let mut port: Option<String> = None;
     let mut baud: u32 = 115200;
     let mut auto = false;
+    let mut no_connect = false;
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -146,6 +149,10 @@ fn main() -> eframe::Result {
             }
             "--auto" | "-a" => {
                 auto = true;
+                i += 1;
+            }
+            "--no-connect" | "-n" => {
+                no_connect = true;
                 i += 1;
             }
             _ => i += 1,
@@ -181,6 +188,13 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
             let mut app = MyApp::new();
+            if no_connect {
+                // --no-connect：连开机扫描也跳过，保证不打开任何串口。
+                app.state.auto_connect = false;
+                app.state.auto_connect_after_scan = false;
+                app.state.status = "已按 --no-connect 启动：未扫描串口、未连接设备".into();
+                return Ok(Box::new(app));
+            }
             // 后台扫一次端口（只 CreateFile 试探，不重试），这样设备页一打开就能看到
             // 每个口的在线状态。扫描必须放后台：离线蓝牙口的 CreateFile 可能卡十几秒。
             app.state.start_port_scan();
@@ -317,6 +331,8 @@ mod tests {
             region_block_mm: 2.5,
             stroke_len_mm: 3.2,
             stroke_follow: 2,
+            sketch_style: 1,
+            max_side_px: 3600,
             multi_pen: false,
             background: false,
             out: true,
@@ -962,6 +978,8 @@ mod tests {
             region_block_mm: 2.5,
             stroke_len_mm: 3.2,
             stroke_follow: 2,
+            sketch_style: 1,
+            max_side_px: 3600,
             multi_pen: false,
             background: false,
             out: true,
@@ -1011,14 +1029,29 @@ mod tests {
         let Some(mut app) = make_app() else { return };
         app.dev_kind = 2; // 模拟
         app.connect_device();
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        assert!(app.device.is_connected(), "模拟模式应处于已连接状态");
+        // 连接在后台线程里建立：并行跑测试时固定 sleep 会误判，改成等状态。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !app.device.is_connected() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "模拟模式应处于已连接状态"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         app.send_gcode("G1 X10 Y10");
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let log = app.device.log_snapshot();
-        assert!(log.contains("模拟模式"), "日志应标明模拟模式：{log}");
-        assert!(log.contains("G1 X10 Y10"), "日志应回显下发的 G-code：{log}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let log = app.device.log_snapshot();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "日志应回显下发的 G-code：{log}"
+            );
+            if log.contains("模拟模式") && log.contains("G1 X10 Y10") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// 重复连接不应「被自己占用」：连接前必须先释放上一个 transport。
@@ -1101,6 +1134,8 @@ mod tests {
             region_block_mm: 2.5,
             stroke_len_mm: 3.2,
             stroke_follow: 2,
+            sketch_style: 1,
+            max_side_px: 3600,
             multi_pen: false,
             background: false,
             out: true,
@@ -1668,6 +1703,49 @@ mod tests {
         assert!(horizontal > 0 && vertical > 0, "应同时含横线与竖线");
     }
 
+    /// 交叉排线 + 明暗分层：浅笔铺全图，越深的笔只在越暗的区域补交叉层，
+    /// 且笔标签按浅 → 深排列。
+    #[test]
+    fn crosshatch_multi_pen_layers_follow_tone() {
+        let (w, h) = (120u32, 120u32);
+        // 左黑右白的灰度渐变：越深（越靠左）的层覆盖范围越小
+        let gray = image::GrayImage::from_fn(w, h, |x, _| {
+            image::Luma([(x * 255 / (w - 1)) as u8])
+        });
+        let mut o = img_opts(5);
+        o.threshold = 0.7;
+        o.multi_pen = true;
+        o.pen_count = 3;
+        let r = crate::io::gray_to_polylines(&gray, &o);
+        assert_eq!(r.polylines.len(), r.pens.len(), "每根笔迹都要有笔标签");
+        for pen in 0..3u8 {
+            assert!(
+                r.pens.contains(&pen),
+                "第 {pen} 层应有笔迹：{:?}",
+                r.pens
+            );
+        }
+        assert!(
+            r.pens.windows(2).all(|s| s[0] <= s[1]),
+            "笔迹应按 浅 → 深 分层输出：{:?}",
+            r.pens
+        );
+        let max_x = |pen: u8| {
+            r.polylines
+                .iter()
+                .zip(r.pens.iter())
+                .filter(|(_, &p)| p == pen)
+                .flat_map(|(pl, _)| pl.pts.iter().map(|p| p.0))
+                .fold(0.0f64, f64::max)
+        };
+        let (a, b, c) = (max_x(0), max_x(1), max_x(2));
+        assert!(
+            c < b && b < a,
+            "层越深覆盖越窄：笔 0 到 {a:.1}mm、笔 1 到 {b:.1}mm、笔 2 到 {c:.1}mm"
+        );
+        assert!(r.w_mm > 50.0 && a > 35.0, "最浅的笔要铺满大面：{a:.1}mm");
+    }
+
     /// 网点（半调）：白区不落点，黑区网点密集且每次生成结果一致。
     #[test]
     fn line_art_halftone_dots_follow_darkness() {
@@ -1693,33 +1771,65 @@ mod tests {
         assert_eq!(again.polylines[0].pts, r.polylines[0].pts);
     }
 
-    /// 新增模式不能破坏旧存档：0/1/2 的序号语义保持不变。
+    /// 新增模式不能破坏旧存档：0/1/2 的序号语义保持不变；
+    /// 已下线的 7/8/9 统一归一到素描笔触。
     #[test]
     fn line_art_draw_type_indices_are_stable() {
         use crate::state::ImgDraw;
-        assert_eq!(ImgDraw::names().len(), 11);
-        for i in 0..ImgDraw::names().len() {
-            assert_eq!(ImgDraw::from_usize(i).name(), ImgDraw::names()[i]);
+        assert_eq!(ImgDraw::active().len(), 8);
+        for m in ImgDraw::active() {
+            assert_eq!(ImgDraw::from_usize(*m as usize), *m);
+            assert!(!m.name().is_empty());
         }
         assert_eq!(ImgDraw::from_usize(0), ImgDraw::Wire);
         assert_eq!(ImgDraw::from_usize(1), ImgDraw::Sketch);
         assert_eq!(ImgDraw::from_usize(2), ImgDraw::Continuous);
-        assert_eq!(ImgDraw::from_usize(7), ImgDraw::SketchOriginal);
-        assert_eq!(ImgDraw::from_usize(8), ImgDraw::SketchHatch);
-        assert_eq!(ImgDraw::from_usize(9), ImgDraw::RegionRedraw);
+        assert_eq!(ImgDraw::from_usize(7), ImgDraw::StrokeSketch);
+        assert_eq!(ImgDraw::from_usize(8), ImgDraw::StrokeSketch);
+        assert_eq!(ImgDraw::from_usize(9), ImgDraw::StrokeSketch);
         assert_eq!(ImgDraw::from_usize(10), ImgDraw::StrokeSketch);
         assert_eq!(ImgDraw::from_usize(99), ImgDraw::Sketch);
+        assert_eq!(ImgDraw::SketchOriginal.normalized(), ImgDraw::StrokeSketch);
+        assert_eq!(ImgDraw::SketchHatch.normalized(), ImgDraw::StrokeSketch);
+        assert_eq!(ImgDraw::RegionRedraw.normalized(), ImgDraw::StrokeSketch);
+        assert_eq!(ImgDraw::SketchOriginal.name(), ImgDraw::StrokeSketch.name());
     }
 
-    // ——— 调子排线通路（色调稿：铅笔素描、照片、成片的暗部） ———
+    /// 旧工程里的 7/8/9 走与 10 完全相同的生成通路。
+    #[test]
+    fn legacy_draw_types_render_as_stroke_sketch() {
+        let (w, h) = (160u32, 120u32);
+        let gray = image::GrayImage::from_fn(w, h, |x, _| {
+            image::Luma([if x < 60 { 255 } else if x < 110 { 150 } else { 40 }])
+        });
+        let base = {
+            let mut o = img_opts(10);
+            o.multi_pen = false;
+            o.hatch_levels = 4;
+            o.stroke_len_mm = 3.5;
+            o.sketch_jitter = 0.0;
+            crate::io::gray_to_polylines(&gray, &o)
+        };
+        for t in [7usize, 8, 9] {
+            let mut o = img_opts(t);
+            o.multi_pen = false;
+            o.hatch_levels = 4;
+            o.stroke_len_mm = 3.5;
+            o.sketch_jitter = 0.0;
+            let r = crate::io::gray_to_polylines(&gray, &o);
+            assert_eq!(
+                r.polylines.len(),
+                base.polylines.len(),
+                "draw_type={t} 应与素描笔触同路"
+            );
+            assert_eq!(r.polylines.first().map(|p| p.pts.clone()), base.polylines.first().map(|p| p.pts.clone()));
+        }
+    }
 
     /// 笔迹在某个矩形里的覆盖率（墨面积 / 矩形面积）。
     ///
-    /// 沿折线**逐段细步采样**、只看落在框内的那部分长度。早先是「线段中点落在
-    /// 框内就把整段长度算进去」，在长直笔画上会离谱地虚高——一条 40mm 的长线
-    /// 只要中点蹭到框边，整段 40mm 都算成框里的墨，实测把纯色块内部的覆盖率
-    /// 抬到 0.246，而框内其实只有 3 个点。细步采样量的是「框里到底有多少墨」，
-    /// 跟折线怎么抽稀无关。
+    /// 沿折线逐段细步采样，只累计落在框内那部分长度——线段中点蹭到框边
+    /// 不能把整段都算进框里。
     fn cover_in_box(
         polys: &[wrobot_core::render::Polyline],
         x0: f64,
@@ -1750,891 +1860,6 @@ mod tests {
             }
         }
         len * pen_mm / ((x1 - x0) * (y1 - y0)).max(1e-9)
-    }
-
-    /// 纯白纸上不该有任何笔迹：素描的亮部就是留白。
-    #[test]
-    fn sketch_tonal_blank_paper_stays_empty() {
-        crate::sketch::force_path(2);
-        let gray = image::GrayImage::from_pixel(200, 200, image::Luma([255]));
-        let mut o = img_opts(7);
-        o.threshold = 0.7;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        let cov = cover_in_box(&r.polylines, 0.0, 0.0, r.w_mm, r.h_mm, 0.5);
-        assert!(cov < 0.005, "白纸落墨了：覆盖率 {cov:.3}");
-    }
-
-    /// 核心语义：**原稿上真有的线要描出来**。
-    /// 造一张「一组平行细线」的图——这正是一张铅笔稿最典型的样子，
-    /// 提取出的笔迹数量应与原线一致、方向应贴着原线、长度应基本贯通。
-    #[test]
-    fn sketch_tonal_extracts_parallel_lines() {
-        crate::sketch::force_path(2);
-        let (w, h) = (240u32, 200u32);
-        let rows = [30u32, 50, 70, 90, 110, 130, 150, 170];
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let on = rows.contains(&y) && (16..224).contains(&x);
-            image::Luma([if on { 96 } else { 244 }])
-        });
-        let mut o = img_opts(7);
-        o.threshold = 0.7;
-        o.sketch_pen = 0.5;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        let ppm = r.w_mm / w as f64;
-        let n = r.polylines.len();
-        assert!(n >= 6, "8 条线只认出了 {n} 条");
-        // 方向：每条的外接框应明显「横长竖短」
-        let mut horiz = 0usize;
-        for p in &r.polylines {
-            if p.pts.len() < 2 {
-                continue;
-            }
-            let (mut x0, mut x1, mut y0, mut y1) = (1e9f64, -1e9f64, 1e9f64, -1e9f64);
-            for &(x, y) in &p.pts {
-                x0 = x0.min(x);
-                x1 = x1.max(x);
-                y0 = y0.min(y);
-                y1 = y1.max(y);
-            }
-            if x1 - x0 > 3.0 * (y1 - y0).max(0.02) {
-                horiz += 1;
-            }
-        }
-        assert!(horiz * 2 > n, "多数笔迹应是水平走向，实际 {horiz}/{n}");
-        // 长度：横线原长 208px ≈ 104mm 的一半以上要画出来
-        let long = r
-            .polylines
-            .iter()
-            .filter(|p| {
-                let x0 = p.pts.iter().map(|q| q.0).fold(1e9f64, f64::min);
-                let x1 = p.pts.iter().map(|q| q.0).fold(-1e9f64, f64::max);
-                (x1 - x0) > 208.0 * ppm * 0.45
-            })
-            .count();
-        assert!(long >= 4, "只有 {long} 条线贯穿近半幅（共 {n} 条）");
-        let _ = ppm;
-    }
-
-    /// 纯色块里**没有线**，就不该在里面编线：只描出它的边界。
-    /// 这条守的是「提取真实笔触」这个前提——一旦退化成"按明暗补排线"，
-    /// 块内部就会被填满，整幅画变成另一张图。
-    #[test]
-    fn sketch_tonal_flat_block_only_gets_its_outline() {
-        crate::sketch::force_path(2);
-        let (w, h) = (200u32, 200u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let d = ((x as f32 - 100.0).powi(2) + (y as f32 - 100.0).powi(2)).sqrt();
-            let t = ((d - 48.0) / 12.0).clamp(0.0, 1.0);
-            image::Luma([(70.0 + (242.0 - 70.0) * t) as u8])
-        });
-        let mut o = img_opts(7);
-        o.threshold = 0.7;
-        o.sketch_pen = 0.5;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        let (wmm, hmm) = (r.w_mm, r.h_mm);
-        let (cxm, cym) = (wmm * 0.5, hmm * 0.5);
-        // 圆内核心：本来就没有线，应当几乎空白
-        let inner = cover_in_box(
-            &r.polylines,
-            cxm - wmm * 0.10,
-            cym - hmm * 0.10,
-            cxm + wmm * 0.10,
-            cym + hmm * 0.10,
-            0.5,
-        );
-        // 边界一圈：应当有笔
-        let ring = cover_in_box(
-            &r.polylines,
-            cxm - wmm * 0.28,
-            cym - hmm * 0.28,
-            cxm + wmm * 0.28,
-            cym + hmm * 0.28,
-            0.5,
-        );
-        let corner = cover_in_box(
-            &r.polylines,
-            wmm * 0.96,
-            hmm * 0.02,
-            wmm * 0.99,
-            hmm * 0.2,
-            0.5,
-        );
-        if inner >= 0.10 {
-            let ppm2 = 200.0 / wmm; // px per mm
-            eprintln!("DBG 共 {} 条，wmm={wmm:.1} hmm={hmm:.1}", r.polylines.len());
-            for (k, p) in r.polylines.iter().enumerate() {
-                let (mut ax, mut bx, mut ay, mut by) = (1e9f64, -1e9f64, 1e9f64, -1e9f64);
-                let mut ln = 0.0f64;
-                for s in p.pts.windows(2) {
-                    ln += ((s[1].0 - s[0].0).powi(2) + (s[1].1 - s[0].1).powi(2)).sqrt();
-                }
-                for q in &p.pts {
-                    ax = ax.min(q.0);
-                    bx = bx.max(q.0);
-                    ay = ay.min(q.1);
-                    by = by.max(q.1);
-                }
-                let f = |v: f64, c: f64| (v - c) * ppm2;
-                let ib = cover_in_box(
-                    std::slice::from_ref(p),
-                    cxm - wmm * 0.10,
-                    cym - hmm * 0.10,
-                    cxm + wmm * 0.10,
-                    cym + hmm * 0.10,
-                    0.5,
-                );
-                eprintln!(
-                    "DBG #{k} n={} len={:.1}px box x[{:.0},{:.0}] y[{:.0},{:.0}] inner={ib:.4}",
-                    p.pts.len(),
-                    ln * ppm2,
-                    f(ax, cxm),
-                    f(bx, cxm),
-                    f(ay, cym),
-                    f(by, cym),
-                );
-            }
-        }
-        assert!(inner < 0.10, "纯色块内部被编了线：{inner:.3}");
-        assert!(ring > 0.02, "块边界没描出来：{ring:.3}");
-        assert!(corner < 0.05, "纸白处不该落墨：{corner:.3}");
-    }
-
-    /// 识别与笔宽无关：换笔宽只改「纸上怎么排」，不该改变「认出几根线」。
-    #[test]
-    fn sketch_tonal_ink_is_pen_independent() {
-        crate::sketch::force_path(2);
-        let (w, h) = (200u32, 160u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let on = y % 16 == 8 && (10..190).contains(&x);
-            image::Luma([if on { 110 } else { 242 }])
-        });
-        let n_for = |pen: f64| {
-            let mut o = img_opts(7);
-            o.threshold = 0.7;
-            o.sketch_pen = pen;
-            crate::io::gray_to_polylines(&gray, &o).polylines.len()
-        };
-        let a = n_for(0.3);
-        let b = n_for(0.6);
-        assert!(a >= 6 && b >= 6, "细笔 {a} 条、粗笔 {b} 条，都太少");
-        let k = a as f64 / b as f64;
-        assert!(
-            (0.6..1.67).contains(&k),
-            "笔宽不该改变识别到的线条数：0.3mm → {a} 条，0.6mm → {b} 条"
-        );
-    }
-
-    /// 素描原稿：沿原稿线条描线而非铺影线；暗部叠描更多，空白处保持空白。
-    #[test]
-    fn sketch_original_follows_strokes_and_pressure() {
-        // 一张 120×120 的「铅笔稿」：一条深色斜线 + 一条浅灰横线。
-        let (w, h) = (120u32, 120u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let dark = (x as i32 - y as i32).abs() <= 1;
-            let light = y == 90 && (20..100).contains(&x);
-            let v = if dark {
-                20u8
-            } else if light {
-                150u8
-            } else {
-                255u8
-            };
-            image::Luma([v])
-        });
-
-        let mut opts = img_opts(7);
-        opts.threshold = 0.75; // 深线和浅线都算墨
-        opts.sketch_jitter = 0.0;
-        opts.sketch_pressure = 1;
-        opts.order_mode = 2; // 保持扫描顺序，便于比较遍数
-        let one = crate::io::gray_to_polylines(&gray, &opts);
-        assert!(!one.polylines.is_empty(), "原稿有线条就应描出笔迹");
-
-        opts.sketch_pressure = 3;
-        let many = crate::io::gray_to_polylines(&gray, &opts);
-        assert!(
-            many.polylines.len() > one.polylines.len(),
-            "叠描遍数增加后暗部应多描几遍：{} → {}",
-            one.polylines.len(),
-            many.polylines.len()
-        );
-
-        // 白纸区域不能凭空生成线条（高光天然留白）。
-        // 允许 1px 的光晕：笔有宽度，墨带边缘那一遍的线心本就压在墨迹边界上。
-        for pl in &many.polylines {
-            for &(x, y) in &pl.pts {
-                let px = (((x / many.w_mm) * w as f64) as i32).clamp(0, w as i32 - 1);
-                let py = (((y / many.h_mm) * h as f64) as i32).clamp(0, h as i32 - 1);
-                let mut near_ink = false;
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        let (qx, qy) = (
-                            (px + dx).clamp(0, w as i32 - 1) as u32,
-                            (py + dy).clamp(0, h as i32 - 1) as u32,
-                        );
-                        if gray.get_pixel(qx, qy).0[0] < 200 {
-                            near_ink = true;
-                        }
-                    }
-                }
-                assert!(near_ink, "白纸区域不应落笔：({px},{py})");
-            }
-        }
-
-        // 纯白图：没有任何线条。
-        let blank = image::GrayImage::from_pixel(40, 40, image::Luma([255u8]));
-        opts.sketch_pressure = 1;
-        let r = crate::io::gray_to_polylines(&blank, &opts);
-        assert!(r.polylines.is_empty(), "空白稿不应产生笔迹");
-    }
-
-    /// 逐笔识别：十字交叉处两条笔迹都要保持连续，不能在结点处断成四截。
-    #[test]
-    fn sketch_original_keeps_strokes_whole_through_crossing() {
-        let (w, h) = (160u32, 160u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let horiz = (79..=81).contains(&y) && (18..=141).contains(&x);
-            let vert = (79..=81).contains(&x) && (18..=141).contains(&y);
-            image::Luma([if horiz || vert { 20u8 } else { 255u8 }])
-        });
-        let mut opts = img_opts(7);
-        opts.threshold = 0.6;
-        opts.sketch_jitter = 0.0;
-        opts.sketch_pressure = 1;
-        opts.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &opts);
-        let sc = r.h_mm / h as f64;
-        let px = |pl: &wrobot_core::Polyline| -> Vec<(f64, f64)> {
-            pl.pts.iter().map(|&(x, y)| (x / sc, y / sc)).collect()
-        };
-        let (mut horiz_ok, mut vert_ok) = (false, false);
-        for pl in &r.polylines {
-            let pts = px(pl);
-            let xmin = pts.iter().map(|p| p.0).fold(f64::MAX, f64::min);
-            let xmax = pts.iter().map(|p| p.0).fold(f64::MIN, f64::max);
-            let ymin = pts.iter().map(|p| p.1).fold(f64::MAX, f64::min);
-            let ymax = pts.iter().map(|p| p.1).fold(f64::MIN, f64::max);
-            if xmin < 30.0 && xmax > 130.0 && pts.iter().all(|p| (p.1 - 80.0).abs() <= 3.0) {
-                horiz_ok = true;
-            }
-            if ymin < 30.0 && ymax > 130.0 && pts.iter().all(|p| (p.0 - 80.0).abs() <= 3.0) {
-                vert_ok = true;
-            }
-        }
-        assert!(horiz_ok, "横向线应在交叉点处续笔成一条：{:?}", r.polylines.len());
-        assert!(vert_ok, "纵向线应在交叉点处续笔成一条：{:?}", r.polylines.len());
-    }
-
-    /// 断笔接续：同一方向、只差几个像素的小断口应接成一条笔迹。
-    #[test]
-    fn sketch_original_bridges_small_break() {
-        let (w, h) = (300u32, 300u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let band = (148..=152).contains(&y);
-            let on = band && ((40..=147).contains(&x) || (152..=250).contains(&x));
-            let faint = band && (148..=151).contains(&x);
-            let v = if on {
-                20u8
-            } else if faint {
-                215u8
-            } else {
-                255u8
-            };
-            image::Luma([v])
-        });
-        let mut opts = img_opts(7);
-        opts.threshold = 0.6;
-        opts.sketch_jitter = 0.0;
-        opts.sketch_pressure = 1;
-        opts.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &opts);
-        let sc = r.h_mm / h as f64;
-        let mut bridged = false;
-        for pl in &r.polylines {
-            let xs: Vec<f64> = pl.pts.iter().map(|p| p.0 / sc).collect();
-            let span = xs.iter().fold(f64::MIN, |a, &b| a.max(b))
-                - xs.iter().fold(f64::MAX, |a, &b| a.min(b));
-            if span > 180.0 {
-                bridged = true;
-            }
-        }
-        assert!(bridged, "4px 小断口应接成一条长笔迹");
-    }
-
-    /// 1px 针孔（浅灰残留，不是白纸）应在细化前补上，避免骨架天生就是断的。
-    #[test]
-    fn sketch_original_seals_one_pixel_hole() {
-        let (w, h) = (280u32, 80u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let band = (38..=40).contains(&y) && (20..=260).contains(&x);
-            let hole = band && x == 140;
-            let v = if hole {
-                225u8
-            } else if band {
-                25u8
-            } else {
-                255u8
-            };
-            image::Luma([v])
-        });
-        let mut opts = img_opts(7);
-        opts.threshold = 0.72;
-        opts.sketch_jitter = 0.0;
-        opts.sketch_pressure = 1;
-        opts.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &opts);
-        let sc = r.h_mm / h as f64;
-        let span = |pl: &wrobot_core::Polyline| {
-            let xs: Vec<f64> = pl.pts.iter().map(|p| p.0 / sc).collect();
-            xs.iter().fold(f64::MIN, |a, &b| a.max(b))
-                - xs.iter().fold(f64::MAX, |a, &b| a.min(b))
-        };
-        assert!(
-            r.polylines.iter().any(|p| span(p) > 200.0),
-            "1px 浅灰针孔不应把一根线切成两段"
-        );
-    }
-
-    /// 网格交叉处的笔迹必须各走各的：横向线在交叉点穿过竖向线继续走，
-    /// 不能拐进相邻的竖线里，把排线织成「人字纹」。
-    #[test]
-    fn sketch_original_grid_crossings_do_not_zigzag() {
-        let (w, h) = (140u32, 140u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let vert = (0..4).any(|k| (20 + k * 30..=21 + k * 30).contains(&x));
-            let horiz = (0..4).any(|k| (20 + k * 30..=21 + k * 30).contains(&y));
-            let ink = (vert && (10..=130).contains(&y)) || (horiz && (10..=130).contains(&x));
-            image::Luma([if ink { 30u8 } else { 255u8 }])
-        });
-        let mut opts = img_opts(7);
-        opts.threshold = 0.7;
-        opts.sketch_jitter = 0.0;
-        opts.sketch_pressure = 1;
-        opts.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &opts);
-        let sc = r.h_mm / h as f64;
-        let mut plain = 0;
-        for pl in &r.polylines {
-            let pts: Vec<(f64, f64)> = pl.pts.iter().map(|&(x, y)| (x / sc, y / sc)).collect();
-            let (xmin, xmax) = pts.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.0), b.max(p.0)));
-            let (ymin, ymax) = pts.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.1), b.max(p.1)));
-            let (dw, dh) = (xmax - xmin, ymax - ymin);
-            // 横线/竖线：一个方向很长，另一个方向只有一个线宽
-            if (dw > 80.0 && dh < 6.0) || (dh > 80.0 && dw < 6.0) {
-                plain += 1;
-            }
-        }
-        assert!(plain >= 7, "8 根线里应几乎都是直通线，实际只有 {plain} 根（其余被织成折线）");
-    }
-
-    /// 还原出来的线必须落在原稿那条墨上：这是「拟真」的底线，
-    /// 位置飘了的线再漂亮也不是原稿。
-    #[test]
-    fn sketch_original_lands_on_the_ink() {
-        let (w, h) = (200u32, 120u32);
-        // 一条 3px 粗的横线 + 一条 3px 粗的竖线，位置都已知
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let horiz = (78..=80).contains(&y) && (30..=170).contains(&x);
-            let vert = (138..=140).contains(&x) && (25..=95).contains(&y);
-            image::Luma([if horiz || vert { 30u8 } else { 255u8 }])
-        });
-        let mut opts = img_opts(7);
-        opts.threshold = 0.7;
-        opts.sketch_jitter = 0.0;
-        opts.sketch_pressure = 1;
-        opts.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &opts);
-        let sc = r.h_mm / h as f64;
-        let mut best_h = f64::MAX;
-        let mut best_v = f64::MAX;
-        for pl in &r.polylines {
-            let pts: Vec<(f64, f64)> = pl.pts.iter().map(|&(x, y)| (x / sc, y / sc)).collect();
-            let (xmin, xmax) = pts
-                .iter()
-                .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.0), b.max(p.0)));
-            let (ymin, ymax) = pts
-                .iter()
-                .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.1), b.max(p.1)));
-            if xmax - xmin > 80.0 {
-                for p in &pts {
-                    best_h = best_h.min((p.1 - 79.0).abs());
-                }
-            }
-            if ymax - ymin > 40.0 {
-                for p in &pts {
-                    best_v = best_v.min((p.0 - 139.0).abs());
-                }
-            }
-        }
-        assert!(best_h <= 1.5, "横线偏离原墨 {best_h:.2}px");
-        assert!(best_v <= 1.5, "竖线偏离原墨 {best_v:.2}px");
-    }
-
-    /// 真正的白纸断口不能接：留白是高光，接上就成了凭空多出的线。
-    #[test]
-    fn sketch_original_keeps_paper_break() {
-        let (w, h) = (280u32, 80u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let band = (38..=40).contains(&y);
-            let ink = band && ((20..=138).contains(&x) || (142..=260).contains(&x));
-            image::Luma([if ink { 25u8 } else { 255u8 }])
-        });
-        let mut opts = img_opts(7);
-        opts.threshold = 0.72;
-        opts.sketch_jitter = 0.0;
-        opts.sketch_pressure = 1;
-        opts.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &opts);
-        let sc = r.h_mm / h as f64;
-        let span = |pl: &wrobot_core::Polyline| {
-            let xs: Vec<f64> = pl.pts.iter().map(|p| p.0 / sc).collect();
-            xs.iter().fold(f64::MIN, |a, &b| a.max(b))
-                - xs.iter().fold(f64::MAX, |a, &b| a.min(b))
-        };
-        assert!(
-            r.polylines.iter().all(|p| span(p) < 200.0),
-            "3px 纯白断口是留白，不应被接成长线"
-        );
-    }
-
-    /// 分层描绘：浅色起稿线先画、暗部后画；暗部重描更多。
-    #[test]
-    fn sketch_original_draws_light_layer_first() {
-        let (w, h) = (300u32, 140u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let light = (25..=27).contains(&y) && (20..=280).contains(&x);
-            let dark = (105..=107).contains(&y) && (20..=280).contains(&x);
-            let v = if dark {
-                30u8
-            } else if light {
-                170u8
-            } else {
-                255u8
-            };
-            image::Luma([v])
-        });
-        let mut opts = img_opts(7);
-        opts.threshold = 0.8;
-        opts.sketch_jitter = 0.2;
-        opts.sketch_pressure = 3;
-        opts.order_mode = 0;
-        let r = crate::io::gray_to_polylines(&gray, &opts);
-        assert!(!r.polylines.is_empty());
-        let sc = r.h_mm / h as f64;
-        let mean_y = |pl: &wrobot_core::Polyline| -> f64 {
-            pl.pts.iter().map(|p| p.1 / sc).sum::<f64>() / pl.pts.len() as f64
-        };
-        assert!(
-            mean_y(&r.polylines[0]) < 70.0,
-            "浅色起稿线应先画，实际第一条在 y={:.1}px",
-            mean_y(&r.polylines[0])
-        );
-        let light_n = r.polylines.iter().filter(|p| mean_y(p) < 70.0).count();
-        let dark_n = r.polylines.iter().filter(|p| mean_y(p) >= 70.0).count();
-        assert!(dark_n >= 2, "暗部应有重描：{dark_n} 条");
-        assert!(dark_n > light_n, "暗部重描应多于浅色：{dark_n} vs {light_n}");
-    }
-
-    // ——— 素描调子：灰度分层排线 ———
-
-    /// 三段等宽色块（白 / 中灰 / 深灰）：排线密度必须随调子递增，白纸留白。
-    #[test]
-    fn sketch_hatch_density_follows_tone() {
-        let (w, h) = (240u32, 160u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, _| {
-            image::Luma([if x < 80 {
-                255
-            } else if x < 160 {
-                170
-            } else {
-                55
-            }])
-        });
-        let mut o = img_opts(8);
-        o.hatch_levels = 6;
-        o.hatch_angle = 35.0;
-        o.step_px = 6;
-        o.threshold = 0.5;
-        o.edge_threshold = 0.9; // 少提轮廓，避免块边界干扰内部统计
-        o.sketch_jitter = 0.0;
-        o.sketch_pen = 0.5;
-        o.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        assert!(!r.polylines.is_empty(), "调子排线应生成笔迹");
-        let (wmm, hmm) = (r.w_mm, r.h_mm);
-        let cov = |x0: f64, x1: f64| {
-            cover_in_box(
-                &r.polylines,
-                x0 * wmm,
-                0.2 * hmm,
-                x1 * wmm,
-                0.8 * hmm,
-                0.5,
-            )
-        };
-        let white = cov(0.03, 0.30);
-        let mid = cov(0.36, 0.63);
-        let dark = cov(0.70, 0.97);
-        assert!(white < 0.008, "亮部应留白，实际覆盖率 {white:.4}");
-        assert!(mid > 0.015, "中间调应有一层排线，实际 {mid:.4}");
-        assert!(
-            dark > mid * 1.25,
-            "暗部排线应明显更密：暗 {dark:.4} vs 中 {mid:.4}"
-        );
-    }
-
-    /// 暗部叠的是交叉排线：同一块暗部里应出现多个明显不同的走向。
-    #[test]
-    fn sketch_hatch_dark_area_crosses_directions() {
-        let (w, h) = (220u32, 180u32);
-        // 中间一块深色，四周留白（留白让调子归一化有纸白基准）
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let inside = (30..190).contains(&x) && (25..155).contains(&y);
-            image::Luma([if inside { 55u8 } else { 250u8 }])
-        });
-        let mut o = img_opts(8);
-        o.hatch_levels = 6;
-        o.hatch_angle = 20.0;
-        o.step_px = 6;
-        o.threshold = 0.5;
-        o.edge_threshold = 0.9;
-        o.sketch_jitter = 0.0;
-        o.sketch_pen = 0.5;
-        o.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        let (wmm, hmm) = (r.w_mm, r.h_mm);
-        let (x0, x1, y0, y1) = (0.3 * wmm, 0.7 * wmm, 0.3 * hmm, 0.7 * hmm);
-        let mut bins = [0.0f64; 6];
-        let mut total = 0.0f64;
-        for pl in &r.polylines {
-            for s in pl.pts.windows(2) {
-                let (ax, ay) = s[0];
-                let (bx, by) = s[1];
-                let mx = (ax + bx) * 0.5;
-                let my = (ay + by) * 0.5;
-                if mx < x0 || mx > x1 || my < y0 || my > y1 {
-                    continue;
-                }
-                let len = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
-                if len < 1e-6 {
-                    continue;
-                }
-                let mut th = (by - ay).atan2(bx - ax);
-                if th < 0.0 {
-                    th += std::f64::consts::PI;
-                }
-                if th >= std::f64::consts::PI {
-                    th -= std::f64::consts::PI;
-                }
-                let b = (th / (std::f64::consts::PI / 6.0)).floor() as usize;
-                bins[b.min(5)] += len;
-                total += len;
-            }
-        }
-        assert!(total > 10.0, "暗部内部没有排线：{total:.1}mm");
-        let used = bins.iter().filter(|&&v| v > total * 0.08).count();
-        assert!(
-            used >= 2,
-            "暗部应叠出两组交叉排线，实际 {used} 个（{:?}）",
-            bins.map(|v| (v / total * 100.0).round())
-        );
-    }
-
-    /// 多笔：亮部只由最浅的笔出线；暗部一定轮到最深的笔；笔迹标签按笔序单调递进。
-    #[test]
-    fn sketch_hatch_multi_pen_allocates_tone_bands() {
-        let (w, h) = (240u32, 160u32);
-        // 白 / 中灰 / 深灰 三段：浅笔管中间调，深笔管暗部，白纸留白。
-        let gray = image::GrayImage::from_fn(w, h, |x, _| {
-            image::Luma([if x < 80 {
-                255
-            } else if x < 160 {
-                150
-            } else {
-                35
-            }])
-        });
-        let mut o = img_opts(8);
-        o.multi_pen = true;
-        o.pen_count = 4;
-        o.pens = [
-            crate::sketch::HatchPen { width_mm: 0.3, darkness: 0.45 },
-            crate::sketch::HatchPen { width_mm: 0.5, darkness: 0.65 },
-            crate::sketch::HatchPen { width_mm: 0.8, darkness: 0.82 },
-            crate::sketch::HatchPen { width_mm: 1.0, darkness: 0.95 },
-        ];
-        o.hatch_levels = 8;
-        o.hatch_angle = 35.0;
-        o.step_px = 6;
-        o.threshold = 0.5;
-        o.edge_threshold = 0.9;
-        o.sketch_jitter = 0.0;
-        o.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        assert_eq!(r.pens.len(), r.polylines.len(), "每根笔迹都要有笔标签");
-        assert!(!r.polylines.is_empty(), "多笔排线应生成笔迹");
-
-        let (wmm, _hmm) = (r.w_mm, r.h_mm);
-        let pens_in_box = |x0: f64, x1: f64| {
-            let mut v = std::collections::BTreeSet::new();
-            for (pl, &pen) in r.polylines.iter().zip(r.pens.iter()) {
-                if pl.pts.iter().any(|p| p.0 >= x0 * wmm && p.0 <= x1 * wmm) {
-                    v.insert(pen);
-                }
-            }
-            v
-        };
-        let light = pens_in_box(0.03, 0.30);
-        let mid = pens_in_box(0.36, 0.63);
-        let dark = pens_in_box(0.70, 0.97);
-        assert!(light.is_empty(), "亮部应留白，实际出现笔 {light:?}");
-        assert!(mid.contains(&0), "中间调应由最浅的笔起稿：{mid:?}");
-        assert!(
-            dark.contains(&3),
-            "最暗的区域必须轮到最深那支笔：{dark:?}"
-        );
-        assert!(
-            light.union(&mid).all(|&p| p <= 2),
-            "最浅的带不应把最深笔浪费在亮部"
-        );
-        let sorted = r.pens.windows(2).all(|s| s[0] <= s[1]);
-        assert!(sorted, "笔迹应按 浅 → 深 输出：{:?}", r.pens);
-    }
-
-    /// 关掉多笔时，无论笔组里放了几支笔，输出都只属于第 0 支。
-    #[test]
-    fn sketch_hatch_single_pen_ignores_pen_set() {
-        let (w, h) = (160u32, 120u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, _| image::Luma([if x < 80 { 255 } else { 40 }]));
-        let mut o = img_opts(8);
-        o.pen_count = 4;
-        o.pens = [
-            crate::sketch::HatchPen { width_mm: 0.3, darkness: 0.45 },
-            crate::sketch::HatchPen { width_mm: 0.5, darkness: 0.65 },
-            crate::sketch::HatchPen { width_mm: 0.8, darkness: 0.82 },
-            crate::sketch::HatchPen { width_mm: 1.0, darkness: 0.95 },
-        ];
-        o.multi_pen = false;
-        o.edge_threshold = 0.9;
-        o.sketch_jitter = 0.0;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        assert!(!r.polylines.is_empty());
-        assert!(r.pens.iter().all(|&p| p == 0), "单笔模式不应出现其它笔标签");
-    }
-
-    /// 多笔最要紧的是「线来自原稿」：一张由深浅不同、彼此分离的横线组成的稿子，
-    /// 重建出的采样点大部分必须落在原稿的墨上，而不是在纸白处凭空拟合。
-    #[test]
-    fn sketch_hatch_multi_pen_traces_source_ink() {
-        let (w, h) = (360u32, 300u32);
-        // 48 条 200px 长的横线，行距 6px、线宽 2px，明暗从浅灰一路到深灰。
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            if !(20..340).contains(&x) {
-                return image::Luma([245u8]);
-            }
-            let row = y / 6;
-            let on = y % 6 < 2 && row < 48;
-            let tone = 220u8.saturating_sub((row / 4) as u8 * 10);
-            image::Luma([if on { tone } else { 245 }])
-        });
-        let mut o = img_opts(8);
-        o.multi_pen = true;
-        o.pen_count = 4;
-        o.pens = [
-            crate::sketch::HatchPen { width_mm: 0.3, darkness: 0.45 },
-            crate::sketch::HatchPen { width_mm: 0.5, darkness: 0.65 },
-            crate::sketch::HatchPen { width_mm: 0.8, darkness: 0.82 },
-            crate::sketch::HatchPen { width_mm: 1.0, darkness: 0.95 },
-        ];
-        o.threshold = 0.5;
-        o.edge_threshold = 0.9;
-        o.sketch_jitter = 0.0;
-        o.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        assert!(!r.polylines.is_empty(), "多笔应生成笔迹");
-        assert_eq!(r.pens.len(), r.polylines.len());
-
-        // on-ink：沿折线细步采样，每个采样点在原稿 3×3 邻域里找得到墨
-        // （直线被抽稀成两三个拐点，只看顶点会严重低估采样量）。
-        let scale = r.w_mm / w as f64;
-        let mut hit = 0usize;
-        let mut tot = 0usize;
-        for pl in &r.polylines {
-            for s in pl.pts.windows(2) {
-                let (ax, ay) = s[0];
-                let (bx, by) = s[1];
-                let seg = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
-                let steps = (seg / 0.35).ceil().max(1.0) as usize;
-                for k in 0..steps {
-                    let t = (k as f64 + 0.5) / steps as f64;
-                    let px = ((ax + (bx - ax) * t) / scale).round() as i32;
-                    let py = ((ay + (by - ay) * t) / scale).round() as i32;
-                    if !(1..w as i32 - 1).contains(&px) || !(1..h as i32 - 1).contains(&py) {
-                        continue;
-                    }
-                    let mut ink = false;
-                    'find: for dy in -1..=1 {
-                        for dx in -1..=1 {
-                            if gray.get_pixel((px + dx) as u32, (py + dy) as u32).0[0] < 200 {
-                                ink = true;
-                                break 'find;
-                            }
-                        }
-                    }
-                    tot += 1;
-                    hit += ink as usize;
-                }
-            }
-        }
-        assert!(tot > 200, "采样点太少：{tot}");
-        let ratio = hit as f64 / tot as f64;
-        assert!(
-            ratio > 0.75,
-            "多笔笔迹应贴在原稿墨上，实际 on-ink {:.2}（{hit}/{tot}）",
-            ratio
-        );
-
-        let mut used = [0usize; 4];
-        for &p in &r.pens {
-            used[(p as usize).min(3)] += 1;
-        }
-        assert!(
-            used.iter().filter(|&&n| n > 0).count() >= 3,
-            "深浅不同的原稿线应分给至少三支笔：{used:?}"
-        );
-        let sorted = r.pens.windows(2).all(|s| s[0] <= s[1]);
-        assert!(sorted, "笔迹应按 浅 → 深 输出：{:?}", r.pens);
-    }
-
-    /// 分区重绘：覆盖率必须跟着深度层走——亮部留白、暗部叠得最密，
-    /// 并且每个深度层绑定不同的笔，输出按 浅 → 深 排列。
-    #[test]
-    fn region_redraw_density_follows_depth_layers() {
-        let (w, h) = (240u32, 160u32);
-        // 白 / 中灰 / 近黑 三段
-        let gray = image::GrayImage::from_fn(w, h, |x, _| {
-            image::Luma([if x < 80 {
-                255
-            } else if x < 160 {
-                150
-            } else {
-                12
-            }])
-        });
-        let mut o = img_opts(9);
-        o.multi_pen = true;
-        o.pen_count = 4;
-        o.pens = [
-            crate::sketch::HatchPen { width_mm: 0.3, darkness: 0.45 },
-            crate::sketch::HatchPen { width_mm: 0.5, darkness: 0.65 },
-            crate::sketch::HatchPen { width_mm: 0.8, darkness: 0.82 },
-            crate::sketch::HatchPen { width_mm: 1.0, darkness: 0.95 },
-        ];
-        o.hatch_levels = 6;
-        o.region_block_mm = 3.0;
-        o.hatch_angle = 35.0;
-        o.threshold = 0.5;
-        o.edge_threshold = 0.9;
-        o.sketch_jitter = 0.0;
-        o.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        assert_eq!(r.pens.len(), r.polylines.len());
-        assert!(!r.polylines.is_empty(), "分区重绘应生成笔迹");
-        let (wmm, hmm) = (r.w_mm, r.h_mm);
-        let cov = |x0: f64, x1: f64| {
-            cover_in_box(
-                &r.polylines,
-                x0 * wmm,
-                0.2 * hmm,
-                x1 * wmm,
-                0.8 * hmm,
-                0.5,
-            )
-        };
-        let white = cov(0.03, 0.30);
-        let mid = cov(0.36, 0.63);
-        let dark = cov(0.70, 0.97);
-        assert!(white < 0.01, "亮部应留白，实际覆盖率 {white:.4}");
-        assert!(mid > 0.05, "中间调应有排线，实际 {mid:.4}");
-        assert!(
-            dark > mid * 1.15,
-            "暗部多层叠加应明显更密：暗 {dark:.4} vs 中 {mid:.4}"
-        );
-
-        let pens_in_box = |x0: f64, x1: f64| {
-            let mut v = std::collections::BTreeSet::new();
-            for (pl, &pen) in r.polylines.iter().zip(r.pens.iter()) {
-                if pl.pts.iter().any(|p| p.0 >= x0 * wmm && p.0 <= x1 * wmm) {
-                    v.insert(pen);
-                }
-            }
-            v
-        };
-        assert!(pens_in_box(0.03, 0.30).is_empty(), "亮部不应落笔");
-        let mid_pens = pens_in_box(0.36, 0.63);
-        let dark_pens = pens_in_box(0.70, 0.97);
-        assert!(mid_pens.contains(&0), "中间调应由最浅的笔起稿：{mid_pens:?}");
-        assert!(
-            dark_pens.contains(&3),
-            "最暗处必须轮到最深那支笔：{dark_pens:?}"
-        );
-        let sorted = r.pens.windows(2).all(|s| s[0] <= s[1]);
-        assert!(sorted, "分区重绘应按 浅 → 深 逐层输出：{:?}", r.pens);
-    }
-
-    /// 分区重绘按原稿走向排线：一片 135°（x+y 恒定）斜纹，笔迹也应主要沿
-    /// 同一走向，而不是不管原稿一律按扫描方向横排。
-    #[test]
-    fn region_redraw_follows_source_stroke_direction() {
-        let (w, h) = (200u32, 200u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let on = (x + y) % 8 < 3;
-            image::Luma([if on { 55u8 } else { 250u8 }])
-        });
-        let mut o = img_opts(9);
-        o.hatch_levels = 5;
-        o.region_block_mm = 2.0;
-        o.hatch_angle = 0.0;
-        o.threshold = 0.5;
-        o.edge_threshold = 0.9;
-        o.sketch_jitter = 0.0;
-        o.order_mode = 2;
-        let r = crate::io::gray_to_polylines(&gray, &o);
-        assert!(!r.polylines.is_empty());
-        let (wmm, hmm) = (r.w_mm, r.h_mm);
-        let (x0, x1, y0, y1) = (0.2 * wmm, 0.8 * wmm, 0.2 * hmm, 0.8 * hmm);
-        let mut along = 0.0f64;
-        let mut total = 0.0f64;
-        for pl in &r.polylines {
-            for s in pl.pts.windows(2) {
-                let (ax, ay) = s[0];
-                let (bx, by) = s[1];
-                let mx = (ax + bx) * 0.5;
-                let my = (ay + by) * 0.5;
-                if mx < x0 || mx > x1 || my < y0 || my > y1 {
-                    continue;
-                }
-                let len = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
-                if len < 1e-6 {
-                    continue;
-                }
-                let mut th = (by - ay).atan2(bx - ax).to_degrees();
-                if th < 0.0 {
-                    th += 180.0;
-                }
-                total += len;
-                if (th - 135.0).abs() <= 25.0 {
-                    along += len;
-                }
-            }
-        }
-        assert!(total > 20.0, "内部没有排线：{total:.1}mm");
-        let frac = along / total;
-        assert!(
-            frac > 0.45,
-            "排线应主要顺着原稿斜纹（135°），实际只有 {:.0}% 沿纹（共 {total:.0}mm）",
-            frac * 100.0
-        );
     }
 
     /// 素描笔触：密度必须由调子决定——亮部留白、中间调稀、暗部密，
@@ -2683,95 +1908,98 @@ mod tests {
         );
     }
 
-    /// 素描笔触除结构线外应是 1~5mm 的短直线：不能退化成两种坏形状——
-    /// 一根贯穿画面的长排线，或者抖动过度的小曲线。
+    /// 一块平滑的软调子圆斑 + 纸白底：原稿里没有细纹理、没有脊，细节层
+    /// 提取不到任何笔迹，于是图上只剩排线。用来单独检查排线本身的几何。
+    fn soft_blob(w: u32, h: u32) -> image::GrayImage {
+        image::GrayImage::from_fn(w, h, |x, y| {
+            let dx = x as f64 - w as f64 * 0.5;
+            let dy = y as f64 - h as f64 * 0.5;
+            let d = (dx * dx + dy * dy).sqrt();
+            let r = w.min(h) as f64 * 0.5;
+            let t = (1.0 - d / r).clamp(0.0, 1.0);
+            let t = t * t * (3.0 - 2.0 * t);
+            image::Luma([(250.0 - 180.0 * t) as u8])
+        })
+    }
+
+    /// 排线是「一族平行长线」：交叉排线的笔迹组织形式——每一行是一整根
+    /// 直线，放大不会碎成短杠。这里检查（1）超过八成笔迹是两点直线，
+    /// （2）长度中位足够长，（3）方向只落在基准角与基准角+90°两族上。
     #[test]
-    fn stroke_sketch_uses_short_straight_segments() {
+    fn stroke_sketch_hatch_is_long_straight_and_aligned() {
         let (w, h) = (200u32, 160u32);
-        // 大片纸白上放一块中灰：让「纸白」按面积胜出，中灰才有调子。
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let on = (60..180).contains(&x) && (20..140).contains(&y);
-            image::Luma([if on { 120u8 } else { 252u8 }])
-        });
+        let gray = soft_blob(w, h);
         let mut o = img_opts(10);
-        o.stroke_len_mm = 3.0;
-        o.stroke_follow = 2;
         o.hatch_levels = 4;
         o.threshold = 0.5;
-        o.sketch_jitter = 0.15;
-        o.sketch_pen = 0.5;
-        o.order_mode = 1;
+        o.sketch_jitter = 0.0;
+        o.sketch_pen = 0.3;
+        o.hatch_angle = 35.0;
+        o.order_mode = 2;
         let r = crate::io::gray_to_polylines(&gray, &o);
-        assert!(!r.polylines.is_empty());
-        let (mut short, mut straight, mut total) = (0usize, 0usize, 0usize);
+        assert!(!r.polylines.is_empty(), "均匀中灰应有排线");
+        let (mut straight, mut total, mut on_axis, mut lens) = (0usize, 0usize, 0usize, Vec::new());
         for pl in &r.polylines {
-            if pl.pts.len() < 2 || pl.pts[0].0 < 0.4 * r.w_mm {
+            if pl.pts.len() < 2 {
                 continue;
             }
             total += 1;
+            let (a, b) = (pl.pts[0], *pl.pts.last().unwrap());
             let mut len = 0.0;
             for s in pl.pts.windows(2) {
                 len += ((s[1].0 - s[0].0).powi(2) + (s[1].1 - s[0].1).powi(2)).sqrt();
             }
-            if (1.2..=6.5).contains(&len) {
-                short += 1;
-            }
-            // 到首尾弦的最大垂距：短直线的偏离应远小于自身长度。
-            let (a, b) = (pl.pts[0], *pl.pts.last().unwrap());
-            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-            let chord = (dx * dx + dy * dy).sqrt().max(1e-6);
-            let mut dev = 0.0f64;
-            for &p in &pl.pts {
-                let d = ((p.0 - a.0) * dy - (p.1 - a.1) * dx).abs() / chord;
-                dev = dev.max(d);
-            }
-            if dev <= 0.12 * len + 0.25 {
+            lens.push(len);
+            if pl.pts.len() == 2 {
                 straight += 1;
             }
+            let mut th = (b.1 - a.1).atan2(b.0 - a.0).to_degrees();
+            if th < 0.0 {
+                th += 180.0;
+            }
+            if th.is_finite()
+                && ((th - 35.0).abs() <= 3.0 || (th - 125.0).abs() <= 3.0)
+            {
+                on_axis += 1;
+            }
         }
-        assert!(total >= 20, "中灰区应有足够笔触，实际 {total}");
+        lens.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let median = lens[lens.len() / 2];
         assert!(
-            short * 100 >= total * 70,
-            "至少 70% 笔触应是 1.2~6.5mm 短段，实际 {}/{total}",
-            short
+            straight * 100 >= total * 80,
+            "排线应是两点直线：{}/{}",
+            straight,
+            total
         );
+        assert!(median > 6.0, "排线长度中位应够长，实际 {median:.1}mm");
         assert!(
-            straight * 100 >= total * 75,
-            "至少 75% 笔触应是短直线，实际 {}/{total}",
-            straight
+            on_axis * 100 >= total * 95,
+            "方向应只用基准角与垂直两族：{}/{}",
+            on_axis,
+            total
         );
     }
 
-    /// 「跟随轮廓」用等照度线切向：一片 135° 斜纹里，笔触应顺着斜纹走。
+    /// 排线方向来自基准角，不跟原稿的斜纹走——和交叉排线一样，全图只用
+    /// 一族平行线加密加深。这里给一张平滑软斑（原稿本身没有斜纹），检查
+    /// 笔迹仍只落在 35°/125°。
     #[test]
-    fn stroke_sketch_follows_contour_direction() {
+    fn stroke_sketch_hatch_uses_two_global_angles() {
         let (w, h) = (200u32, 200u32);
-        let gray = image::GrayImage::from_fn(w, h, |x, y| {
-            let on = (x + y) % 8 < 3;
-            image::Luma([if on { 55u8 } else { 250u8 }])
-        });
+        let gray = soft_blob(w, h);
         let mut o = img_opts(10);
-        o.stroke_len_mm = 3.0;
-        o.stroke_follow = 0;
         o.hatch_levels = 3;
         o.threshold = 0.5;
-        o.edge_threshold = 0.9;
         o.sketch_jitter = 0.0;
+        o.hatch_angle = 35.0;
         o.order_mode = 2;
         let r = crate::io::gray_to_polylines(&gray, &o);
         assert!(!r.polylines.is_empty());
-        let (wmm, hmm) = (r.w_mm, r.h_mm);
-        let (x0, x1, y0, y1) = (0.2 * wmm, 0.8 * wmm, 0.2 * hmm, 0.8 * hmm);
-        let mut along = 0.0f64;
-        let mut total = 0.0f64;
+        let (mut along, mut total) = (0.0f64, 0.0f64);
         for pl in &r.polylines {
             for s in pl.pts.windows(2) {
                 let (ax, ay) = s[0];
                 let (bx, by) = s[1];
-                let (mx, my) = ((ax + bx) * 0.5, (ay + by) * 0.5);
-                if mx < x0 || mx > x1 || my < y0 || my > y1 {
-                    continue;
-                }
                 let len = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
                 if len < 1e-6 {
                     continue;
@@ -2781,17 +2009,73 @@ mod tests {
                     th += 180.0;
                 }
                 total += len;
-                if (th - 135.0).abs() <= 25.0 {
+                if (th - 35.0).abs() <= 4.0 || (th - 125.0).abs() <= 4.0 {
                     along += len;
                 }
             }
         }
-        assert!(total > 20.0, "内部没有笔触：{total:.1}mm");
+        assert!(total > 20.0, "内部没有笔迹：{total:.1}mm");
         let frac = along / total;
         assert!(
-            frac > 0.5,
-            "笔触应顺着原稿斜纹（135°），实际只有 {:.0}%（共 {total:.0}mm）",
+            frac > 0.95,
+            "笔迹应全部落在基准角两族（35°/125°），实际 {:.0}%（共 {total:.0}mm）",
             frac * 100.0
+        );
+    }
+
+    /// 「交叉明暗调子」：浅调仍走基准方向，暗部按遍数叠出明显分开的
+    /// 几族角（35°/125°/80°…），画面不再是一边倒的单向排线。
+    #[test]
+    fn stroke_tone_follow_adds_cross_directions() {
+        let (w, h) = (200u32, 160u32);
+        let gray = soft_blob(w, h);
+        let mut o = img_opts(10);
+        o.sketch_style = 1;
+        o.stroke_follow = 3;
+        o.hatch_levels = 4;
+        o.threshold = 0.5;
+        o.sketch_jitter = 0.0;
+        o.stroke_len_mm = 3.0;
+        o.hatch_angle = 35.0;
+        o.order_mode = 2;
+        let r = crate::io::gray_to_polylines(&gray, &o);
+        assert!(!r.polylines.is_empty(), "交叉明暗调子应生成笔迹");
+        // 6 个 30° 的方向桶，按线长统计
+        let mut bins = [0.0f64; 6];
+        let mut total = 0.0;
+        for pl in &r.polylines {
+            for s in pl.pts.windows(2) {
+                let len = ((s[1].0 - s[0].0).powi(2) + (s[1].1 - s[0].1).powi(2)).sqrt();
+                if len < 1e-6 {
+                    continue;
+                }
+                let th = (s[1].1 - s[0].1)
+                    .atan2(s[1].0 - s[0].0)
+                    .to_degrees()
+                    .rem_euclid(180.0);
+                bins[(th / 30.0) as usize % 6] += len;
+                total += len;
+            }
+        }
+        assert!(total > 20.0, "内部没有笔迹：{total:.1}mm");
+        let strong: Vec<usize> = (0..6).filter(|&i| bins[i] > total * 0.12).collect();
+        assert!(
+            strong.len() >= 2,
+            "应出现多族方向（每族 >12%），实际 {:?}（{:?}）",
+            strong,
+            bins
+        );
+        let mut spread = 0usize;
+        for i in 0..strong.len() {
+            for j in i + 1..strong.len() {
+                let d = strong[j] - strong[i];
+                spread = spread.max(d.min(6 - d));
+            }
+        }
+        assert!(
+            spread >= 2,
+            "方向族应明显分开（≥60°）而不只是同族抖动：{:?}",
+            strong
         );
     }
 
@@ -2818,7 +2102,7 @@ mod tests {
             crate::sketch::HatchPen { width_mm: 1.0, darkness: 0.95 },
         ];
         o.stroke_len_mm = 3.0;
-        o.hatch_levels = 5;
+        o.hatch_levels = 8;
         o.threshold = 0.5;
         o.sketch_jitter = 0.0;
         o.order_mode = 2;
@@ -2894,6 +2178,93 @@ mod tests {
                 j.gcode
             );
         }
+    }
+
+    /// 等后台算完方案（最多 2 分钟），返回结果。
+    fn wait_run_plan(app: &mut AppState) -> crate::state::RunPlan {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            app.poll_run_plan();
+            if let Some(p) = app.run_plan.clone() {
+                return p;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "后台计算方案超时"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// 「开始绘制」先出方案：代码量、路径与预估耗时都在后台算；
+    /// 改选排序方式会重算且只改空移，墨线长度必须守恒。
+    #[test]
+    fn run_plan_defers_gcode_and_shrinks_travel() {
+        let Some(mut app) = make_app() else { return };
+        // 按列生成笔迹：原序里每画完一列都要跨回下一列顶部
+        let mut paths = Vec::new();
+        for col in 0..8 {
+            for row in 0..5 {
+                let (x, y) = (col as f64 * 24.0, row as f64 * 40.0);
+                paths.push(wrobot_core::Polyline::new(vec![(x, y), (x + 12.0, y)]));
+            }
+        }
+        let n = paths.len();
+        app.preview = paths;
+        app.preview_pens = vec![crate::state::NON_PEN; n];
+        app.refresh_stats();
+
+        app.path_order_sel = 0; // 保持原序
+        app.start_run_plan();
+        assert!(app.show_run_plan, "点开始绘制应先打开计算窗口");
+        let keep = wait_run_plan(&mut app);
+        assert_eq!(keep.strokes, n, "每根笔迹都应落笔");
+        assert_eq!(keep.paths.len(), n, "方案要带回排好序的笔迹");
+        assert!(keep.lines > 0 && keep.bytes == keep.gcode.len());
+        assert!(keep.gcode.contains("G1"), "方案里应已有可执行的 G-code");
+        assert!(keep.seconds > 0.0, "应给出预估耗时");
+        assert!(keep.ink_mm > 0.0 && keep.travel_mm > keep.ink_mm);
+
+        app.recompute_run_plan(1); // 蛇形
+        let serp = wait_run_plan(&mut app);
+        assert_eq!(app.run_plan_order, 1, "窗口里改选的方式要同步到状态");
+        assert!((serp.ink_mm - keep.ink_mm).abs() < 1e-6, "排序不能改变墨线长度");
+        assert!(
+            serp.travel_mm < keep.travel_mm * 0.7,
+            "蛇形应显著减少空移：{:.0}mm vs {:.0}mm",
+            serp.travel_mm,
+            keep.travel_mm
+        );
+        assert!(serp.seconds < keep.seconds, "空移少了，预计耗时也应下降");
+        assert_ne!(serp.sig, keep.sig, "排序方式变化要体现在方案指纹上");
+
+        app.close_run_plan();
+        assert!(!app.show_run_plan && app.run_plan.is_none() && !app.run_plan_busy);
+    }
+
+    /// 多笔内容的方案：一次算完按笔拆好的任务，确认后无需再生成 G-code。
+    #[test]
+    fn run_plan_splits_multi_pen_queue() {
+        let Some(mut app) = make_app() else { return };
+        app.tab = 0;
+        app.texts[0].text = "永".into();
+        push_tagged_image(&mut app);
+        app.rebuild_preview();
+        app.start_run_plan();
+        let plan = wait_run_plan(&mut app);
+        assert_eq!(plan.pen_jobs.len(), 3, "应有三支笔的任务");
+        assert_eq!(
+            plan.pen_jobs.iter().map(|j| j.pen).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "任务按笔序（浅 → 深）排列"
+        );
+        assert!(plan.strokes >= 3 && plan.lines > 0);
+        assert_eq!(plan.bytes, plan.gcode.len());
+        assert!(plan.gcode.contains("多笔绘制"), "合并版应带分笔说明");
+        assert!(plan.pen_jobs.iter().all(|j| j.gcode.contains("G92 X0 Y0")));
+        assert_eq!(plan.tile_page, None);
+        app.close_run_plan();
+        assert!(app.run_plan.is_none());
     }
 
     /// 套准偏移只作用于对应那支笔，并且预览标签与实际输出一一对应。
@@ -3012,11 +2383,11 @@ mod tests {
         crate::io::export_gcode(&mut app, &main).unwrap();
         assert!(main.exists(), "应写出合并版");
         assert!(
-            dir.join("job-pen1-HB_0_20.nc").exists(),
+            dir.join("job-pen1-HB_0_28.nc").exists(),
             "应写出第 1 支笔的分笔文件"
         );
         assert!(
-            dir.join("job-pen2-4B_0_32.nc").exists(),
+            dir.join("job-pen2-4B_0_46.nc").exists(),
             "应写出第 2 支笔的分笔文件"
         );
         assert!(app.status.contains("分笔"), "状态栏应提示已导出分笔文件");
@@ -3101,6 +2472,8 @@ mod tests {
             region_block_mm: 2.5,
             stroke_len_mm: 3.2,
             stroke_follow: 2,
+            sketch_style: 1,
+            max_side_px: 3600,
             multi_pen: false,
             background: false,
             out: true,
@@ -3365,7 +2738,96 @@ mod tests {
         }
     }
 
-    /// 视觉验收工具（默认 ignore）：把一张铅笔稿按「素描原稿」模式重画，
+    /// 程序默认导入参数必须和无头验收工具取到同一套值——这是「测试图与
+    /// 程序出图一致」的硬约束，任何一侧改默认值都要两边一起过这里。
+    #[test]
+    fn default_import_opts_are_style1_and_match_pens() {
+        let d = crate::state::default_import_opts(10);
+        assert_eq!(d.sketch_style, 1, "新工程默认随形短笔触");
+        assert!((d.target_h_mm - 240.0).abs() < 1e-9, "默认成品高应取适纸面尺寸");
+        assert_eq!(d.max_side_px, 3600);
+        assert_eq!(d.pen_count, 4);
+        let want = crate::state::default_pens();
+        for (h, p) in d.pens.iter().zip(want.iter()) {
+            assert!((h.width_mm - p.width_mm).abs() < 1e-9);
+            assert!((h.darkness - p.darkness as f32).abs() < 1e-6);
+        }
+    }
+
+    /// 切换笔触风格：笔组还是旧风格的默认值才跟着换，手调过就保留。
+    #[test]
+    fn style_switch_swaps_only_untouched_pens() {
+        let mut app = AppState::new(FontManager::default(), String::new());
+        assert_eq!(app.img_sketch_style, 1);
+        assert_eq!(app.pens, crate::state::default_pens());
+        app.set_sketch_style(0);
+        assert_eq!(app.pens, crate::state::crosshatch_pens());
+        app.pens[0].width_mm = 0.23;
+        app.set_sketch_style(1);
+        assert!(
+            (app.pens[0].width_mm - 0.23).abs() < 1e-9,
+            "手调过的笔组不能被风格切换冲掉"
+        );
+    }
+
+    /// 导入时的尺寸 / 精细度是两件事：目标高度决定成品毫米尺寸，
+    /// 精细度只决定算法的工作像素；缩像素不能把成品也缩掉。
+    #[test]
+    fn import_size_is_independent_of_fineness() {
+        let src = image::GrayImage::from_fn(400, 600, |x, y| {
+            image::Luma([((x * 3 + y * 5) % 256) as u8])
+        });
+        let mut opts = crate::state::default_import_opts(10);
+        opts.target_h_mm = 240.0;
+        opts.max_side_px = 0;
+        let full = crate::io::gray_to_polylines(&src, &opts);
+        assert!(!full.polylines.is_empty());
+        assert!((full.h_mm - 240.0).abs() < 0.5);
+        assert!((full.w_mm - 160.0).abs() < 0.5);
+        opts.max_side_px = 200;
+        let small = crate::io::gray_to_polylines(&src, &opts);
+        assert!((small.h_mm - 240.0).abs() < 0.5);
+        assert!((small.w_mm - 160.0).abs() < 0.5, "精细度不应改变成品尺寸");
+        assert!(!small.polylines.is_empty());
+    }
+
+    /// 程序导入（import_image_file）与无头验收工具（image_to_polylines）
+    /// 必须产出完全相同的笔迹数——同参数对不上的问题就靠这条守住。
+    #[test]
+    fn import_path_matches_headless_tool() {
+        let img = image::GrayImage::from_fn(96, 128, |x, y| {
+            image::Luma([((x * 7 + y * 3) % 256) as u8])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("wrobot-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("in.png");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut app = AppState::new(FontManager::default(), String::new());
+        app.img_draw_type = 10;
+        let d = app.default_import_opts(10);
+        let n = app
+            .import_image_file(&path, false, d.target_h_mm, d.max_side_px)
+            .unwrap();
+        let direct =
+            crate::io::image_to_polylines(&std::fs::read(&path).unwrap(), &app.default_import_opts(10))
+                .unwrap();
+        assert_eq!(n, direct.polylines.len(), "程序导入与无头工具笔迹数不一致");
+        let im = app.images.last().unwrap();
+        assert_eq!(im.sketch_style, 1);
+        assert_eq!(im.max_side_px, d.max_side_px);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 视觉验收工具（默认 ignore）：把一张铅笔稿按「素描笔触」模式重画，
     /// 输出「原稿 | 重建」并排对照图，用于人工判断拟真度。
     #[test]
     #[ignore]
@@ -3392,22 +2854,22 @@ mod tests {
         };
         let mut gray = image::load_from_memory(&src).unwrap().to_luma8();
         // 和 `image_to_polylines` 一样先做色阶归一化（纸不是纯白时这是前提）
-        crate::io::stretch_levels(&mut gray);
+        if std::env::var("SKETCH_NOSTRETCH").is_err() {
+            crate::io::stretch_levels(&mut gray);
+        }
         let (w, h) = gray.dimensions();
-        // SKETCH_DRAW=1 素描（影线）/ 5 交叉排线 / 7 素描原稿：同一张图横向对比
+        // SKETCH_DRAW=1 素描（影线）/ 5 交叉排线 / 10 素描笔触：同一张图横向对比
         let draw_type: usize = std::env::var("SKETCH_DRAW")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(7);
-        let mut opts = img_opts(draw_type);
-        opts.target_h_mm = std::env::var("SKETCH_H")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(120.0);
-        opts.threshold = 0.72;
-        opts.order_mode = 0;
-        opts.sketch_pressure = 3;
-        opts.sketch_jitter = 0.12;
+            .unwrap_or(10);
+        // 直接取程序的「默认导入参数」：阈值、层数、笔组、顺序、手抖等
+        // 都和界面导入完全一致，避免测试图与程序出图对不上。需要调参时
+        // 仍可用下面的 SKETCH_* 环境变量逐项覆盖。
+        let mut opts = crate::state::default_import_opts(draw_type);
+        if let Ok(v) = std::env::var("SKETCH_H") {
+            opts.target_h_mm = v.parse().unwrap_or(opts.target_h_mm);
+        }
         if let Ok(v) = std::env::var("SKETCH_THR") {
             opts.threshold = v.parse().unwrap_or(opts.threshold);
         }
@@ -3435,17 +2897,53 @@ mod tests {
         if let Ok(v) = std::env::var("SKETCH_FOLLOW") {
             opts.stroke_follow = v.parse().unwrap_or(opts.stroke_follow);
         }
+        if let Ok(v) = std::env::var("SKETCH_STYLE") {
+            opts.sketch_style = v.parse().unwrap_or(opts.sketch_style);
+        }
+        if let Ok(v) = std::env::var("SKETCH_MAX") {
+            opts.max_side_px = v.parse().unwrap_or(opts.max_side_px);
+        }
         // SKETCH_MULTI=1：按默认铅笔笔组走多笔分层，右半边按每支笔的
         // 真实线宽与深浅着色，用来核对「浅笔铺中间调、深笔压暗部」。
         let multi = std::env::var("SKETCH_MULTI").is_ok();
-        let pens = crate::state::default_pens();
+        let mut pens = crate::state::default_pens_for_style(opts.sketch_style);
+        // 笔组跟默认风格走：交叉排线用细笔组，随形短笔触用 0.20 的宽笔组。
+        opts.pen_count = pens.len().min(4) as u8;
+        for (i, p) in pens.iter().take(4).enumerate() {
+            opts.pens[i] = p.to_hatch();
+        }
         if multi {
             opts.multi_pen = true;
-            opts.pen_count = pens.len() as u8;
-            for (i, p) in pens.iter().take(4).enumerate() {
-                opts.pens[i] = p.to_hatch();
+        }
+        // SKETCH_PENS="0.28:0.45,0.38:0.65,..."：按「线宽:满覆盖深度」覆盖笔组，
+        // 用来在无头环境复现界面上自定义笔组的组合。
+        if let Ok(v) = std::env::var("SKETCH_PENS") {
+            let mut n = 0usize;
+            for part in v.split(',').take(4) {
+                let mut it = part.split(':');
+                let w = it.next().and_then(|s| s.trim().parse::<f64>().ok());
+                let d = it.next().and_then(|s| s.trim().parse::<f32>().ok());
+                if let (Some(w), Some(d)) = (w, d) {
+                    opts.pens[n] = crate::sketch::HatchPen {
+                        width_mm: w,
+                        darkness: d,
+                    };
+                    // 预览与日志也用同一组数，否则图上画的是默认笔宽、
+                    // 日志里印的却是默认笔名，排查时对不上。
+                    if let Some(p) = pens.get_mut(n) {
+                        p.name = format!("{w:.2}mm");
+                        p.width_mm = w;
+                        p.darkness = d as f64;
+                    }
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                opts.pen_count = n as u8;
+                opts.multi_pen = true;
             }
         }
+        let pens = pens;
         let t0 = std::time::Instant::now();
         let r = crate::io::gray_to_polylines(&gray, &opts);
         eprintln!(
@@ -4135,6 +3633,216 @@ mod tests {
             ratio(band[2]),
             cov_r
         );
+        // —— 物理墨量：覆盖并集 ——
+        //
+        // 上面的明暗比是「线长 × 线宽 × 笔深」的加法统计：同一处叠三笔算三倍墨，
+        // 可投影笔在纸上不会越叠越黑，那里只有一层。真实输出整片黑，正是被这个
+        // 指标骗的。这里按每支笔的真实线宽把笔迹刷进栅格，每个像素只取压在上面
+        // 最深的那支笔（覆盖并集），再换算成与原稿同一尺度的纸面暗度
+        // （纸白 = 0，最黑 = 1），逐格对比。这样「画黑了没有」才量得出来。
+        let phys_stats = {
+            let mut hist = [0u32; 256];
+            for p in gray.pixels() {
+                hist[p.0[0] as usize] = hist[p.0[0] as usize].saturating_add(1);
+            }
+            let total = (w * h) as u64;
+            // 最亮 1% 的分位点当作纸白（从亮端往下累计 1%）。
+            let top = (total as f64 * 0.01).max(1.0) as u64;
+            let mut acc = 0u64;
+            let mut paper = 255u8;
+            for v in (0..256usize).rev() {
+                acc += hist[v] as u64;
+                if acc >= top {
+                    paper = v as u8;
+                    break;
+                }
+            }
+            // 纸白按本图自己的纸取，扫描偏灰也不会把整页算成「墨」。
+            let paper = (paper as f32).max(64.0);
+            let h_mm = opts.target_h_mm;
+            let w_mm = h_mm * w as f64 / h as f64;
+            // 8px/mm 能分辨 0.2mm 的笔；大图降采样，保住内存。
+            let mut ppm = 8.0f64;
+            if w_mm * h_mm * ppm * ppm > 3_600_000.0 {
+                ppm = (3_600_000.0 / (w_mm * h_mm)).sqrt().max(2.0);
+            }
+            let pw = ((w_mm * ppm).ceil() as usize).max(1);
+            let ph = ((h_mm * ppm).ceil() as usize).max(1);
+            let mut dark = vec![0f32; pw * ph];
+            for (k, pl) in r.polylines.iter().enumerate() {
+                let (pen_w, pen_d) = if multi {
+                    let tag = (r.pens.get(k).copied().unwrap_or(0) as usize).min(pens.len() - 1);
+                    (pens[tag].width_mm, pens[tag].darkness as f64)
+                } else {
+                    // 单笔预览统一按 40 灰度画，对应 0.84 的墨深。
+                    (single_pen, 0.84)
+                };
+                let rad = (pen_w * 0.5 * ppm).max(0.55);
+                for seg in pl.pts.windows(2) {
+                    let (ax, ay) = (seg[0].0 * ppm, seg[0].1 * ppm);
+                    let (bx, by) = (seg[1].0 * ppm, seg[1].1 * ppm);
+                    let x0 = (ax.min(bx) - rad - 1.0).floor().max(0.0) as usize;
+                    let y0 = (ay.min(by) - rad - 1.0).floor().max(0.0) as usize;
+                    let x1 = ((ax.max(bx) + rad + 1.0).ceil() as isize)
+                        .min(pw as isize - 1)
+                        .max(0) as usize;
+                    let y1 = ((ay.max(by) + rad + 1.0).ceil() as isize)
+                        .min(ph as isize - 1)
+                        .max(0) as usize;
+                    let (dx, dy) = (bx - ax, by - ay);
+                    let len2 = dx * dx + dy * dy;
+                    for yy in y0..=y1 {
+                        for xx in x0..=x1 {
+                            let (qx, qy) = (xx as f64 + 0.5, yy as f64 + 0.5);
+                            let t = if len2 > 1e-9 {
+                                (((qx - ax) * dx + (qy - ay) * dy) / len2).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            let px0 = ax + dx * t;
+                            let py0 = ay + dy * t;
+                            let d = ((qx - px0).powi(2) + (qy - py0).powi(2)).sqrt();
+                            if d <= rad {
+                                let i = yy * pw + xx;
+                                let v = pen_d as f32;
+                                if v > dark[i] {
+                                    dark[i] = v;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(path) = std::env::var("SKETCH_DUMP_PHYS") {
+                let mut img = image::GrayImage::new(pw as u32, ph as u32);
+                for y in 0..ph {
+                    for x in 0..pw {
+                        let v = (255.0 - dark[y * pw + x] * 255.0).clamp(0.0, 255.0) as u8;
+                        img.put_pixel(x as u32, y as u32, image::Luma([v]));
+                    }
+                }
+                let _ = img.save(&path);
+            }
+            // 原稿同尺度暗度（相对本图纸白）。
+            let mut srcp = vec![0f32; pw * ph];
+            for yy in 0..ph {
+                let sy = (((yy as f64 + 0.5) / ph as f64) * h as f64) as u32;
+                let sy = sy.min(h - 1);
+                for xx in 0..pw {
+                    let sx = (((xx as f64 + 0.5) / pw as f64) * w as f64) as u32;
+                    let sx = sx.min(w - 1);
+                    let v = gray.get_pixel(sx, sy).0[0] as f32;
+                    srcp[yy * pw + xx] = ((paper - v) / paper).clamp(0.0, 1.0);
+                }
+            }
+            let ncell = tone.cw * tone.ch;
+            let mut s_cell = vec![0f32; ncell];
+            let mut o_cell = vec![0f32; ncell];
+            let mut cnt = vec![0u32; ncell];
+            for yy in 0..ph {
+                let ym = (yy as f64 + 0.5) / ppm;
+                let cy = ((ym / tone.cell_mm) as usize).min(tone.ch - 1);
+                for xx in 0..pw {
+                    let xm = (xx as f64 + 0.5) / ppm;
+                    let cx = ((xm / tone.cell_mm) as usize).min(tone.cw - 1);
+                    let i = cy * tone.cw + cx;
+                    let k = yy * pw + xx;
+                    s_cell[i] += srcp[k];
+                    o_cell[i] += dark[k];
+                    cnt[i] += 1;
+                }
+            }
+            for i in 0..ncell {
+                if cnt[i] > 0 {
+                    let c = cnt[i] as f32;
+                    s_cell[i] /= c;
+                    o_cell[i] /= c;
+                }
+            }
+            let mut band = [(0.0f64, 0.0f64, 0u32); 3];
+            let (mut m_s, mut m_o, mut n2) = (0.0f64, 0.0f64, 0.0f64);
+            let (mut vx, mut vy, mut vxx, mut vyy, mut vxy) =
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for i in 0..ncell {
+                let s = s_cell[i] as f64;
+                let o = o_cell[i] as f64;
+                m_s += s;
+                m_o += o;
+                n2 += 1.0;
+                vx += s;
+                vy += o;
+                vxx += s * s;
+                vyy += o * o;
+                vxy += s * o;
+                let k = if s < 0.12 {
+                    0
+                } else if s < 0.40 {
+                    1
+                } else {
+                    2
+                };
+                band[k].0 += s;
+                band[k].1 += o;
+                band[k].2 += 1;
+            }
+            let pr = {
+                let num = vxy - vx * vy / n2.max(1.0);
+                let den = ((vxx - vx * vx / n2.max(1.0)) * (vyy - vy * vy / n2.max(1.0))).sqrt();
+                if den > 1e-9 {
+                    num / den
+                } else {
+                    0.0
+                }
+            };
+            let mut sat = 0usize;
+            let mut covered = 0usize;
+            let mut extra = 0usize;
+            let mut extra_base = 0usize;
+            for k in 0..pw * ph {
+                let d = dark[k];
+                if d >= 0.60 {
+                    sat += 1;
+                }
+                if d > 0.04 {
+                    covered += 1;
+                    extra_base += 1;
+                    if srcp[k] < 0.03 {
+                        extra += 1;
+                    }
+                }
+            }
+            if std::env::var("SKETCH_DEBUG").is_ok() {
+                let raw: f64 = srcp.iter().map(|&v| v as f64).sum::<f64>() / (pw * ph) as f64;
+                let rawd: f64 = dark.iter().map(|&v| v as f64).sum::<f64>() / (pw * ph) as f64;
+                eprintln!(
+                    "  [phys] 纸白 {paper:.0} 栅格 {pw}×{ph} 原像素均值 {raw:.3} 出像素均值 {rawd:.3} 有效格 {}",
+                    cnt.iter().filter(|&&c| c > 0).count()
+                );
+            }
+            let np = (pw * ph) as f64;
+            let pct = |a: usize| a as f64 * 100.0 / np.max(1.0);
+            // 每档只报「原稿 → 输出」的绝对暗度；比比值更能看出是不是压黑了。
+            format!(
+                "；物理墨量 原/出 {:.2}/{:.2} 覆盖 {:.0}% 饱和60 {:.0}% 多余 {:.0}%；\
+                 亮 {:.2}→{:.2} 中 {:.2}→{:.2} 暗 {:.2}→{:.2} r {:.2}",
+                m_s / n2.max(1.0),
+                m_o / n2.max(1.0),
+                pct(covered),
+                pct(sat),
+                if extra_base > 0 {
+                    extra as f64 * 100.0 / extra_base as f64
+                } else {
+                    0.0
+                },
+                band[0].0 / band[0].2.max(1) as f64,
+                band[0].1 / band[0].2.max(1) as f64,
+                band[1].0 / band[1].2.max(1) as f64,
+                band[1].1 / band[1].2.max(1) as f64,
+                band[2].0 / band[2].2.max(1) as f64,
+                band[2].1 / band[2].2.max(1) as f64,
+                pr
+            )
+        };
         // SKETCH_MODE=tone：三行「原稿调子 / 输出墨量 / 差值」，肉眼核对明暗结构。
         if std::env::var("SKETCH_MODE").ok().as_deref() == Some("tone") {
             let s: u32 = 16;
@@ -4173,7 +3881,7 @@ mod tests {
             timg.save(&p).ok();
             println!("调子图 → {}", p.display());
         }
-        let cov = format!("{stats}{tone_stats}");
+        let cov = format!("{stats}{tone_stats}{phys_stats}");
         let name = std::env::var("SKETCH_OUT").unwrap_or_else(|_| "sketch_verify.png".into());
         let out = root.join(name);
         image::save_buffer(&out, &buf, ow * 2, oh, image::ColorType::Rgba8).unwrap();

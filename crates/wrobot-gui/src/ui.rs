@@ -280,6 +280,10 @@ fn menu_bar(app: &mut AppState, ui: &mut Ui) {
             }
             ui.checkbox(&mut app.log_open, "底部实时日志栏");
             ui.separator();
+            ui.checkbox(&mut app.show_left, "显示左侧导航栏");
+            ui.checkbox(&mut app.show_right, "显示右侧参数栏");
+            ui.weak("隐藏两栏可把画布放到最大；快捷键 Ctrl+\\ 也可切换。");
+            ui.separator();
             ui.label(RichText::new("界面缩放").size(11.0).color(muted()));
             ui.add(egui::Slider::new(&mut app.ui_scale, 0.7..=2.0).text("×"));
             if ui.button("恢复 1.0×").clicked() {
@@ -341,45 +345,37 @@ enum Export {
 
 /// 开始绘制（顶栏与菜单共用）。
 ///
-/// 生成 G-code 后先做**边界自检**：内容超出机器幅面时挂起并弹窗，
-/// 由用户决定「仍然执行」还是「取消」——见 [`bounds_warn_window`]。
+/// 先打开「绘制前计算」窗口：由用户选择路径优化方式，后台算好代码量与
+/// 预计耗时后，再确认是否下发（超界仍会弹窗二次确认）。
 fn act_start_draw(app: &mut AppState) {
-    // 多笔分层：拆成「一支笔一份」的队列，先请用户装第一支笔。
-    // 只有真的分成两支以上才这样做；否则完全沿用原来的单次绘制。
-    if !app.pen_running && app.start_pen_jobs() {
-        let g = app.gcode_text.clone();
-        if app.bounds_check {
-            if let Some(msg) = app.bounds_warning(&g) {
-                app.pending_run_gcode = g;
-                app.bounds_warn_msg = msg;
-                app.show_bounds_warn = true;
-                app.status = "⚠ 内容超出机器边界，已暂停：请在弹窗中确认是否仍然执行".into();
-                return;
-            }
-        }
+    if app.pen_running {
+        app.status = "多笔队列进行中：请先完成或取消当前队列".into();
         return;
     }
-    let g = app.generate_gcode();
-    if g.trim().is_empty() {
-        app.status = "当前页面没有可绘制的内容".into();
-        return;
-    }
-    app.gcode_text = g.clone();
-    if app.bounds_check {
-        if let Some(msg) = app.bounds_warning(&g) {
-            app.pending_run_gcode = g;
-            app.bounds_warn_msg = msg;
-            app.show_bounds_warn = true;
-            app.status = "⚠ 内容超出机器边界，已暂停：请在弹窗中确认是否仍然执行".into();
-            return;
-        }
-    }
-    finish_start(app, g);
+    app.start_run_plan();
 }
 
 /// 边界检查通过（或用户确认）后真正开始运行。
 fn finish_start(app: &mut AppState, g: String) {
     let n = g.lines().filter(|l| !l.trim().is_empty()).count();
+    // 「绘制前计算」带来的已排序笔迹：直接用，避免重新生成（顺序也保持一致）。
+    if let Some(pv) = app.pending_run_paths.take() {
+        let tile = app.tile_on.then(|| app.tile_layout()).flatten();
+        if let Some(layout) = tile {
+            let page = app.tile_page_clamped();
+            app.start_run_with_preview(g, pv);
+            app.status = format!(
+                "已开始传输第 {}/{} 页（{} 行）· 本页画完回到原点后再放下一张纸",
+                page + 1,
+                layout.count(),
+                n
+            );
+        } else {
+            app.start_run_with_preview(g, pv);
+            app.status = format!("已开始传输 {} 行（进度见「运行监控」页）", n);
+        }
+        return;
+    }
     if app.tile_on {
         if let Some(layout) = app.tile_layout() {
             let page = app.tile_page_clamped();
@@ -396,6 +392,177 @@ fn finish_start(app: &mut AppState, g: String) {
     }
     app.start_run(g);
     app.status = format!("已开始传输 {} 行（进度见「运行监控」页，传输结果见左下角）", n);
+}
+
+/// 用户确认「绘制前计算」方案后的处理：先做边界自检，再真正开始。
+fn confirm_run_plan(app: &mut AppState) {
+    let Some(plan) = app.run_plan.take() else {
+        return;
+    };
+    app.show_run_plan = false;
+    app.run_plan_busy = false;
+    app.run_plan_rx = None;
+    if plan.pen_jobs.len() >= 2 {
+        // 多笔：先把队列建好（等用户装第一支笔），再决定是否提示越界。
+        app.begin_run_plan(plan);
+        let g = app.gcode_text.clone();
+        if app.bounds_check {
+            if let Some(msg) = app.bounds_warning(&g) {
+                app.pending_run_gcode = g;
+                app.bounds_warn_msg = msg;
+                app.show_bounds_warn = true;
+                app.status = "⚠ 内容超出机器边界，已暂停：请在弹窗中确认是否仍然执行".into();
+            }
+        }
+        return;
+    }
+    if app.bounds_check {
+        if let Some(msg) = app.bounds_warning(&plan.gcode) {
+            app.pending_run_gcode = plan.gcode;
+            app.pending_run_paths = Some(plan.paths);
+            app.bounds_warn_msg = msg;
+            app.show_bounds_warn = true;
+            app.status = "⚠ 内容超出机器边界，已暂停：请在弹窗中确认是否仍然执行".into();
+            return;
+        }
+    }
+    app.begin_run_plan(plan);
+}
+
+/// 「绘制前计算」窗口：确认路径优化、代码量与预计耗时后再开始。
+fn run_plan_window(app: &mut AppState, ctx: egui::Context) {
+    if !app.show_run_plan {
+        return;
+    }
+    app.poll_run_plan();
+    let mut open = true;
+    let mut start = false;
+    let mut close = false;
+    let mut recompute = false;
+    let mut order = app.run_plan_order;
+    let busy = app.run_plan_busy;
+    let plan = app.run_plan.clone();
+    let sig_now = app.plan_sig();
+    let stale = plan.as_ref().map(|pl| pl.sig) != Some(sig_now);
+    egui::Window::new("绘制前计算")
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .default_width(480.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(&ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("路径优化");
+                egui::ComboBox::from_id_salt("run_plan_order")
+                    .selected_text(wrobot_core::PathOrder::from_u8(order).label())
+                    .width(250.0)
+                    .show_ui(ui, |ui| {
+                        for v in 0..=4u8 {
+                            if ui
+                                .selectable_value(
+                                    &mut order,
+                                    v,
+                                    wrobot_core::PathOrder::from_u8(v).label(),
+                                )
+                                .changed()
+                            {
+                                recompute = true;
+                            }
+                        }
+                    });
+            });
+            ui.weak("只调整绘制顺序与起笔端，不增删任何笔迹。改选后会自动重新计算。");
+            ui.separator();
+
+            if busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("正在排序路径、抽稀并生成 G-code…");
+                });
+                return;
+            }
+            let Some(pl) = plan.as_ref() else {
+                ui.label("尚未计算。");
+                if ui.button("开始计算").clicked() {
+                    recompute = true;
+                }
+                return;
+            };
+            let p = pal(ui);
+
+            egui::Grid::new("run_plan_stats")
+                .num_columns(2)
+                .spacing([18.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("笔迹");
+                    ui.label(format!("{} 笔 · {} 点", pl.strokes, pl.points));
+                    ui.end_row();
+                    ui.label("G-code");
+                    ui.label(format!(
+                        "{} 行 · {:.1} KB",
+                        pl.lines,
+                        pl.bytes as f64 / 1024.0
+                    ));
+                    ui.end_row();
+                    ui.label("墨线 / 空移");
+                    ui.label(format!(
+                        "{:.2} m / {:.1} m",
+                        pl.ink_mm / 1000.0,
+                        pl.travel_mm / 1000.0
+                    ));
+                    ui.end_row();
+                    ui.label("预计耗时");
+                    ui.label(
+                        RichText::new(fmt_duration(pl.seconds))
+                            .strong()
+                            .color(p.accent),
+                    );
+                    ui.end_row();
+                });
+            if pl.pen_jobs.len() >= 2 {
+                ui.label(format!("多笔分层：共 {} 支笔，按顺序换笔绘制。", pl.pen_jobs.len()));
+            }
+            if let Some(page) = pl.tile_page {
+                ui.label(format!("分页绘制：本次只输出第 {} 页。", page + 1));
+            }
+            ui.weak(
+                "估算按快速空移、落笔进给、加减速与每行指令开销计算；实际耗时受机器与纸张影响。",
+            );
+            if stale {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 90, 30),
+                    "内容或参数已改变，方案已过期——请重新计算。",
+                );
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !stale,
+                        egui::Button::new(RichText::new("开始绘制").strong()),
+                    )
+                    .clicked()
+                {
+                    start = true;
+                }
+                if ui.button("重新计算").clicked() {
+                    recompute = true;
+                }
+                if ui.button("取消").clicked() {
+                    close = true;
+                }
+            });
+        });
+    if order != app.run_plan_order {
+        app.run_plan_order = order;
+    }
+    if start {
+        confirm_run_plan(app);
+    } else if recompute {
+        app.recompute_run_plan(order);
+    } else if close || !open {
+        app.close_run_plan();
+    }
 }
 
 /// 超界确认弹窗：列出超出的方向与数值，用户可选「仍然执行」或「取消」。
@@ -442,6 +609,7 @@ fn bounds_warn_window(app: &mut AppState, ctx: egui::Context) {
                 if ui.button("取消").clicked() {
                     cancelled = true;
                     app.pending_run_gcode.clear();
+                    app.pending_run_paths = None;
                     app.bounds_warn_msg.clear();
                     if app.pen_running {
                         app.cancel_pen_jobs();
@@ -454,10 +622,164 @@ fn bounds_warn_window(app: &mut AppState, ctx: egui::Context) {
     if !open || confirmed || cancelled {
         app.show_bounds_warn = false;
         app.pending_run_gcode.clear();
+        app.pending_run_paths = None;
         app.bounds_warn_msg.clear();
         if !confirmed {
             app.status = "已取消运行：内容超出机器边界".into();
         }
+    }
+}
+
+/// 导入图片的「尺寸 / 精细度」确认窗口。
+///
+/// 以前选完文件就直接按默认高度生成，大图被静默压到固定长边，用户拿到的是
+/// 简化过的结果。现在把原图尺寸、成品毫米尺寸和实际工作分辨率摆在一起，
+/// 由用户选择目标高度与精细度后再生成。
+fn import_window(app: &mut AppState, ctx: egui::Context) {
+    let Some(p) = app.pending_import.as_ref() else {
+        return;
+    };
+    let background = p.background;
+    let src_w = p.src_w;
+    let src_h = p.src_h;
+    let file_name = p
+        .path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.path.display().to_string());
+    let mut target_h = p.target_h;
+    let mut max_side = p.max_side;
+    let page_w = app.machine_w_mm;
+    let page_h = app.machine_h_mm;
+    let draw_type = app.img_draw_type;
+    let size_cap = matches!(draw_type, 3 | 4); // 中心线 / 描边固定封顶
+
+    let long = src_w.max(src_h).max(1);
+    let work_side = if max_side == 0 {
+        long
+    } else {
+        max_side.min(long)
+    };
+    let k = work_side as f64 / long as f64;
+    let work_w = (src_w as f64 * k).round().max(1.0) as u32;
+    let work_h = (src_h as f64 * k).round().max(1.0) as u32;
+    let out_w = target_h * src_w as f64 / src_h.max(1) as f64;
+
+    let mut open = true;
+    let mut confirmed = false;
+    let mut cancelled = false;
+    egui::Window::new(if background {
+        "导入背景参考图"
+    } else {
+        "导入前景图片"
+    })
+    .open(&mut open)
+    .resizable(false)
+    .collapsible(false)
+    .default_width(430.0)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    .show(&ctx, |ui| {
+        ui.weak(&file_name);
+        ui.label(format!("原图：{} × {} px", src_w, src_h));
+        ui.separator();
+
+        ui.label(RichText::new("尺寸（成品高度）").strong());
+        ui.horizontal_wrapped(|ui| {
+            for h in [100.0, 150.0, 200.0, 250.0, 300.0] {
+                if ui.selectable_label((target_h - h).abs() < 0.5, format!("{h:.0}mm")).clicked() {
+                    target_h = h;
+                }
+            }
+            if page_w > 20.0 && page_h > 20.0 {
+                // 按原图比例取「宽高都不超过纸面留边」的最大高度，避免竖图
+                // 选「纸面高」后左右溢出。
+                let fit_h = ((page_w - 20.0) * src_h as f64 / src_w.max(1) as f64)
+                    .min(page_h - 20.0)
+                    .max(20.0);
+                if ui
+                    .selectable_label((target_h - fit_h).abs() < 0.5, "适应纸面")
+                    .on_hover_text(format!(
+                        "机器幅面 {page_w:.0}×{page_h:.0}mm，四周留 10mm 边"
+                    ))
+                    .clicked()
+                {
+                    target_h = fit_h;
+                }
+            }
+        });
+        ui.add(egui::Slider::new(&mut target_h, 30.0..=400.0).suffix(" mm"));
+        ui.weak(format!(
+            "成品尺寸约 {:.1} × {:.1} mm（宽 × 高）",
+            out_w, target_h
+        ));
+        if out_w > page_w + 1e-6 || target_h > page_h + 1e-6 {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 30),
+                format!(
+                    "超出机器幅面 {:.0} × {:.0} mm：导入后可在画布上缩放，或启用分页绘制",
+                    page_w, page_h
+                ),
+            );
+        }
+        ui.separator();
+
+        ui.label(RichText::new("精细度（工作分辨率）").strong());
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut max_side, 0, "原图");
+            for v in [3600u32, 3000, 2400, 1800] {
+                ui.selectable_value(&mut max_side, v, format!("{v}px"));
+            }
+        });
+        ui.weak(format!(
+            "算法实际处理 {work_w} × {work_h} px（{}）",
+            if max_side == 0 || work_side == long {
+                "原分辨率".to_string()
+            } else {
+                format!("长边压到 {work_side}px")
+            }
+        ));
+        if max_side != 0 && max_side < long {
+            ui.weak(format!(
+                "原图长边 {long}px，当前会丢掉一部分像素细节；追细节可选「原图」。"
+            ));
+        }
+        if size_cap {
+            ui.weak("中心线 / 描边为保证界面响应，最高按 1600px 处理。");
+        }
+        if max_side == 0 && long > 5000 {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 30),
+                "原图很大，生成可能需要较久；卡住时可选 3600px。",
+            );
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("导入并生成").strong()).clicked() {
+                confirmed = true;
+            }
+            if ui.button("取消").clicked() {
+                cancelled = true;
+            }
+        });
+    });
+
+    if confirmed {
+        if let Some(p) = app.pending_import.as_mut() {
+            p.target_h = target_h;
+            p.max_side = max_side;
+        }
+        match app.confirm_import() {
+            Ok(n) => {
+                app.status = if background {
+                    format!("已导入背景参考图（{} 条笔迹，浅色显示不打印）", n)
+                } else {
+                    format!("已导入前景图片（{} 条笔迹）", n)
+                }
+            }
+            Err(e) => app.status = format!("导入失败：{e}"),
+        }
+    } else if cancelled || !open {
+        app.pending_import = None;
     }
 }
 
@@ -696,13 +1018,26 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
     });
 
     // 快捷键：Ctrl+S 保存工程 / Ctrl+O 打开工程 / Ctrl+E 导出 G-code / F1 帮助
-    let (mut k_save, mut k_open, mut k_export, mut k_help) = (false, false, false, false);
+    // Ctrl+\ 显示/隐藏左右侧栏（画布最大化）
+    let (mut k_save, mut k_open, mut k_export, mut k_help, mut k_side) =
+        (false, false, false, false, false);
     ui.ctx().input_mut(|i| {
         k_save = i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
         k_open = i.consume_key(egui::Modifiers::CTRL, egui::Key::O);
         k_export = i.consume_key(egui::Modifiers::CTRL, egui::Key::E);
         k_help = i.consume_key(egui::Modifiers::NONE, egui::Key::F1);
+        k_side = i.consume_key(egui::Modifiers::CTRL, egui::Key::Backslash);
     });
+    if k_side {
+        let show = !(app.show_left && app.show_right);
+        app.show_left = show;
+        app.show_right = show;
+        app.status = if show {
+            "已显示左右侧栏".into()
+        } else {
+            "已隐藏左右侧栏（Ctrl+\\ 恢复）".into()
+        };
+    }
     if k_save {
         act_save_project(app);
     }
@@ -803,72 +1138,78 @@ pub fn show(app: &mut AppState, ui: &mut Ui, _frame: &mut eframe::Frame) {
             });
     }
 
-    // ── 左侧：分组导航 + 输出图层 + 坐标 ──────────
-    egui::Panel::left("modules")
-        .resizable(true)
-        .default_size(220.0)
-        .min_size(190.0)
-        .max_size(340.0)
-        .frame(
-            egui::Frame::new()
-                .fill(p.panel)
-                .inner_margin(egui::Margin::symmetric(8, 6)),
-        )
-        .show(ui, |ui| {
-            left_sidebar(app, ui, &p);
-        });
+    // ── 左侧：分组导航 + 输出图层 + 坐标（视图菜单可隐藏）──
+    if app.show_left {
+        egui::Panel::left("modules")
+            .resizable(true)
+            .default_size(220.0)
+            .min_size(190.0)
+            .max_size(340.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
+            )
+            .show(ui, |ui| {
+                left_sidebar(app, ui, &p);
+            });
+    }
 
-    // ── 右侧：当前模块参数 ───────────────────────
-    egui::Panel::right("params")
-        .resizable(true)
-        .default_size(340.0)
-        .min_size(300.0)
-        // 上限要给死，否则长按钮/滑块会把栏位一路撑大、挤压预览；
-        // 但图片页的多笔笔组和长标签滑块确实需要更宽的栏位，
-        // 400 不够用时用户又拖不过去，所以留到 520。
-        .max_size(520.0)
-        .frame(
-            egui::Frame::new()
-                .fill(p.panel)
-                .inner_margin(egui::Margin::symmetric(0, 0)),
-        )
-        .show(ui, |ui| {
-            ScrollArea::vertical()
-                .id_salt("params_scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin::symmetric(12, 8))
-                        .show(ui, |ui| {
-                            // 主题的滑块轨道宽 150pt，侧栏最窄 300pt：长中文标签 +
-                            // 数值 + 轨道会顶出栏外被裁掉。按当前栏宽收窄轨道，
-                            // 保证整行（标签、数值、滑块）都完整显示。
-                            fit_params_width(ui);
-                            match app.tab {
-                                0 => panel_text(app, ui),
-                                1 => panel_table(app, ui),
-                                2 => panel_grid(app, ui),
-                                3 => panel_draw(app, ui),
-                                4 => panel_notes(app, ui),
-                                5 => panel_images(app, ui),
-                                6 | 7 => panel_device(app, ui),
-                                8 => panel_io(app, ui),
-                                9 => panel_running(app, ui),
-                                _ => {}
-                            }
-                            // 手写风格是全体内容模块的公共参数，放一个入口即可。
-                            if app.tab <= 4 || app.tab == 5 {
-                                panel_style(app, ui);
-                            }
-                        });
-                });
-        });
+    // ── 右侧：当前模块参数（视图菜单可隐藏）───────
+    if app.show_right {
+        egui::Panel::right("params")
+            .resizable(true)
+            .default_size(340.0)
+            .min_size(300.0)
+            // 上限要给死，否则长按钮/滑块会把栏位一路撑大、挤压预览；
+            // 但图片页的多笔笔组和长标签滑块确实需要更宽的栏位，
+            // 400 不够用时用户又拖不过去，所以留到 520。
+            .max_size(520.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(0, 0)),
+            )
+            .show(ui, |ui| {
+                ScrollArea::vertical()
+                    .id_salt("params_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                // 主题的滑块轨道宽 150pt，侧栏最窄 300pt：长中文标签 +
+                                // 数值 + 轨道会顶出栏外被裁掉。按当前栏宽收窄轨道，
+                                // 保证整行（标签、数值、滑块）都完整显示。
+                                fit_params_width(ui);
+                                match app.tab {
+                                    0 => panel_text(app, ui),
+                                    1 => panel_table(app, ui),
+                                    2 => panel_grid(app, ui),
+                                    3 => panel_draw(app, ui),
+                                    4 => panel_notes(app, ui),
+                                    5 => panel_images(app, ui),
+                                    6 | 7 => panel_device(app, ui),
+                                    8 => panel_io(app, ui),
+                                    9 => panel_running(app, ui),
+                                    _ => {}
+                                }
+                                // 手写风格是全体内容模块的公共参数，放一个入口即可。
+                                if app.tab <= 4 || app.tab == 5 {
+                                    panel_style(app, ui);
+                                }
+                            });
+                    });
+            });
+    }
 
-    // 设置 / 帮助 / 关于 / 越界确认
+    // 设置 / 帮助 / 关于 / 越界确认 / 绘制前计算
     settings_window(app, ui.ctx().clone());
     help_window(app, ui.ctx().clone());
     about_window(app, ui.ctx().clone());
     bounds_warn_window(app, ui.ctx().clone());
+    run_plan_window(app, ui.ctx().clone());
+    import_window(app, ui.ctx().clone());
     pen_swap_window(app, ui.ctx().clone());
 
     // ── 中央：工作区 ─────────────────────────────
@@ -1095,9 +1436,9 @@ fn action_bar(app: &mut AppState, ui: &mut Ui, p: &theme::Palette) {
             if ui
                 .add(theme::primary_button(p, &start_label))
                 .on_hover_text(if tile_layout.is_some() {
-                    "生成当前分页的 G-code 并下发（含四角定位标记）"
+                    "先计算当前分页的方案（代码量与预计耗时），确认后再下发（含四角定位标记）"
                 } else {
-                    "生成 G-code 并下发（会先做边界自检）"
+                    "先计算代码量、路径优化与预计耗时，确认后再下发（含边界自检）"
                 })
                 .clicked()
             {
@@ -1582,6 +1923,21 @@ fn settings_window(app: &mut AppState, ctx: egui::Context) {
                 if ui.button("恢复默认 0.2").clicked() {
                     app.min_step_mm = 0.2;
                 }
+
+                section(ui, "耗时估算（开始绘制前给出的预计时间）");
+                ui.add(
+                    egui::Slider::new(&mut app.rapid_rate, 500.0..=30000.0)
+                        .text("空移快速(mm/min)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut app.accel_mm_s2, 50.0..=5000.0)
+                        .text("加速度(mm/s²)"),
+                );
+                ui.add(egui::Slider::new(&mut app.line_ms, 0.0..=10.0).text("每行指令(ms)"));
+                ui.weak(
+                    "空移速度与加速度取机器实际值；每行指令开销约等于「一行代码的固件处理时间」。\
+                     估时按加减速曲线逐段累计，短笔触多、指令密时会更准。",
+                );
 
                 section(ui, "机器幅面");
                 ui.horizontal(|ui| {
@@ -2957,21 +3313,16 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
         if ui.button("导入前景图片（可打印）").clicked() {
             if let Some(p) = app.pick_file("图片", &["png", "jpg", "jpeg", "gif", "bmp"]) {
-                match app.import_image_file(&p, false) {
-                    Ok(n) => app.status = format!("已导入前景图片（{} 条笔迹）", n),
-                    Err(e) => app.status = format!("导入失败：{e}"),
-                }
+                app.begin_import(&p, false);
             }
         }
         if ui.button("导入背景参考图").clicked() {
             if let Some(p) = app.pick_file("图片", &["png", "jpg", "jpeg", "gif", "bmp"]) {
-                match app.import_image_file(&p, true) {
-                    Ok(n) => app.status = format!("已导入背景参考图（{} 条笔迹，浅色显示不打印）", n),
-                    Err(e) => app.status = format!("导入失败：{e}"),
-                }
+                app.begin_import(&p, true);
             }
         }
     });
+    ui.weak("选好文件后可确认成品尺寸与精细度；不会再把大图静默压小。");
     ui.weak("画布操作：点击选图 · 按住拖动移动 · 滚轮缩放当前选中图片");
 
     // 模块级输出开关统一放在左侧栏「输出图层」，避免两个地方各有一个开关。
@@ -3223,20 +3574,20 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
         // —— 描边提取参数 ——
         ui.separator();
         ui.label(RichText::new("描边提取参数").strong());
-        let mut dt = app.images[sel].draw as usize;
+        let mut mode_sel = app.images[sel].draw.normalized();
         ui.horizontal_wrapped(|ui| {
             ui.label("绘制类型:");
             ComboBox::from_id_salt("img_draw_sel")
-                .selected_text(ImgDraw::from_usize(dt).name())
+                .selected_text(mode_sel.name())
                 .width(combo_w)
                 .show_ui(ui, |ui| {
-                    for (i, name) in ImgDraw::names().iter().enumerate() {
-                        ui.selectable_value(&mut dt, i, *name);
+                    for m in ImgDraw::active() {
+                        ui.selectable_value(&mut mode_sel, *m, m.name());
                     }
                 });
         });
-        app.images[sel].draw = ImgDraw::from_usize(dt);
-        ui.weak(app.images[sel].draw.hint());
+        app.images[sel].draw = mode_sel;
+        ui.weak(mode_sel.hint());
         let mode = app.images[sel].draw;
         let uses_step = matches!(
             mode,
@@ -3245,149 +3596,130 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
                 | ImgDraw::Continuous
                 | ImgDraw::CrossHatch
                 | ImgDraw::Halftone
-                | ImgDraw::SketchHatch
         );
-        if mode == ImgDraw::SketchHatch {
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].step_px, 2..=24)
-                    .text("排线间距(px)"),
-            );
-        } else {
-            ui.add_enabled(
-                uses_step,
-                egui::Slider::new(&mut app.images[sel].step_px, 1..=12)
-                    .text(if mode == ImgDraw::Halftone { "网点间隔(px)" } else { "影线间隔(px)" }),
-            );
-        }
+        ui.add_enabled(
+            uses_step,
+            egui::Slider::new(&mut app.images[sel].step_px, 1..=12)
+                .text(if mode == ImgDraw::Halftone { "网点间隔(px)" } else { "影线间隔(px)" }),
+        );
         ui.add_enabled(
             mode != ImgDraw::Wire,
             egui::Slider::new(&mut app.images[sel].threshold, 0.1..=0.95)
-                // 同一个 `threshold` 字段在不同画法里含义不同。素描原稿这条路上
-                // 它是「响应最强的百分之多少算线」，即识别到多浅的铅笔线为止，
-                // 叫「暗部阈值」会让人以为在调明暗——这里换名字。
-                .text(match mode {
-                    ImgDraw::SketchOriginal => "识别密度",
-                    ImgDraw::SketchHatch
-                    | ImgDraw::RegionRedraw
-                    | ImgDraw::StrokeSketch => "明暗对比",
-                    _ => "暗部阈值",
-                }),
+                .text(if mode == ImgDraw::StrokeSketch { "明暗对比" } else { "暗部阈值" }),
         );
         ui.add_enabled(
-            matches!(
-                mode,
-                ImgDraw::Wire
-                    | ImgDraw::SketchHatch
-                    | ImgDraw::RegionRedraw
-                    | ImgDraw::StrokeSketch
-            ),
+            matches!(mode, ImgDraw::Wire | ImgDraw::StrokeSketch),
             egui::Slider::new(&mut app.images[sel].edge_threshold, 0.05..=0.9)
-                .text(if matches!(
-                    mode,
-                    ImgDraw::SketchHatch | ImgDraw::RegionRedraw | ImgDraw::StrokeSketch
-                ) {
-                    "轮廓阈值"
-                } else {
-                    "边缘阈值(线框)"
-                }),
+                .text(if mode == ImgDraw::StrokeSketch { "轮廓阈值" } else { "边缘阈值(线框)" }),
         );
         ui.checkbox(&mut app.images[sel].invert, "反相（黑变白）");
-        if mode == ImgDraw::SketchOriginal {
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
-                    .text("手抖幅度(mm)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
-                    .text("画笔线宽(mm)"),
-            );
-            ui.weak(
-                "把原稿上真实画出来的铅笔线一根根描出来——发丝、眼线、唇线、衬衫的排线，位置与走向都由原稿决定，不是照明暗另排一套。识别密度决定描到多浅的线：调高鼻子、嘴角的浅结构会出来，但再高纸纹也会被当成线；调低只剩五官和重轮廓。画笔线宽要填你实际用的笔（0.5 ≈ 中性笔），它既决定两根线最近能靠多近，也决定识别的细度——比笔细十倍的线画不出来，找出来只会糊成一团。",
-            );
-        } else if mode == ImgDraw::SketchHatch {
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].hatch_levels, 3..=8)
-                    .text("明暗层数"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].hatch_angle, 0.0..=180.0)
-                    .text("排线基准角(°)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
-                    .text("手抖幅度(mm)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
-                    .text("画笔线宽(mm)"),
-            );
-            ui.weak(
-                "单色笔没有灰阶：亮部一根不画，中间调铺一层稀排线，越暗叠越多层交叉排线（只交错两组方向，避免织成乱网）。头发、衣褶这类方向明确的暗部会改沿原稿走向排线，像顺着发丝画；连成一片的浅灰背景自动留白。轮廓另用「局部细节 − 大尺度调子」提一遍线，五官不散。明暗层数决定最多叠几层（4 层以下容易断层，6 层左右最自然）；排线间距是纸面上两根线的最近距离，小于 2.4 个笔宽会糊成黑块；明暗对比调高，浅灰会更早让给纸白，画面更像铅笔速写。",
-            );
-            ui.separator();
-            ui.checkbox(
-                &mut app.images[sel].multi_pen,
-                "多笔分层（换笔绘制 HB → 2B → 4B → 8B）",
-            )
-            .on_hover_text(
-                "把明暗带按每支笔能压出的最深色分配：浅笔铺中间调，深笔压暗部，轮廓用最深笔。\
-                 绘制时会一支一支提示换笔，每支笔的 G-code 都重新以当前位置为零点。",
-            );
-            if app.images[sel].multi_pen {
-                let n = app.active_pens().len();
-                if n < 2 {
-                    ui.colored_label(
-                        p.warning,
-                        "多笔分层至少需要两支启用中的笔：请在下方「多笔分层 · 笔组」里勾选。",
-                    );
-                } else {
-                    ui.weak(format!(
-                        "当前 {n} 支笔参与分层（亮 → 暗）；铅笔越深压得越黑，不再让一支笔靠密度硬撑。"
-                    ));
-                }
-            }
-        } else if mode == ImgDraw::StrokeSketch {
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].hatch_levels, 2..=6)
-                    .text("叠加遍数"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].stroke_len_mm, 1.5..=8.0)
-                    .text("笔触长度(mm)"),
-            );
-            const FOLLOW_NAMES: [&str; 3] = ["跟随轮廓", "跟随原稿", "混合（轮廓+交叉）"];
+        if mode == ImgDraw::StrokeSketch {
+            let mut style = app.images[sel].sketch_style;
             ui.horizontal_wrapped(|ui| {
-                ui.label("走向参考:");
-                egui::ComboBox::from_id_salt("img_stroke_follow")
-                    .selected_text(
-                        FOLLOW_NAMES[usize::from(app.images[sel].stroke_follow).min(2)],
-                    )
+                ui.label("笔触风格:");
+                ComboBox::from_id_salt("img_sketch_style")
+                    .selected_text(if style == 1 {
+                        "随形短笔触（逐遍补墨）"
+                    } else {
+                        "交叉排线基底"
+                    })
                     .width(combo_w)
                     .show_ui(ui, |ui| {
-                        for (i, name) in FOLLOW_NAMES.iter().enumerate() {
-                            ui.selectable_value(
-                                &mut app.images[sel].stroke_follow,
-                                i as u8,
-                                *name,
+                        ui.selectable_value(&mut style, 1, "随形短笔触（逐遍补墨）")
+                            .on_hover_text(
+                                "0.20 的落笔流水线：量出每个小块还差多少墨，用 1~5mm 短笔触\
+                                 沿轮廓/墨脊去补，一遍不够下一遍接着补，直到目标墨量。",
                             );
-                        }
+                        ui.selectable_value(&mut style, 0, "交叉排线基底（等距平行线）")
+                            .on_hover_text(
+                                "0.25 的落笔流水线：全图两族平行线打底，按笔宽分档加密，\
+                                 线条更规整、耗时更短。",
+                            );
                     });
             });
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].hatch_angle, 0.0..=180.0)
-                    .text("无方向时基准角(°)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
-                    .text("手抖幅度(mm)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
-                    .text("画笔线宽(mm)"),
-            );
-            ui.weak(
-                "按真实素描的工序铺线：先量出每一小块「还差多少墨」，再用短直线段去补——差得多就排得密，差得少就留得疏，线距由明暗反算，不再全图一个间距。笔触是 1.5~8mm 的直线段（不是顺着方向场画到底的曲线），轮廓和细节处会自动收短。走向参考决定这些短段朝哪边：跟随轮廓沿等照度线（圆球、脸颊会顺着形体转），跟随原稿沿原稿真实的铅笔笔触，混合则先跟原稿、暗部再叠 38° 交叉层。叠加遍数越多，暗部交叉越充分；亮部没有那么多墨要补，自然只落很少几笔。",
-            );
+            app.images[sel].sketch_style = style;
+            if style == 1 {
+                ui.add(
+                    egui::Slider::new(&mut app.images[sel].hatch_levels, 2..=8)
+                        .text("补墨遍数"),
+                )
+                .on_hover_text(
+                    "最多补几遍。每一遍都重新量「目标墨 − 当前墨」，只补还差的缺口；\
+                     遍数越多，暗部越压实，耗时也越长。",
+                );
+                ui.add(
+                    egui::Slider::new(&mut app.images[sel].stroke_len_mm, 1.0..=8.0)
+                        .text("短笔触长度(mm)"),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("走向参考:");
+                    const FOLLOW_NAMES: [&str; 4] = [
+                        "跟随轮廓",
+                        "跟随原稿笔触",
+                        "混合（轮廓+笔触）",
+                        "交叉明暗调子",
+                    ];
+                    ComboBox::from_id_salt("img_stroke_follow")
+                        .selected_text(FOLLOW_NAMES[usize::from(app.images[sel].stroke_follow).min(3)])
+                        .width(combo_w)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in FOLLOW_NAMES.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut app.images[sel].stroke_follow,
+                                    i as u8,
+                                    *name,
+                                )
+                                .on_hover_text(match i {
+                                    0 => "笔触沿轮廓切线走，形体边界最清楚。",
+                                    1 => "笔触沿原稿里已有的笔触方向走，最贴近原作。",
+                                    2 => "前两者按置信度混合，平滑处跟轮廓、有笔触处跟原稿。",
+                                    _ => "浅调子只走一个方向，越暗越叠加交叉方向（45°/90°/135°），\
+                                          画面对比更丰富，不再是一边倒的单向排线。",
+                                });
+                            }
+                        });
+                });
+                ui.add(
+                    egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
+                        .text("手抖幅度(mm)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut app.images[sel].hatch_angle, 0.0..=180.0)
+                        .text("交叉基准角(°)"),
+                );
+                ui.weak(
+                    "逐遍补残留墨：先把每个小块的目标墨量与当前覆盖做差，差得多就排得密，\
+                     差得少就留白；笔触用 1~5mm 的短直线，方向跟着轮廓走，暗部再按固定角差\
+                     叠交叉遍。原稿里的真实细线（发丝、睫毛、衣褶）由细节层单独描一遍。\
+                     这是 0.20 的落笔方式，版面更「脏」也更像手绘。",
+                );
+            } else {
+                ui.add(
+                    egui::Slider::new(&mut app.images[sel].hatch_levels, 2..=8)
+                        .text("排线层数（HB→8B）"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut app.images[sel].hatch_angle, 0.0..=180.0)
+                        .text("排线基准角(°)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
+                        .text("手抖幅度(mm)"),
+                );
+                ui.weak(
+                    "以交叉排线为底：全图只用「基准角 / 基准角+90°」两族平行线，行距由笔宽决定。\
+                     调子越高、缺口越大，同一族线排得越密；每两层换一支更深的笔（HB→2B→4B→8B），\
+                     所以暗部是几族平行线的叠加，而不是一坨涂黑。原稿里真实存在的细线（发丝、\
+                     睫毛、衣褶）由细节层单独描一遍，压在排线之上。层数越多，最深的头发/瞳孔\
+                     才压得下去；亮部没有缺墨的空间，自然留白。",
+                );
+            }
+            if !app.images[sel].multi_pen {
+                ui.add(
+                    egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
+                        .text("画笔线宽(mm)"),
+                );
+            }
             ui.separator();
             ui.checkbox(
                 &mut app.images[sel].multi_pen,
@@ -3410,38 +3742,18 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
                     ));
                 }
             }
-        } else if mode == ImgDraw::RegionRedraw {
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].hatch_levels, 3..=8)
-                    .text("深度层数"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].region_block_mm, 1.5..=10.0)
-                    .text("分块粒度(mm)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].hatch_angle, 0.0..=180.0)
-                    .text("排线基准角(°)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].sketch_jitter, 0.0..=0.8)
-                    .text("手抖幅度(mm)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
-                    .text("画笔线宽(mm)"),
-            );
-            ui.weak(
-                "先把画面量成逐像素的深度层（越黑层号越大），再切成细块，每块单独看原稿的笔触走向重新排线：浅层用浅铅笔先铺，深层用深铅笔一层层压上去，最后用最深笔压轮廓。和「素描调子」的区别是排线方向不再整片一致，而是跟着鼻梁、眼窝、发丝各走各的——分层时用的是每个像素的深浅，所以只有一两毫米的深色也不会被块平均抹掉。分块粒度是方向采样的边长：调小更贴局部走向，但太小会抖；深度层数决定最多叠几层，5 层左右层次最稳。",
-            );
+        }
+
+        if mode == ImgDraw::CrossHatch {
             ui.separator();
             ui.checkbox(
                 &mut app.images[sel].multi_pen,
-                "多笔分层（换笔绘制 HB → 2B → 4B → 8B）",
+                "按明暗多笔分层（浅笔铺底，深笔补暗部）",
             )
             .on_hover_text(
-                "每个深度层绑定一支笔：最浅的层用 HB，越深换越黑的笔；关掉时全部用同一支笔，\
-                 只靠层数和疏密表现灰阶。绘制时会一支一支提示换笔。",
+                "第 1 支（最浅）画全部排线；之后每支更深的笔只在更暗的区域补一层交叉排线，\
+                 阈值逐层 ×0.72，方向依次换成 90° / 45° / 135°。亮部只由浅笔铺一遍，\
+                 深色块则由多支笔叠出层次，不会一上来就糊黑。",
             );
             if app.images[sel].multi_pen {
                 let n = app.active_pens().len();
@@ -3451,12 +3763,18 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
                         "多笔分层至少需要两支启用中的笔：请在下方「多笔分层 · 笔组」里勾选。",
                     );
                 } else {
-                    ui.weak(format!("当前 {n} 支笔参与深度分层（亮 → 暗）。"));
+                    ui.weak(format!(
+                        "当前 {n} 支笔：第 1 支铺全部排线，其余 {} 支依次补更暗的交叉层。",
+                        n - 1
+                    ));
                 }
+            } else {
+                ui.add(
+                    egui::Slider::new(&mut app.images[sel].sketch_pen, 0.2..=1.2)
+                        .text("画笔线宽(mm)"),
+                );
             }
         }
-
-        // —— 绘画方式（顺序 / 方向 / 连笔）——
         ui.separator();
         ui.label(RichText::new("绘画方式").strong());
         let uses_scan = matches!(
@@ -3465,8 +3783,6 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
                 | ImgDraw::Sketch
                 | ImgDraw::Continuous
                 | ImgDraw::CrossHatch
-                | ImgDraw::SketchHatch
-                | ImgDraw::RegionRedraw
                 | ImgDraw::StrokeSketch
         );
         ui.add_enabled_ui(uses_scan, |ui| {
@@ -3510,34 +3826,7 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
             app.images[sel].order_mode == 3,
             egui::Slider::new(&mut app.images[sel].block_px, 16..=120).text("分块边长(px)"),
         );
-        if mode == ImgDraw::SketchOriginal {
-            match app.images[sel].order_mode {
-                1 => ui.weak("最优路径：全部笔迹按最近邻 + 2-opt 串联，空移最少，但会打乱分层。"),
-                2 => ui.weak("按笔迹起点的上下位置依次绘制：最接近原稿扫描顺序，空移较多。"),
-                3 => ui.weak("分块蛇形：块内最优、块间来回「犁地」，适合大幅面分批绘制。"),
-                _ => ui.weak(
-                    "分层手绘：起稿轻线 → 主体 → 暗部；每层长线先走，短线按方向成组排线。空移比最优路径多，但更像人的作画步骤。",
-                ),
-            }
-        } else if mode == ImgDraw::SketchHatch {
-            match app.images[sel].order_mode {
-                1 => ui.weak("每层内就近串联：空移少，但始终先画完亮部再画暗部。"),
-                2 => ui.weak("按排线扫描顺序：同一方向成排推进，最接近人手排线。"),
-                3 => ui.weak("分块蛇形：块内就近、块间来回，适合大幅面分批绘制。"),
-                _ => ui.weak(
-                    "分层手绘：亮部单层 → 中间调 → 暗部交叉叠线，每层内就近串联。空移略多，但层次不会被走笔顺序打乱。",
-                ),
-            }
-        } else if mode == ImgDraw::RegionRedraw {
-            match app.images[sel].order_mode {
-                1 => ui.weak("每层内就近串联：空移少；但必须整层画完才换笔，换笔次数不变。"),
-                2 => ui.weak("按排线成排推进：同一小块内一路排下去，最像人手铺调子。"),
-                3 => ui.weak("分块蛇形：块内就近、块间来回，适合大幅面分批绘制。"),
-                _ => ui.weak(
-                    "按深度分层：浅层先铺、深层后叠，每一层内就近串联。整层画完再换下一支笔，叠出来的暗部才匀。",
-                ),
-            }
-        } else if mode == ImgDraw::StrokeSketch {
+        if mode == ImgDraw::StrokeSketch {
             match app.images[sel].order_mode {
                 1 => ui.weak("全部笔触就近串联：空移最少，但打乱「先浅后深、先铺后压」的层次。"),
                 2 => ui.weak("按扫描顺序成排推进：同一片区域一路画过去，最接近人手排线。"),
@@ -3555,11 +3844,7 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
             }
         };
         if !uses_scan {
-            ui.weak("中心线 / 描边 / 网点 / 素描原稿不使用扫描方向；线条走向由原稿决定。");
-        } else if mode == ImgDraw::SketchHatch {
-            ui.weak("扫描方向只叠加在排线基准角上：横向/纵向适合大面积平涂，45° 最像手绘斜排线。");
-        } else if mode == ImgDraw::RegionRedraw {
-            ui.weak("扫描方向是基准角：原稿有明确笔触的块会沿用原稿走向，其余块按这个角度错开排线。");
+            ui.weak("中心线 / 描边 / 网点不使用扫描方向；线条走向由原稿决定。");
         } else if mode == ImgDraw::StrokeSketch {
             ui.weak("扫描方向叠加到「无明确走向」区域的基准角上；有轮廓/原稿走向的地方优先跟随画面。");
         }
@@ -3732,61 +4017,97 @@ fn panel_images(app: &mut AppState, ui: &mut Ui) {
         app.regenerate_image(sel);
     }
 
-    // 默认导入参数（作用于后续导入）
-    ui.separator();
-    section(ui, "默认导入参数");
-    ui.add(egui::Slider::new(&mut app.img_target_h, 30.0..=250.0).text("目标高度(mm)"));
-    ui.add(egui::Slider::new(&mut app.img_step, 1..=12).text("影线/网点间隔(px)"));
-    ui.add(egui::Slider::new(&mut app.img_thr, 0.1..=0.95).text("暗部阈值"));
-    ui.add(egui::Slider::new(&mut app.img_edge, 0.05..=0.9).text("边缘阈值(线框)"));
-    ui.checkbox(&mut app.img_invert, "反相");
-    let mut dt = app.img_draw_type;
-    ui.horizontal_wrapped(|ui| {
-        ui.label("默认类型:");
-        ComboBox::from_id_salt("img_default_draw")
-            .selected_text(ImgDraw::from_usize(dt).name())
-            .width(combo_w)
-            .show_ui(ui, |ui| {
-                for (i, name) in ImgDraw::names().iter().enumerate() {
-                    ui.selectable_value(&mut dt, i, *name);
-                }
-            });
+    // 默认导入参数（作用于后续导入）：不常用，默认折叠，和「手写风格」一致。
+    ui.add_space(8.0);
+    theme::collapsible_card(ui, &p, "默认导入参数", false, |ui| {
+        ui.add(egui::Slider::new(&mut app.img_target_h, 30.0..=400.0).text("目标高度(mm)"));
+        ui.add(egui::Slider::new(&mut app.img_step, 1..=12).text("影线/网点间隔(px)"));
+        ui.add(egui::Slider::new(&mut app.img_thr, 0.1..=0.95).text("暗部阈值"));
+        ui.add(egui::Slider::new(&mut app.img_edge, 0.05..=0.9).text("边缘阈值(线框)"));
+        ui.checkbox(&mut app.img_invert, "反相");
+        let mut mode_sel = ImgDraw::from_usize(app.img_draw_type);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("默认类型:");
+            ComboBox::from_id_salt("img_default_draw")
+                .selected_text(mode_sel.name())
+                .width(combo_w)
+                .show_ui(ui, |ui| {
+                    for m in ImgDraw::active() {
+                        ui.selectable_value(&mut mode_sel, *m, m.name());
+                    }
+                });
+        });
+        app.img_draw_type = mode_sel as usize;
+        ui.weak(mode_sel.hint());
+        ui.horizontal_wrapped(|ui| {
+            ui.label("默认扫描方向:");
+            ComboBox::from_id_salt("img_default_scan")
+                .selected_text(ANGLES[usize::from(app.img_scan_angle).min(3)])
+                .width(combo_w)
+                .show_ui(ui, |ui| {
+                    for (i, name) in ANGLES.iter().enumerate() {
+                        ui.selectable_value(&mut app.img_scan_angle, i as u8, *name);
+                    }
+                });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("默认笔画顺序:");
+            ComboBox::from_id_salt("img_default_order")
+                .selected_text(ORDERS[usize::from(app.img_order_mode).min(3)])
+                .width(combo_w)
+                .show_ui(ui, |ui| {
+                    for (i, name) in ORDERS.iter().enumerate() {
+                        ui.selectable_value(&mut app.img_order_mode, i as u8, *name);
+                    }
+                });
+        });
+        ui.add(egui::Slider::new(&mut app.img_merge_gap, 0..=40).text("连笔跨行容差(px)"));
+        ui.add(egui::Slider::new(&mut app.img_block_px, 16..=120).text("分块边长(px)"));
+        let mut style = app.img_sketch_style;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("默认笔触风格:");
+            ComboBox::from_id_salt("img_default_style")
+                .selected_text(if style == 1 {
+                    "随形短笔触（逐遍补墨）"
+                } else {
+                    "交叉排线基底"
+                })
+                .width(combo_w)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut style, 1, "随形短笔触（逐遍补墨）");
+                    ui.selectable_value(&mut style, 0, "交叉排线基底");
+                });
+        });
+        app.set_sketch_style(style);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("默认精细度:");
+            ComboBox::from_id_salt("img_default_max_side")
+                .selected_text(if app.img_max_side == 0 {
+                    "原图".to_string()
+                } else {
+                    format!("{}px", app.img_max_side)
+                })
+                .width(combo_w)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.img_max_side, 0, "原图（不缩放）");
+                    for v in [3600u32, 3000, 2400, 1800] {
+                        ui.selectable_value(&mut app.img_max_side, v, format!("长边 {v}px"));
+                    }
+                });
+        });
+        ui.add(egui::Slider::new(&mut app.img_sketch_jitter, 0.0..=0.8).text("笔触手抖幅度(mm)"));
+        ui.add(egui::Slider::new(&mut app.img_sketch_pen, 0.2..=1.2).text("笔触线宽(mm)"));
+        ui.add(
+            egui::Slider::new(&mut app.img_hatch_levels, 2..=8).text(if app.img_sketch_style == 1 {
+                "补墨遍数"
+            } else {
+                "排线层数（HB→8B）"
+            }),
+        );
+        ui.add(egui::Slider::new(&mut app.img_hatch_angle, 0.0..=180.0).text("排线基准角(°)"));
+        ui.add(egui::Slider::new(&mut app.img_stroke_len_mm, 1.0..=8.0).text("短笔触长度(mm)"));
+        ui.weak("以上为默认值；单张图片可在上方单独覆盖");
     });
-    app.img_draw_type = dt;
-    ui.weak(ImgDraw::from_usize(dt).hint());
-    ui.horizontal_wrapped(|ui| {
-        ui.label("默认扫描方向:");
-        ComboBox::from_id_salt("img_default_scan")
-            .selected_text(ANGLES[usize::from(app.img_scan_angle).min(3)])
-            .width(combo_w)
-            .show_ui(ui, |ui| {
-                for (i, name) in ANGLES.iter().enumerate() {
-                    ui.selectable_value(&mut app.img_scan_angle, i as u8, *name);
-                }
-            });
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label("默认笔画顺序:");
-        ComboBox::from_id_salt("img_default_order")
-            .selected_text(ORDERS[usize::from(app.img_order_mode).min(3)])
-            .width(combo_w)
-            .show_ui(ui, |ui| {
-                for (i, name) in ORDERS.iter().enumerate() {
-                    ui.selectable_value(&mut app.img_order_mode, i as u8, *name);
-                }
-            });
-    });
-    ui.add(egui::Slider::new(&mut app.img_merge_gap, 0..=40).text("连笔跨行容差(px)"));
-    ui.add(egui::Slider::new(&mut app.img_block_px, 16..=120).text("分块边长(px)"));
-    // 原稿通的这个字段在新笔触提取里已无作用（见 `tonal_strokes` 的 `_pressure`），
-    // 不再对外暴露，免得用户以为是「调深」的旋钮——提取出来的线不加深浅。
-    ui.add(egui::Slider::new(&mut app.img_sketch_jitter, 0.0..=0.8).text("原稿手抖幅度(mm)"));
-    ui.add(egui::Slider::new(&mut app.img_sketch_pen, 0.2..=1.2).text("原稿画笔线宽(mm)"));
-    ui.add(egui::Slider::new(&mut app.img_hatch_levels, 3..=8).text("调子明暗层数"));
-    ui.add(egui::Slider::new(&mut app.img_hatch_angle, 0.0..=180.0).text("调子排线基准角(°)"));
-    ui.add(egui::Slider::new(&mut app.img_region_block_mm, 1.5..=10.0).text("分区重绘分块(mm)"));
-    ui.add(egui::Slider::new(&mut app.img_stroke_len_mm, 1.5..=8.0).text("素描笔触长度(mm)"));
-    ui.weak("以上为默认值；单张图片可在上方单独覆盖");
 }
 
 /// 运行中页：实时进度（当前行/总行、已用/剩余时间、进度页）与控制。
@@ -3855,7 +4176,7 @@ fn panel_running(app: &mut AppState, ui: &mut Ui) {
             theme::stat(ui, &p, "总点数", &format!("{}", app.stats.points), p.muted);
             theme::stat(ui, &p, "预计耗时", &fmt_duration(app.estimated_seconds()), p.accent);
         });
-        ui.weak("估算按当前进给速度 + 抬落笔延时计算，未计入加减速。");
+        ui.weak("估算含快速空移、加减速与每行指令开销；开始绘制前的计算窗口会给出按实际 G-code 逐行累计的精确值。");
     });
 
     ui.add_space(6.0);
@@ -3918,7 +4239,7 @@ mod tests {
             rotation: 0.0,
             flip_h: false,
             flip_v: false,
-            draw: ImgDraw::SketchHatch,
+            draw: ImgDraw::StrokeSketch,
             step_px: 3,
             threshold: 0.55,
             edge_threshold: 0.25,
@@ -3936,6 +4257,8 @@ mod tests {
             region_block_mm: 2.5,
             stroke_len_mm: 3.2,
             stroke_follow: 2,
+            sketch_style: 1,
+            max_side_px: 3600,
             multi_pen: true,
             background: false,
             out: true,
